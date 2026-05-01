@@ -428,6 +428,16 @@ What poc-9 throws out and replaces:
 
 Connection model follows poc-6's `events/network/` (`connection`, `connection_ack`, `intro`, `negentropy`, `self_address`, `sync_window`, etc. as canonical events). This is a **deliberate reversal** of poc-7's stance — poc-6's `SIMPLIFICATION_FOR_RUST_POC.md` §2 explicitly said "Connection/sync state is protocol/runtime state, not canonical events." poc-9 rejects that rule in favor of putting sync/connection facts through the same event pipeline as everything else.
 
+**Each step must align 100% to plan.md. No duplication of logic.** Every migration of a poc-7 surface — a projector, a state table, a runtime path, an RPC, a test — has to land at the principles described in this document, not somewhere halfway. Specifically:
+
+- **No two implementations of the same concern.** Connection / transit / sync are event-based via `event_modules/connection/` and `event_modules/sync/` — there is no parallel session/round/open machinery, no second transport, no parallel sync engine. If a poc-7 module is brought over, the legacy machinery it depended on must be retired in the same commit, not left to coexist as a "transitional path."
+- **No bespoke per-event-type loaders.** `get_context` returns `{event, deps, labels}` and nothing else. There is exactly one context loader. If a projector needs additional state, declare it as a dependency or write it as a label upstream — do not introduce a second loader.
+- **No legacy compatibility scaffolding.** This is a POC. Canonical event ids and wire layouts are not load-bearing across deployments — change them whenever the new model needs a field. Do not preserve old hashes via shadow columns, sentinel strings, thread-local bridges, or "still-needed" parallel tables. If the legacy reader is still around, retire the reader.
+- **No duplication via vocabulary drift.** "Session", "round", "open", "tenant" (as a per-row scope key), "recorded_by" (as anything other than a transient diagnostic) are forbidden in active code. Substrate-level work is queue-driven and event-driven; reads scope by `workspace_id` (or `endpoint_id` for endpoint-scoped events). One word per concept.
+- **Each step ends green.** A migration that compiles by leaving partial scaffolding in place is not done. The build, the substrate test bar, and the relevant CLI tests must all pass at the end of each step. Half-done work is rolled back, not left to a future agent.
+
+The bar is alignment, not progress. A commit that lands more code while leaving plan.md violated by an extra abstraction layer or a duplicate path is a regression.
+
 **Pipeline simplicity is non-negotiable.** Preserve the pipeline shape of this document — see `get_context` in the Event Pipeline section for the strict contract. poc-7's projection-context-query adapters (one custom `context_loader` per event module) are the surface this fork is rejecting. To restate concretely, in poc-9:
 
 - dependencies come from schema metadata on flat fields (one mechanism for all event types),
