@@ -1,0 +1,1 @@
+"""Sender-owned outbox boundary."""

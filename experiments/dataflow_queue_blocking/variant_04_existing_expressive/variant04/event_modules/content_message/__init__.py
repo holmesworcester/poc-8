@@ -1,0 +1,1 @@
+"""Message content event module."""
