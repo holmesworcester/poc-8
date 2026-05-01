@@ -1,8 +1,10 @@
 use rusqlite::{params, Connection};
 use std::env;
 use std::fs;
+use std::io::Write;
+use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
-use topo::{event_modules, pipeline};
+use topo::{event_modules, network, pipeline};
 
 const DRAIN_BATCH: usize = 512;
 
@@ -18,7 +20,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
     if let Command::Completions { shell } = command {
         println!("# topo {shell} completions");
         println!(
-            "topo --db <path> create-workspace create-account invite accept send generate send-file save-file accounts messages files view workspaces event sync-from"
+            "topo --db <path> create-workspace create-account invite accept send generate send-file save-file accounts messages files view workspaces event queue-event queue-events send-pending receive"
         );
         return Ok(());
     }
@@ -242,13 +244,36 @@ fn run(args: Vec<String>) -> Result<(), String> {
         Command::EventShow { prefix } => {
             print_event_show(&conn, &prefix)?;
         }
-        Command::SyncFrom { peer_db } => {
-            let report = sync_from(&conn, peer_db, now_ms)?;
-            println!("imported_events: {}", report.imported_events);
-            println!("projected_events: {}", report.projected_events);
+        Command::QueueEvent {
+            prefix,
+            connection_id,
+        } => {
+            let event_id = event_id_by_prefix(&conn, &prefix)?;
+            let inserted = queue_event(&conn, connection_id, event_id, now_ms)?;
+            println!("queued_event_id: {}", hex_id(&event_id));
+            println!("connection_id: {}", hex_id(&connection_id));
+            println!("inserted: {inserted}");
         }
-        Command::SyncRoundAll => {
-            println!("sync round all: no configured peers");
+        Command::QueueEvents {
+            connection_id,
+            type_filter,
+        } => {
+            let inserted = queue_events(&conn, connection_id, type_filter.as_deref(), now_ms)?;
+            println!("connection_id: {}", hex_id(&connection_id));
+            println!("queued_events: {inserted}");
+        }
+        Command::SendPending {
+            connection_id,
+            addr,
+        } => {
+            let sent = send_pending(&conn, connection_id, addr)?;
+            println!("connection_id: {}", hex_id(&connection_id));
+            println!("sent_events: {sent}");
+        }
+        Command::Receive { bind, count } => {
+            let report = receive_frames(&conn, bind, count, now_ms)?;
+            println!("received_events: {}", report.received_events);
+            println!("projected_events: {}", report.projected_events);
         }
         Command::Status => {
             let events: i64 = conn
@@ -327,10 +352,22 @@ enum Command {
     EventShow {
         prefix: String,
     },
-    SyncFrom {
-        peer_db: PathBuf,
+    QueueEvent {
+        prefix: String,
+        connection_id: [u8; 32],
     },
-    SyncRoundAll,
+    QueueEvents {
+        connection_id: [u8; 32],
+        type_filter: Option<String>,
+    },
+    SendPending {
+        connection_id: [u8; 32],
+        addr: SocketAddr,
+    },
+    Receive {
+        bind: SocketAddr,
+        count: usize,
+    },
     Status,
     Completions {
         shell: String,
@@ -449,18 +486,47 @@ fn parse_args(args: Vec<String>) -> Result<(PathBuf, Command), String> {
         "accounts" => Command::Accounts,
         "workspaces" => Command::Workspaces,
         "event" => parse_event_command(&rest[1..])?,
-        "sync-from" => {
-            let peer_db = rest
+        "queue-event" => {
+            let prefix = rest
                 .get(1)
-                .map(PathBuf::from)
-                .ok_or_else(|| usage("sync-from requires peer DB path"))?;
-            Command::SyncFrom { peer_db }
+                .cloned()
+                .ok_or_else(|| usage("queue-event requires an event id prefix"))?;
+            let connection_id = parse_hex_id(&option_value(&rest[2..], "--connection-id")?)?;
+            Command::QueueEvent {
+                prefix,
+                connection_id,
+            }
         }
-        "sync"
-            if rest.get(1).map(String::as_str) == Some("round")
-                && rest.get(2).map(String::as_str) == Some("all") =>
-        {
-            Command::SyncRoundAll
+        "queue-events" => {
+            let connection_id = parse_hex_id(&option_value(&rest[1..], "--connection-id")?)?;
+            let type_filter = optional_value(&rest[1..], "--type");
+            Command::QueueEvents {
+                connection_id,
+                type_filter,
+            }
+        }
+        "send-pending" => {
+            let connection_id = parse_hex_id(&option_value(&rest[1..], "--connection-id")?)?;
+            let addr = option_value(&rest[1..], "--addr")?
+                .parse::<SocketAddr>()
+                .map_err(|_| usage("send-pending --addr requires HOST:PORT"))?;
+            Command::SendPending {
+                connection_id,
+                addr,
+            }
+        }
+        "receive" => {
+            let bind = option_value(&rest[1..], "--bind")?
+                .parse::<SocketAddr>()
+                .map_err(|_| usage("receive --bind requires HOST:PORT"))?;
+            let count = optional_value(&rest[1..], "--count")
+                .unwrap_or_else(|| "1".to_string())
+                .parse::<usize>()
+                .map_err(|_| usage("receive --count requires a positive integer"))?;
+            if count == 0 {
+                return Err(usage("receive --count requires a positive integer"));
+            }
+            Command::Receive { bind, count }
         }
         "status" => Command::Status,
         other => return Err(usage(&format!("unknown command `{other}`"))),
@@ -919,68 +985,131 @@ fn event_rows(conn: &Connection, type_filter: Option<&str>) -> Result<Vec<EventL
     Ok(events)
 }
 
+fn event_id_by_prefix(conn: &Connection, prefix: &str) -> Result<[u8; 32], String> {
+    let matches = event_rows(conn, None)?
+        .into_iter()
+        .filter(|event| hex_id(&event.event_id).starts_with(prefix))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [event] => Ok(event.event_id),
+        [] => Err("no event matching that prefix".to_string()),
+        _ => Err("event id prefix is ambiguous".to_string()),
+    }
+}
+
+fn queue_event(
+    conn: &Connection,
+    connection_id: [u8; 32],
+    event_id: [u8; 32],
+    now_ms: i64,
+) -> Result<usize, String> {
+    if pipeline::event_bytes(conn, event_id)
+        .map_err(|err| format!("load event: {err}"))?
+        .is_none()
+    {
+        return Err("event not found".to_string());
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO outbox (connection_id, event_id, queued_at_ms)
+         VALUES (?1, ?2, ?3)",
+        params![connection_id.to_vec(), event_id.to_vec(), now_ms],
+    )
+    .map_err(|err| format!("queue event: {err}"))
+}
+
+fn queue_events(
+    conn: &Connection,
+    connection_id: [u8; 32],
+    type_filter: Option<&str>,
+    now_ms: i64,
+) -> Result<usize, String> {
+    let events = event_rows(conn, type_filter)?;
+    let mut inserted = 0;
+    for event in events {
+        inserted += queue_event(conn, connection_id, event.event_id, now_ms)?;
+    }
+    Ok(inserted)
+}
+
+fn send_pending(
+    conn: &Connection,
+    connection_id: [u8; 32],
+    addr: SocketAddr,
+) -> Result<usize, String> {
+    let mut transport = network::TcpTransport::new();
+    transport.upsert_endpoint(connection_id, addr);
+    let mut sender = network::Network::new(transport, 16 * 1024 * 1024);
+    let mut outbox = network::SqliteOutbox::for_connection(conn, connection_id);
+    let mut sent = 0;
+
+    loop {
+        let report = sender
+            .tick(&mut outbox)
+            .map_err(|err| format!("send pending: {err:?}"))?;
+        if let Some((_, err)) = report.errors.into_iter().next() {
+            return Err(format!("send pending: {err:?}"));
+        }
+        if report.sent.is_empty() {
+            return Ok(sent);
+        }
+        sent += report.sent.len();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SyncReport {
-    imported_events: usize,
+struct ReceiveReport {
+    received_events: usize,
     projected_events: usize,
 }
 
-fn sync_from(conn: &Connection, peer_db: PathBuf, now_ms: i64) -> Result<SyncReport, String> {
-    if !peer_db.exists() {
-        return Err(format!("peer db does not exist: {}", peer_db.display()));
-    }
-    let events = missing_peer_event_bytes(conn, peer_db)?;
+fn receive_frames(
+    conn: &Connection,
+    bind: SocketAddr,
+    count: usize,
+    now_ms: i64,
+) -> Result<ReceiveReport, String> {
+    let listener = TcpListener::bind(bind).map_err(|err| format!("bind {bind}: {err}"))?;
+    println!(
+        "listening: {}",
+        listener.local_addr().map_err(|err| err.to_string())?
+    );
+    std::io::stdout()
+        .flush()
+        .map_err(|err| format!("flush stdout: {err}"))?;
 
-    with_immediate_transaction(conn, || {
-        let mut imported_events = 0;
-        for event in &events {
-            match pipeline::ingest_local(conn, event, now_ms)
-                .map_err(|err| format!("ingest synced event: {err}"))?
-            {
-                pipeline::IngestOutcome::InsertedReady { .. }
-                | pipeline::IngestOutcome::InsertedBlocked { .. } => imported_events += 1,
-                pipeline::IngestOutcome::Duplicate { .. } => {}
-            }
+    let mut projected_events = 0;
+    for _ in 0..count {
+        let (mut stream, _) = listener
+            .accept()
+            .map_err(|err| format!("accept connection: {err}"))?;
+        let frame = network::read_frame(&mut stream)
+            .map_err(|err| format!("read network frame: {err:?}"))?;
+        let computed = pipeline::event_id(&frame.event_bytes);
+        if computed != frame.event_id {
+            return Err("network frame event id did not match event bytes".to_string());
         }
 
-        Ok(SyncReport {
-            imported_events,
-            projected_events: drain_until_idle(conn, now_ms)?,
-        })
-    })
-}
-
-fn missing_peer_event_bytes(conn: &Connection, peer_db: PathBuf) -> Result<Vec<Vec<u8>>, String> {
-    let peer_db = peer_db.to_string_lossy().to_string();
-    conn.execute("ATTACH DATABASE ?1 AS peer", params![peer_db])
-        .map_err(|err| format!("attach peer db: {err}"))?;
-
-    let result = (|| {
-        let mut stmt = conn
-            .prepare(
-                "SELECT p.canonical_bytes
-                 FROM peer.events p
-                 WHERE p.status != 'purged'
-                   AND NOT EXISTS (
-                     SELECT 1 FROM main.events e
-                     WHERE e.event_id = p.event_id
-                   )
-                 ORDER BY p.created_at_ms, p.event_id",
+        let outcome = pipeline::ingest_local(conn, &frame.event_bytes, now_ms)
+            .map_err(|err| format!("ingest network event: {err}"))?;
+        if let pipeline::IngestOutcome::InsertedReady { event_id } = outcome {
+            let projected = pipeline::project_ready_from_origin(
+                conn,
+                event_id,
+                Some(frame.connection_id),
+                now_ms,
             )
-            .map_err(|err| format!("query peer events: {err}"))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, Vec<u8>>(0))
-            .map_err(|err| format!("read peer events: {err}"))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|err| format!("peer event row: {err}"))
-    })();
-
-    let detach = conn.execute_batch("DETACH DATABASE peer");
-    match (result, detach) {
-        (Ok(events), Ok(())) => Ok(events),
-        (Err(err), _) => Err(err),
-        (Ok(_), Err(err)) => Err(format!("detach peer db: {err}")),
+            .map_err(|err| format!("project network event: {err}"))?;
+            if matches!(projected, pipeline::ProjectOutcome::Applied { .. }) {
+                projected_events += 1;
+            }
+        }
+        projected_events += drain_until_idle(conn, now_ms)?;
     }
+
+    Ok(ReceiveReport {
+        received_events: count,
+        projected_events,
+    })
 }
 
 fn drain_until_idle(conn: &Connection, now_ms: i64) -> Result<usize, String> {
@@ -1132,6 +1261,6 @@ fn now_ms() -> i64 {
 
 fn usage(message: &str) -> String {
     format!(
-        "{message}\nusage:\n  topo --db PATH create-workspace --workspace-name NAME\n  topo --db PATH create-account --username NAME [--device-name NAME]\n  topo --db PATH invite\n  topo --db PATH accept INVITE [--username NAME] [--device-name NAME]\n  topo --db PATH send TEXT\n  topo --db PATH generate --count N [--prefix TEXT]\n  topo --db PATH send-file PATH\n  topo --db PATH save-file N --out PATH\n  topo --db PATH sync-from PEER_DB\n  topo --db PATH view\n  topo --db PATH status"
+        "{message}\nusage:\n  topo --db PATH create-workspace --workspace-name NAME\n  topo --db PATH create-account --username NAME [--device-name NAME]\n  topo --db PATH invite\n  topo --db PATH accept INVITE [--username NAME] [--device-name NAME]\n  topo --db PATH send TEXT\n  topo --db PATH generate --count N [--prefix TEXT]\n  topo --db PATH send-file PATH\n  topo --db PATH save-file N --out PATH\n  topo --db PATH queue-event EVENT_ID_PREFIX --connection-id HEX\n  topo --db PATH queue-events --connection-id HEX [--type TYPE]\n  topo --db PATH send-pending --connection-id HEX --addr HOST:PORT\n  topo --db PATH receive --bind HOST:PORT [--count N]\n  topo --db PATH view\n  topo --db PATH status"
     )
 }

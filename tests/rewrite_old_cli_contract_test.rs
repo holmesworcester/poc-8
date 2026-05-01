@@ -183,47 +183,15 @@ fn old_cli_delete_message_hides_message_and_reaction() {
 }
 
 #[test]
-fn old_cli_completion_and_sync_syntax_contracts() {
+fn cli_completion_mentions_real_network_commands() {
     let bash = assert_success(topo_no_db(&["completions", "bash"]));
     assert!(bash.contains("topo"));
+    assert!(bash.contains("send-pending"));
+    assert!(bash.contains("receive"));
 
     let zsh = assert_success(topo_no_db(&["completions", "zsh"]));
     assert!(zsh.contains("topo"));
-
-    let tmp = tempfile::tempdir().unwrap();
-    let db = temp_db(&tmp, "sync.db");
-    create_workspace(&db, "sync");
-
-    let sync = assert_success(topo(&db, &["sync", "round", "all"]));
-    assert!(sync.contains("sync round all"));
-}
-
-#[test]
-fn old_cli_ongoing_sync_contract() {
-    let tmp = tempfile::tempdir().unwrap();
-    let alice_db = temp_db(&tmp, "alice.db");
-    let bob_db = temp_db(&tmp, "bob.db");
-
-    create_workspace(&alice_db, "ongoing");
-    send_message(&alice_db, "bootstrap");
-    sync_from(&bob_db, &alice_db);
-
-    send_message(&alice_db, "Round 1");
-    sync_from(&bob_db, &alice_db);
-    send_message(&bob_db, "Round 2");
-    sync_from(&alice_db, &bob_db);
-    send_message(&alice_db, "Round 3");
-    sync_from(&bob_db, &alice_db);
-
-    let alice = assert_success(topo(&alice_db, &["messages"]));
-    let bob = assert_success(topo(&bob_db, &["messages"]));
-    for expected in ["bootstrap", "Round 1", "Round 2", "Round 3"] {
-        assert!(
-            alice.contains(expected),
-            "alice missing {expected}:\n{alice}"
-        );
-        assert!(bob.contains(expected), "bob missing {expected}:\n{bob}");
-    }
+    assert!(zsh.contains("queue-event"));
 }
 
 #[test]

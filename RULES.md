@@ -91,3 +91,27 @@ Module commands own semantic construction:
 - how to interpret `Applied`, `AlreadyApplied`, or `Blocked`
 
 All state mutation still goes through canonical events and projectors.
+
+## Realness Bar
+
+Tests and demos must exercise the production boundary they claim to prove.
+Do not call a shortcut and name it sync, network, auth, storage, or CLI if the
+real path would cross a different boundary.
+
+Use these rules:
+
+- CLI tests run the actual `topo` binary.
+- Network tests use real sockets or the production transport trait with the
+  same framing and outbox/inbox adapters used by the CLI.
+- Sync tests move canonical event bytes through outbox, wire frames, receive,
+  ingest, and project. They must not copy rows from another database.
+- Harnesses may create temp directories, spawn processes, choose ports, and
+  assert output. They must not create kernel tables or apply domain semantics.
+- Toy adapters are allowed only for small unit tests that name the fake
+  explicitly, such as projector math or scheduler ordering. They are not
+  acceptable evidence for end-to-end behavior.
+- If a feature is not real yet, say so in the command name, test name, or
+  documentation. Prefer deleting fake coverage over keeping a test that certifies
+  the wrong boundary.
+- A passing test should fail if the production codec, queue, network frame,
+  database adapter, or projector path is broken.

@@ -190,6 +190,15 @@ pub fn project_ready(
     id: EventId,
     now_ms: i64,
 ) -> Result<ProjectOutcome, PipelineError> {
+    project_ready_from_origin(conn, id, None, now_ms)
+}
+
+pub fn project_ready_from_origin(
+    conn: &Connection,
+    id: EventId,
+    origin_connection_id: Option<ConnectionId>,
+    now_ms: i64,
+) -> Result<ProjectOutcome, PipelineError> {
     let Some((bytes, status)) = event_row(conn, id)? else {
         return Err(PipelineError::NotFound);
     };
@@ -204,7 +213,7 @@ pub fn project_ready(
     let deps = load_deps(conn, &event)?;
     let labels = load_labels(conn, &event, id)?;
     let context = ProjectionContext {
-        origin_connection_id: None,
+        origin_connection_id,
         now_ms,
     };
     let projection = event_modules::project(id, &event, &deps, &labels, &context);

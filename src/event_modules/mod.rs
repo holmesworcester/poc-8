@@ -354,7 +354,7 @@ pub fn project(
 ) -> Projection {
     match event {
         Event::Workspace(e) => project_workspace(event_id, e),
-        Event::Message(e) => project_message(event_id, e, labels),
+        Event::Message(e) => project_message(event_id, e, labels, context),
         Event::Reaction(e) => project_reaction(event_id, e, labels),
         Event::MessageDeletion(e) => project_message_deletion(event_id, e),
         Event::File(e) => project_file(event_id, e),
@@ -408,6 +408,7 @@ fn project_message(
     event_id: EventId,
     event: &MessageEvent,
     labels: &HashMap<EventId, Vec<String>>,
+    context: &ProjectionContext,
 ) -> Projection {
     if labels
         .get(&event.reply_to_event_id)
@@ -441,7 +442,9 @@ fn project_message(
         ..Projection::default()
     };
 
-    if event.fanout_connection_id != [0; 32] {
+    if event.fanout_connection_id != [0; 32]
+        && Some(event.fanout_connection_id) != context.origin_connection_id
+    {
         projection.outbox.push(OutboxOp {
             connection_id: event.fanout_connection_id,
             event_id,

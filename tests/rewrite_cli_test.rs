@@ -2,6 +2,9 @@ mod cli_harness;
 
 use cli_harness::*;
 
+const ALICE_TO_BOB: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const BOB_TO_ALICE: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
 #[test]
 fn cli_creates_workspace_sends_message_and_views_projection() {
     let tmp = tempfile::tempdir().unwrap();
@@ -64,67 +67,52 @@ fn cli_workspace_creation_is_idempotent() {
 }
 
 #[test]
-fn two_cli_nodes_exchange_messages_by_syncing_events() {
+fn two_cli_nodes_exchange_messages_over_tcp() {
     let tmp = tempfile::tempdir().unwrap();
     let alice_db = temp_db(&tmp, "alice.db");
     let bob_db = temp_db(&tmp, "bob.db");
 
-    let created = topo(
-        &alice_db,
-        &["create-workspace", "--workspace-name", "two-people"],
-    );
-    assert!(
-        created.status.success(),
-        "alice create failed: {}",
-        stderr(&created)
-    );
+    let created = create_workspace(&alice_db, "two-people");
+    let workspace_event_id = line_value(&created, "workspace_event_id");
+    let alice_msg = send_message(&alice_db, "alice: hi bob");
+    let alice_msg_id = line_value(&alice_msg, "event_id");
 
-    let bob_sync = topo(&bob_db, &["sync-from", &alice_db]);
-    assert!(
-        bob_sync.status.success(),
-        "bob sync failed: {}",
-        stderr(&bob_sync)
-    );
-    let bob_view = topo(&bob_db, &["view"]);
-    assert!(stdout(&bob_view).contains("workspace: two-people"));
+    queue_event(&alice_db, &workspace_event_id, ALICE_TO_BOB);
+    queue_event(&alice_db, &alice_msg_id, ALICE_TO_BOB);
 
-    let alice_send = topo(&alice_db, &["send", "alice: hi bob"]);
+    let bob_addr = free_addr();
+    let bob_receiver = spawn_receive(&bob_db, &bob_addr, 2);
+    let sent = send_pending_with_retry(&alice_db, ALICE_TO_BOB, &bob_addr);
+    assert!(sent.contains("sent_events: 2"));
+    let bob_receive = bob_receiver.wait_with_output().unwrap();
     assert!(
-        alice_send.status.success(),
-        "alice send failed: {}",
-        stderr(&alice_send)
-    );
-    let bob_sync = topo(&bob_db, &["sync-from", &alice_db]);
-    assert!(
-        bob_sync.status.success(),
-        "bob second sync failed: {}",
-        stderr(&bob_sync)
+        bob_receive.status.success(),
+        "bob receive failed: stdout={} stderr={}",
+        stdout(&bob_receive),
+        stderr(&bob_receive)
     );
     assert!(stdout(&topo(&bob_db, &["view"])).contains("- alice: hi bob"));
 
-    let bob_send = topo(&bob_db, &["send", "bob: hi alice"]);
+    let bob_msg = send_message(&bob_db, "bob: hi alice");
+    let bob_msg_id = line_value(&bob_msg, "event_id");
+    queue_event(&bob_db, &bob_msg_id, BOB_TO_ALICE);
+
+    let alice_addr = free_addr();
+    let alice_receiver = spawn_receive(&alice_db, &alice_addr, 1);
+    let sent = send_pending_with_retry(&bob_db, BOB_TO_ALICE, &alice_addr);
+    assert!(sent.contains("sent_events: 1"));
+    let alice_receive = alice_receiver.wait_with_output().unwrap();
     assert!(
-        bob_send.status.success(),
-        "bob send failed: {}",
-        stderr(&bob_send)
-    );
-    let alice_sync = topo(&alice_db, &["sync-from", &bob_db]);
-    assert!(
-        alice_sync.status.success(),
-        "alice sync failed: {}",
-        stderr(&alice_sync)
+        alice_receive.status.success(),
+        "alice receive failed: stdout={} stderr={}",
+        stdout(&alice_receive),
+        stderr(&alice_receive)
     );
 
     let alice_view = stdout(&topo(&alice_db, &["view"]));
     assert!(alice_view.contains("- alice: hi bob"));
     assert!(alice_view.contains("- bob: hi alice"));
 
-    let bob_sync = topo(&bob_db, &["sync-from", &alice_db]);
-    assert!(
-        bob_sync.status.success(),
-        "bob final sync failed: {}",
-        stderr(&bob_sync)
-    );
     let bob_view = stdout(&topo(&bob_db, &["view"]));
     assert!(bob_view.contains("- alice: hi bob"));
     assert!(bob_view.contains("- bob: hi alice"));
