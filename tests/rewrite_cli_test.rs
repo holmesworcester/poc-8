@@ -1,26 +1,11 @@
-use std::process::{Command, Output};
+mod cli_harness;
 
-fn topo(db: &str, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_topo"))
-        .arg("--db")
-        .arg(db)
-        .args(args)
-        .output()
-        .expect("run topo")
-}
-
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).to_string()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).to_string()
-}
+use cli_harness::*;
 
 #[test]
 fn cli_creates_workspace_sends_message_and_views_projection() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = tmp.path().join("node.db").to_string_lossy().to_string();
+    let db = temp_db(&tmp, "node.db");
 
     let created = topo(
         &db,
@@ -47,7 +32,7 @@ fn cli_creates_workspace_sends_message_and_views_projection() {
 #[test]
 fn cli_rejects_send_before_workspace() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = tmp.path().join("node.db").to_string_lossy().to_string();
+    let db = temp_db(&tmp, "node.db");
 
     let sent = topo(&db, &["send", "too early"]);
 
@@ -58,7 +43,7 @@ fn cli_rejects_send_before_workspace() {
 #[test]
 fn cli_workspace_creation_is_idempotent() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = tmp.path().join("node.db").to_string_lossy().to_string();
+    let db = temp_db(&tmp, "node.db");
 
     let first = topo(&db, &["create-workspace", "--workspace-name", "same"]);
     let second = topo(&db, &["create-workspace", "--workspace-name", "same"]);
@@ -81,8 +66,8 @@ fn cli_workspace_creation_is_idempotent() {
 #[test]
 fn two_cli_nodes_exchange_messages_by_syncing_events() {
     let tmp = tempfile::tempdir().unwrap();
-    let alice_db = tmp.path().join("alice.db").to_string_lossy().to_string();
-    let bob_db = tmp.path().join("bob.db").to_string_lossy().to_string();
+    let alice_db = temp_db(&tmp, "alice.db");
+    let bob_db = temp_db(&tmp, "bob.db");
 
     let created = topo(
         &alice_db,
