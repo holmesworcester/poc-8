@@ -18,7 +18,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
     if let Command::Completions { shell } = command {
         println!("# topo {shell} completions");
         println!(
-            "topo --db <path> create-workspace send generate send-file save-file messages files view workspaces event sync-from"
+            "topo --db <path> create-workspace create-account invite accept send generate send-file save-file accounts messages files view workspaces event sync-from"
         );
         return Ok(());
     }
@@ -38,6 +38,81 @@ fn run(args: Vec<String>) -> Result<(), String> {
             println!("workspace: {name}");
             println!("workspace_id: {}", hex_id(&workspace_id));
             println!("workspace_event_id: {}", hex_id(&event_id));
+        }
+        Command::CreateAccount {
+            username,
+            device_name,
+        } => {
+            let (workspace_id, workspace_event_id, workspace_name) = active_workspace(&conn)?;
+            let account_id = derive_account_id(workspace_id, &username, &device_name);
+            let bytes = event_modules::encode_account(
+                workspace_id,
+                workspace_event_id,
+                account_id,
+                &username,
+                &device_name,
+            );
+            let event_id = pipeline::event_id(&bytes);
+            pipeline::ingest_local(&conn, &bytes, now_ms)
+                .map_err(|err| format!("ingest account: {err}"))?;
+            drain_until_idle(&conn, now_ms)?;
+
+            println!("workspace: {workspace_name}");
+            println!("account: {username}");
+            println!("device: {device_name}");
+            println!("account_id: {}", hex_id(&account_id));
+            println!("event_id: {}", hex_id(&event_id));
+        }
+        Command::CreateInvite => {
+            let (workspace_id, workspace_event_id, workspace_name) = active_workspace(&conn)?;
+            let invite_id = derive_unique_id(&conn, b"invite:", workspace_id, now_ms)?;
+            let bytes = event_modules::encode_invite(workspace_id, workspace_event_id, invite_id);
+            let invite_event_id = pipeline::event_id(&bytes);
+            pipeline::ingest_local(&conn, &bytes, now_ms)
+                .map_err(|err| format!("ingest invite: {err}"))?;
+            drain_until_idle(&conn, now_ms)?;
+
+            println!("workspace: {workspace_name}");
+            println!("invite_id: {}", hex_id(&invite_id));
+            println!("invite_event_id: {}", hex_id(&invite_event_id));
+            println!("{}", invite_link(workspace_id, invite_event_id));
+        }
+        Command::AcceptInvite {
+            invite,
+            username,
+            device_name,
+        } => {
+            let (workspace_id, invite_event_id) = parse_invite_link(&invite)?;
+            if invite_acceptance_exists(&conn, workspace_id)? {
+                return Err("workspace invite already accepted on this endpoint".to_string());
+            }
+            let account_id = derive_account_id(workspace_id, &username, &device_name);
+            let bytes = event_modules::encode_invite_accepted(
+                workspace_id,
+                invite_event_id,
+                account_id,
+                &username,
+                &device_name,
+            );
+            let event_id = pipeline::event_id(&bytes);
+            let outcome = pipeline::ingest_local(&conn, &bytes, now_ms)
+                .map_err(|err| format!("ingest invite acceptance: {err}"))?;
+            drain_until_idle(&conn, now_ms)?;
+
+            println!("accepted_invite: {}", short_hex(&invite_event_id));
+            println!("account: {username}");
+            println!("device: {device_name}");
+            println!("account_id: {}", hex_id(&account_id));
+            println!("event_id: {}", hex_id(&event_id));
+            match outcome {
+                pipeline::IngestOutcome::InsertedBlocked { .. } => {
+                    println!("status: blocked_until_invite_sync");
+                }
+                pipeline::IngestOutcome::InsertedReady { .. }
+                | pipeline::IngestOutcome::Duplicate { .. } => {
+                    println!("status: ready");
+                }
+            }
         }
         Command::Send { body } => {
             let (workspace_id, workspace_event_id, workspace_name) = active_workspace(&conn)?;
@@ -149,6 +224,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
         Command::Files => {
             print_files(&conn)?;
         }
+        Command::Accounts => {
+            print_accounts(&conn)?;
+        }
         Command::Workspaces => {
             print_workspaces(&conn)?;
         }
@@ -182,9 +260,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let files: i64 = conn
                 .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
                 .map_err(|err| format!("count files: {err}"))?;
+            let accounts: i64 = conn
+                .query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))
+                .map_err(|err| format!("count accounts: {err}"))?;
+            let invites: i64 = conn
+                .query_row("SELECT COUNT(*) FROM invites", [], |row| row.get(0))
+                .map_err(|err| format!("count invites: {err}"))?;
             println!("events: {events}");
             println!("messages: {messages}");
             println!("files: {files}");
+            println!("accounts: {accounts}");
+            println!("invites: {invites}");
         }
         Command::Completions { .. } => unreachable!("handled before DB open"),
     }
@@ -196,6 +282,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
 enum Command {
     CreateWorkspace {
         name: String,
+    },
+    CreateAccount {
+        username: String,
+        device_name: String,
+    },
+    CreateInvite,
+    AcceptInvite {
+        invite: String,
+        username: String,
+        device_name: String,
     },
     Send {
         body: String,
@@ -221,6 +317,7 @@ enum Command {
     View,
     Messages,
     Files,
+    Accounts,
     Workspaces,
     EventList {
         ids_only: bool,
@@ -269,6 +366,31 @@ fn parse_args(args: Vec<String>) -> Result<(PathBuf, Command), String> {
         "create-workspace" => {
             let name = option_value(&rest[1..], "--workspace-name")?;
             Command::CreateWorkspace { name }
+        }
+        "create-account" => {
+            let username = option_value(&rest[1..], "--username")?;
+            let device_name = optional_value_any(&rest[1..], &["--device-name", "--devicename"])
+                .unwrap_or_else(|| "device".to_string());
+            Command::CreateAccount {
+                username,
+                device_name,
+            }
+        }
+        "invite" => Command::CreateInvite,
+        "accept" | "accept-invite" => {
+            let invite = rest
+                .get(1)
+                .cloned()
+                .ok_or_else(|| usage("accept requires an invite link"))?;
+            let username =
+                optional_value(&rest[2..], "--username").unwrap_or_else(|| "user".to_string());
+            let device_name = optional_value_any(&rest[2..], &["--device-name", "--devicename"])
+                .unwrap_or_else(|| "device".to_string());
+            Command::AcceptInvite {
+                invite,
+                username,
+                device_name,
+            }
         }
         "send" => {
             let body = rest
@@ -324,6 +446,7 @@ fn parse_args(args: Vec<String>) -> Result<(PathBuf, Command), String> {
         "view" => Command::View,
         "messages" => Command::Messages,
         "files" => Command::Files,
+        "accounts" => Command::Accounts,
         "workspaces" => Command::Workspaces,
         "event" => parse_event_command(&rest[1..])?,
         "sync-from" => {
@@ -407,6 +530,10 @@ fn optional_value(args: &[String], name: &str) -> Option<String> {
     None
 }
 
+fn optional_value_any(args: &[String], names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| optional_value(args, name))
+}
+
 fn active_workspace(conn: &Connection) -> Result<([u8; 32], [u8; 32], String), String> {
     conn.query_row(
         "SELECT workspace_id, source_event_id, name
@@ -480,6 +607,21 @@ fn print_files(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn print_accounts(conn: &Connection) -> Result<(), String> {
+    let accounts = account_rows(conn)?;
+    println!("ACCOUNTS ({}):", accounts.len());
+    for (idx, account) in accounts.iter().enumerate() {
+        println!(
+            "{}. {} @ {} ({})",
+            idx + 1,
+            account.username,
+            account.device_name,
+            short_hex(&account.account_id)
+        );
+    }
+    Ok(())
+}
+
 fn print_workspaces(conn: &Connection) -> Result<(), String> {
     let mut stmt = conn
         .prepare("SELECT name FROM workspaces ORDER BY name")
@@ -510,6 +652,13 @@ struct FileRow {
     name: String,
     byte_len: i64,
     content_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AccountRow {
+    account_id: [u8; 32],
+    username: String,
+    device_name: String,
 }
 
 fn visible_messages(
@@ -549,6 +698,27 @@ fn visible_messages(
             .collect::<rusqlite::Result<Vec<_>>>()
     };
     rows.map_err(|err| format!("message row: {err}"))
+}
+
+fn account_rows(conn: &Connection) -> Result<Vec<AccountRow>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT account_id, username, device_name
+             FROM accounts
+             ORDER BY username, device_name, account_id",
+        )
+        .map_err(|err| format!("query accounts: {err}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(AccountRow {
+                account_id: vec_to_id(row.get::<_, Vec<u8>>(0)?),
+                username: row.get::<_, String>(1)?,
+                device_name: row.get::<_, String>(2)?,
+            })
+        })
+        .map_err(|err| format!("read accounts: {err}"))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|err| format!("account row: {err}"))
 }
 
 fn file_rows(conn: &Connection) -> Result<Vec<FileRow>, String> {
@@ -845,11 +1015,91 @@ fn with_immediate_transaction<T>(
     }
 }
 
+fn invite_acceptance_exists(conn: &Connection, workspace_id: [u8; 32]) -> Result<bool, String> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM invite_acceptances WHERE workspace_id = ?1",
+            params![workspace_id.to_vec()],
+            |row| row.get(0),
+        )
+        .map_err(|err| format!("query invite acceptances: {err}"))?;
+    Ok(count > 0)
+}
+
+fn invite_link(workspace_id: [u8; 32], invite_event_id: [u8; 32]) -> String {
+    format!(
+        "topo://invite/{}{}",
+        hex_id(&invite_event_id),
+        hex_id(&workspace_id)
+    )
+}
+
+fn parse_invite_link(link: &str) -> Result<([u8; 32], [u8; 32]), String> {
+    let payload = link
+        .strip_prefix("topo://invite/")
+        .ok_or_else(|| "invite must start with topo://invite/".to_string())?;
+    if payload.len() != 128 {
+        return Err("invite payload must contain invite and workspace ids".to_string());
+    }
+    let invite_event_id = parse_hex_id(&payload[..64])?;
+    let workspace_id = parse_hex_id(&payload[64..])?;
+    Ok((workspace_id, invite_event_id))
+}
+
+fn parse_hex_id(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64 {
+        return Err("hex id must be 64 characters".to_string());
+    }
+    let mut out = [0u8; 32];
+    for idx in 0..32 {
+        let high = hex_nibble(value.as_bytes()[idx * 2])?;
+        let low = hex_nibble(value.as_bytes()[idx * 2 + 1])?;
+        out[idx] = (high << 4) | low;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err("invalid hex id".to_string()),
+    }
+}
+
 fn deterministic_id(prefix: &[u8], value: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(prefix);
     hasher.update(value);
     *hasher.finalize().as_bytes()
+}
+
+fn derive_account_id(workspace_id: [u8; 32], username: &str, device_name: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"account:");
+    hasher.update(&workspace_id);
+    hasher.update(username.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(device_name.as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn derive_unique_id(
+    conn: &Connection,
+    prefix: &[u8],
+    workspace_id: [u8; 32],
+    now_ms: i64,
+) -> Result<[u8; 32], String> {
+    let event_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .map_err(|err| format!("count events: {err}"))?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(prefix);
+    hasher.update(&workspace_id);
+    hasher.update(&now_ms.to_be_bytes());
+    hasher.update(&event_count.to_be_bytes());
+    Ok(*hasher.finalize().as_bytes())
 }
 
 fn vec_to_id(value: Vec<u8>) -> [u8; 32] {
@@ -882,6 +1132,6 @@ fn now_ms() -> i64 {
 
 fn usage(message: &str) -> String {
     format!(
-        "{message}\nusage:\n  topo --db PATH create-workspace --workspace-name NAME\n  topo --db PATH send TEXT\n  topo --db PATH generate --count N [--prefix TEXT]\n  topo --db PATH send-file PATH\n  topo --db PATH save-file N --out PATH\n  topo --db PATH sync-from PEER_DB\n  topo --db PATH view\n  topo --db PATH status"
+        "{message}\nusage:\n  topo --db PATH create-workspace --workspace-name NAME\n  topo --db PATH create-account --username NAME [--device-name NAME]\n  topo --db PATH invite\n  topo --db PATH accept INVITE [--username NAME] [--device-name NAME]\n  topo --db PATH send TEXT\n  topo --db PATH generate --count N [--prefix TEXT]\n  topo --db PATH send-file PATH\n  topo --db PATH save-file N --out PATH\n  topo --db PATH sync-from PEER_DB\n  topo --db PATH view\n  topo --db PATH status"
     )
 }

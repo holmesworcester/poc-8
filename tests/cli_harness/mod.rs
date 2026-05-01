@@ -54,6 +54,41 @@ pub fn create_workspace(db: &str, name: &str) -> String {
     assert_success(topo(db, &["create-workspace", "--workspace-name", name]))
 }
 
+pub fn create_account(db: &str, username: &str, device_name: &str) -> String {
+    assert_success(topo(
+        db,
+        &[
+            "create-account",
+            "--username",
+            username,
+            "--device-name",
+            device_name,
+        ],
+    ))
+}
+
+pub fn create_invite(db: &str) -> String {
+    let out = assert_success(topo(db, &["invite"]));
+    out.lines()
+        .find(|line| line.starts_with("topo://invite/"))
+        .expect("invite link")
+        .to_string()
+}
+
+pub fn accept_invite(db: &str, invite: &str, username: &str, device_name: &str) -> String {
+    assert_success(topo(
+        db,
+        &[
+            "accept",
+            invite,
+            "--username",
+            username,
+            "--device-name",
+            device_name,
+        ],
+    ))
+}
+
 pub fn send_message(db: &str, message: &str) -> String {
     assert_success(topo(db, &["send", message]))
 }
