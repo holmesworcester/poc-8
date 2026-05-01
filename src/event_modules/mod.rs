@@ -3,6 +3,8 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use thiserror::Error;
 
+pub mod forward_secret;
+
 pub const TYPE_WORKSPACE: u8 = 1;
 pub const TYPE_MESSAGE: u8 = 2;
 pub const TYPE_CONNECTION: u8 = 3;

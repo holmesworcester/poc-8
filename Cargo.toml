@@ -1,0 +1,9 @@
+[package]
+name = "topo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+blake3 = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+thiserror = "1"
