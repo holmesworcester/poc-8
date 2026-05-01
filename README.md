@@ -17,6 +17,7 @@ The CLI is the first external contract:
 ```bash
 cargo run -- --db demo.db create-workspace --workspace-name demo
 cargo run -- --db demo.db send "hello"
+cargo run -- --db bob.db sync-from alice.db
 cargo run -- --db demo.db view
 cargo run -- --db demo.db status
 ```

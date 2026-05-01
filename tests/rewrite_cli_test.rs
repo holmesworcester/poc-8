@@ -77,3 +77,70 @@ fn cli_workspace_creation_is_idempotent() {
     );
     assert!(stdout(&status).contains("events: 1"));
 }
+
+#[test]
+fn two_cli_nodes_exchange_messages_by_syncing_events() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alice_db = tmp.path().join("alice.db").to_string_lossy().to_string();
+    let bob_db = tmp.path().join("bob.db").to_string_lossy().to_string();
+
+    let created = topo(
+        &alice_db,
+        &["create-workspace", "--workspace-name", "two-people"],
+    );
+    assert!(
+        created.status.success(),
+        "alice create failed: {}",
+        stderr(&created)
+    );
+
+    let bob_sync = topo(&bob_db, &["sync-from", &alice_db]);
+    assert!(
+        bob_sync.status.success(),
+        "bob sync failed: {}",
+        stderr(&bob_sync)
+    );
+    let bob_view = topo(&bob_db, &["view"]);
+    assert!(stdout(&bob_view).contains("workspace: two-people"));
+
+    let alice_send = topo(&alice_db, &["send", "alice: hi bob"]);
+    assert!(
+        alice_send.status.success(),
+        "alice send failed: {}",
+        stderr(&alice_send)
+    );
+    let bob_sync = topo(&bob_db, &["sync-from", &alice_db]);
+    assert!(
+        bob_sync.status.success(),
+        "bob second sync failed: {}",
+        stderr(&bob_sync)
+    );
+    assert!(stdout(&topo(&bob_db, &["view"])).contains("- alice: hi bob"));
+
+    let bob_send = topo(&bob_db, &["send", "bob: hi alice"]);
+    assert!(
+        bob_send.status.success(),
+        "bob send failed: {}",
+        stderr(&bob_send)
+    );
+    let alice_sync = topo(&alice_db, &["sync-from", &bob_db]);
+    assert!(
+        alice_sync.status.success(),
+        "alice sync failed: {}",
+        stderr(&alice_sync)
+    );
+
+    let alice_view = stdout(&topo(&alice_db, &["view"]));
+    assert!(alice_view.contains("- alice: hi bob"));
+    assert!(alice_view.contains("- bob: hi alice"));
+
+    let bob_sync = topo(&bob_db, &["sync-from", &alice_db]);
+    assert!(
+        bob_sync.status.success(),
+        "bob final sync failed: {}",
+        stderr(&bob_sync)
+    );
+    let bob_view = stdout(&topo(&bob_db, &["view"]));
+    assert!(bob_view.contains("- alice: hi bob"));
+    assert!(bob_view.contains("- bob: hi alice"));
+}

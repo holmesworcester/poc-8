@@ -22,8 +22,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let event_id = pipeline::event_id(&bytes);
             pipeline::ingest_local(&conn, &bytes, now_ms)
                 .map_err(|err| format!("ingest workspace: {err}"))?;
-            pipeline::drain_ready(&conn, 64, now_ms)
-                .map_err(|err| format!("project workspace: {err}"))?;
+            drain_until_idle(&conn, now_ms)?;
 
             println!("workspace: {name}");
             println!("workspace_id: {}", hex_id(&workspace_id));
@@ -41,14 +40,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let event_id = pipeline::event_id(&bytes);
             pipeline::ingest_local(&conn, &bytes, now_ms)
                 .map_err(|err| format!("ingest message: {err}"))?;
-            pipeline::drain_ready(&conn, 64, now_ms)
-                .map_err(|err| format!("project message: {err}"))?;
+            drain_until_idle(&conn, now_ms)?;
 
             println!("workspace: {workspace_name}");
             println!("event_id: {}", hex_id(&event_id));
         }
         Command::View => {
             print_view(&conn)?;
+        }
+        Command::SyncFrom { peer_db } => {
+            let report = sync_from(&conn, peer_db, now_ms)?;
+            println!("imported_events: {}", report.imported_events);
+            println!("projected_events: {}", report.projected_events);
         }
         Command::Status => {
             let events: i64 = conn
@@ -70,6 +73,7 @@ enum Command {
     CreateWorkspace { name: String },
     Send { body: String },
     View,
+    SyncFrom { peer_db: PathBuf },
     Status,
 }
 
@@ -103,6 +107,13 @@ fn parse_args(args: Vec<String>) -> Result<(PathBuf, Command), String> {
             Command::Send { body }
         }
         "view" => Command::View,
+        "sync-from" => {
+            let peer_db = rest
+                .get(1)
+                .map(PathBuf::from)
+                .ok_or_else(|| usage("sync-from requires peer DB path"))?;
+            Command::SyncFrom { peer_db }
+        }
         "status" => Command::Status,
         other => return Err(usage(&format!("unknown command `{other}`"))),
     };
@@ -181,6 +192,58 @@ fn print_view(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyncReport {
+    imported_events: usize,
+    projected_events: usize,
+}
+
+fn sync_from(conn: &Connection, peer_db: PathBuf, now_ms: i64) -> Result<SyncReport, String> {
+    if !peer_db.exists() {
+        return Err(format!("peer db does not exist: {}", peer_db.display()));
+    }
+    let peer = pipeline::open_path(&peer_db).map_err(|err| format!("open peer db: {err}"))?;
+    let mut stmt = peer
+        .prepare(
+            "SELECT canonical_bytes FROM events
+             WHERE status != 'purged'
+             ORDER BY created_at_ms, event_id",
+        )
+        .map_err(|err| format!("query peer events: {err}"))?;
+    let event_rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(|err| format!("read peer events: {err}"))?;
+
+    let mut imported_events = 0;
+    for event in event_rows {
+        let event = event.map_err(|err| format!("peer event row: {err}"))?;
+        match pipeline::ingest_local(conn, &event, now_ms)
+            .map_err(|err| format!("ingest synced event: {err}"))?
+        {
+            pipeline::IngestOutcome::InsertedReady { .. }
+            | pipeline::IngestOutcome::InsertedBlocked { .. } => imported_events += 1,
+            pipeline::IngestOutcome::Duplicate { .. } => {}
+        }
+    }
+
+    Ok(SyncReport {
+        imported_events,
+        projected_events: drain_until_idle(conn, now_ms)?,
+    })
+}
+
+fn drain_until_idle(conn: &Connection, now_ms: i64) -> Result<usize, String> {
+    let mut total = 0;
+    loop {
+        let outcomes =
+            pipeline::drain_ready(conn, 64, now_ms).map_err(|err| format!("project: {err}"))?;
+        if outcomes.is_empty() {
+            return Ok(total);
+        }
+        total += outcomes.len();
+    }
+}
+
 fn deterministic_id(prefix: &[u8], value: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(prefix);
@@ -213,6 +276,6 @@ fn now_ms() -> i64 {
 
 fn usage(message: &str) -> String {
     format!(
-        "{message}\nusage:\n  topo --db PATH create-workspace --workspace-name NAME\n  topo --db PATH send TEXT\n  topo --db PATH view\n  topo --db PATH status"
+        "{message}\nusage:\n  topo --db PATH create-workspace --workspace-name NAME\n  topo --db PATH send TEXT\n  topo --db PATH sync-from PEER_DB\n  topo --db PATH view\n  topo --db PATH status"
     )
 }
