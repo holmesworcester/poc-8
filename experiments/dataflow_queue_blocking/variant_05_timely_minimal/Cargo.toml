@@ -1,0 +1,9 @@
+[package]
+name = "variant_05_timely_minimal"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "variant_05_timely_minimal"
+path = "src/lib.rs"
