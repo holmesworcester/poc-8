@@ -198,6 +198,38 @@ The network layer owns only transport mechanics: framing, wrapping, sending,
 receiving, buffering, and backpressure. It does not own sync or connection
 semantics.
 
+## No Fake Or Placeholder Encryption
+
+Never implement fake, placeholder, pass-through, XOR, reversible toy, or
+"encrypted in name only" encryption.
+
+If a path requires confidentiality, integrity, authentication, forward secrecy,
+or key erasure, use a real reviewed cryptographic construction through a
+well-maintained library and document the exact primitive, nonce/key rules,
+associated data, and failure behavior. If the real construction is not ready,
+leave the feature unimplemented and make the boundary explicit.
+
+Code, tests, CLI output, table names, event names, and docs must not call bytes
+encrypted, sealed, secret, private, wrapped, or protected unless the production
+path actually enforces the claimed property. A framing function may be called a
+frame. It must not be called encryption.
+
+Tests must not prove crypto behavior with fake keys, fake ciphers, identity
+transforms, or deterministic toy encryption. They may use deterministic test
+vectors for real cryptographic primitives. They may use fakes only below the
+cryptographic boundary, such as a fake transport that carries already-encrypted
+bytes without inspecting or transforming them.
+
+When real encryption is added, required tests include:
+
+- round-trip tests against real test vectors
+- tamper rejection for ciphertext, nonce, associated data, and key id
+- wrong-key rejection
+- nonce uniqueness or misuse-resistance checks, depending on the primitive
+- boundary tests proving plaintext does not cross storage, wire, or log surfaces
+  that claim encryption
+- restart/retry tests for key lookup, rotation, revocation, and expiry behavior
+
 ## Realness Bar
 
 Functional tests and demos must exercise the production boundary they claim to
