@@ -46,6 +46,8 @@
 //! runs parse → context → project → apply, and transitions the row to
 //! Applied / Blocked / Rejected. The binary polls until terminal.
 
+mod fs_cli;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -118,6 +120,12 @@ enum Commands {
         #[arg(short, long, default_value = "50")]
         limit: usize,
     },
+
+    /// Exercise forward-secret encryption facts and deterministic maintenance.
+    Fs {
+        #[command(subcommand)]
+        command: fs_cli::FsCommand,
+    },
 }
 
 fn main() {
@@ -156,6 +164,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         Commands::Send { content } => cmd_send(&db_path, &content).await,
         Commands::Messages { limit } => cmd_messages(&db_path, limit),
+        Commands::Fs { command } => fs_cli::run(&db_path, command).await,
     }
 }
 

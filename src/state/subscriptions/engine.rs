@@ -158,6 +158,7 @@ fn parsed_event_type_name(parsed: &ParsedEvent) -> &'static str {
         ParsedEvent::Need(_) => "need",
         ParsedEvent::File(_) => "file",
         ParsedEvent::FileSlice(_) => "file_slice",
+        ParsedEvent::ForwardSecret(_) => "forward_secret",
     }
 }
 

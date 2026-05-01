@@ -2,6 +2,7 @@ pub mod connection;
 pub mod encrypted;
 pub mod file;
 pub mod file_slice;
+pub mod forward_secret;
 pub mod invite_accepted;
 pub mod invite_secret;
 pub mod key_request;
@@ -65,6 +66,7 @@ pub use connection::ConnectionEvent;
 pub use encrypted::EncryptedEvent;
 pub use file::FileEvent;
 pub use file_slice::FileSliceEvent;
+pub use forward_secret::ForwardSecretEvent;
 pub use invite_accepted::InviteAcceptedEvent;
 pub use invite_secret::InviteSecretEvent;
 pub use key_request::KeyRequestEvent;
@@ -135,6 +137,7 @@ pub const EVENT_TYPE_NEGENTROPY_TREE_RESERVED: u8 = 44;
 // poc-7 slots 24/25 are reserved (see `EVENT_TYPE_FILE_LEGACY_RESERVED`).
 pub const EVENT_TYPE_FILE: u8 = 45;
 pub const EVENT_TYPE_FILE_SLICE: u8 = 46;
+pub const EVENT_TYPE_FORWARD_SECRET: u8 = 47;
 
 /// Max event blob size: 64 MiB.
 ///
@@ -228,6 +231,7 @@ pub enum ParsedEvent {
     // File family (Wave 1 chain-friendly port).
     File(FileEvent),
     FileSlice(FileSliceEvent),
+    ForwardSecret(ForwardSecretEvent),
 }
 
 impl ParsedEvent {
@@ -264,6 +268,7 @@ impl ParsedEvent {
             ParsedEvent::Need(e) => e.created_at_ms,
             ParsedEvent::File(e) => e.created_at_ms,
             ParsedEvent::FileSlice(e) => e.created_at_ms,
+            ParsedEvent::ForwardSecret(e) => e.created_at_ms,
         }
     }
 
@@ -391,6 +396,7 @@ impl ParsedEvent {
                 ("file_event_id", s.file_event_id),
                 ("signed_by", s.signed_by),
             ],
+            ParsedEvent::ForwardSecret(_) => vec![],
         }
     }
 
@@ -427,6 +433,7 @@ impl ParsedEvent {
             ParsedEvent::Need(_) => EVENT_TYPE_NEED,
             ParsedEvent::File(_) => EVENT_TYPE_FILE,
             ParsedEvent::FileSlice(_) => EVENT_TYPE_FILE_SLICE,
+            ParsedEvent::ForwardSecret(_) => EVENT_TYPE_FORWARD_SECRET,
         }
     }
 
@@ -468,7 +475,8 @@ impl ParsedEvent {
             | ParsedEvent::SyncWindow(_)
             | ParsedEvent::Compare(_)
             | ParsedEvent::Have(_)
-            | ParsedEvent::Need(_) => None,
+            | ParsedEvent::Need(_)
+            | ParsedEvent::ForwardSecret(_) => None,
         }
     }
 
@@ -506,6 +514,7 @@ impl ParsedEvent {
             ParsedEvent::Need(e) => e.human_fields(),
             ParsedEvent::File(e) => e.human_fields(),
             ParsedEvent::FileSlice(e) => e.human_fields(),
+            ParsedEvent::ForwardSecret(e) => e.human_fields(),
         }
     }
 }
@@ -613,6 +622,7 @@ pub fn registry() -> &'static EventRegistry {
             // File family (Wave 1 chain-friendly port).
             &file::FILE_META,
             &file_slice::FILE_SLICE_META,
+            &forward_secret::FORWARD_SECRET_META,
         ])
     })
 }
