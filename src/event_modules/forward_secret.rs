@@ -118,6 +118,10 @@ pub enum FsEvent {
         node_prefix: NodePrefix,
         wrap_id: EventId,
     },
+    PubkeyPurged {
+        workspace_id: WorkspaceId,
+        pubkey_id: EventId,
+    },
     MessageEncrypted {
         workspace_id: WorkspaceId,
         epoch_id: EventId,
@@ -212,6 +216,14 @@ impl FsEvent {
                 push_node(&mut out, *node_prefix);
                 push_id(&mut out, wrap_id);
             }
+            FsEvent::PubkeyPurged {
+                workspace_id,
+                pubkey_id,
+            } => {
+                out.push(9);
+                push_id(&mut out, workspace_id);
+                push_id(&mut out, pubkey_id);
+            }
             FsEvent::MessageEncrypted {
                 workspace_id,
                 epoch_id,
@@ -281,6 +293,7 @@ struct RecipientFact {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PubkeyFact {
+    workspace_id: WorkspaceId,
     recipient_id: EventId,
     prev_pubkey_id: Option<EventId>,
     public_key: [u8; 32],
@@ -317,6 +330,7 @@ pub struct PublicSnapshot {
     pub active_pubkeys: Vec<(EventId, EventId)>,
     pub wraps: Vec<WrapKey>,
     pub receipts: Vec<WrapKey>,
+    pub purged_pubkeys: Vec<EventId>,
     pub retained_cover: Vec<(EventId, NodePrefix)>,
     pub purge_cover: Vec<(EventId, NodePrefix)>,
 }
@@ -331,11 +345,13 @@ pub struct ForwardSecretProjector {
     removed_recipients: BTreeSet<EventId>,
     wraps: BTreeMap<EventId, WrapFact>,
     receipts: BTreeSet<WrapKey>,
+    purged_pubkeys: BTreeSet<EventId>,
     histories: BTreeMap<EventId, EpochHistory>,
     invite_grants: BTreeMap<EventId, Vec<NodePrefix>>,
     local_epoch_roots: BTreeMap<EventId, [u8; 32]>,
     local_node_secrets: BTreeMap<(EventId, NodePrefix), [u8; 32]>,
     local_private_keys: BTreeMap<EventId, [u8; 32]>,
+    local_unwrapped_by_pubkey: BTreeMap<EventId, BTreeSet<(EventId, NodePrefix)>>,
 }
 
 impl ForwardSecretProjector {
@@ -352,10 +368,10 @@ impl ForwardSecretProjector {
                         .or_insert(RecipientFact { kind, removed });
                 }
                 FsEvent::DevicePubkey {
+                    workspace_id,
                     recipient_id,
                     prev_pubkey_id,
                     public_key,
-                    ..
                 } => {
                     if let Some(prev) = prev_pubkey_id {
                         self.pubkey_tombstones.insert((prev, recipient_id));
@@ -367,6 +383,7 @@ impl ForwardSecretProjector {
                     }
                     let superseded = self.pubkey_is_tombstoned(event_id, recipient_id);
                     self.pubkeys.entry(event_id).or_insert(PubkeyFact {
+                        workspace_id,
                         recipient_id,
                         prev_pubkey_id,
                         public_key,
@@ -407,6 +424,7 @@ impl ForwardSecretProjector {
                         secret_commitment,
                         ciphertext_commitment,
                     });
+                    self.try_unwrap(pubkey_id, epoch_id, node_prefix);
                 }
                 FsEvent::KeyWrapReceipt {
                     epoch_id,
@@ -419,6 +437,10 @@ impl ForwardSecretProjector {
                         pubkey_id,
                         node_prefix,
                     });
+                }
+                FsEvent::PubkeyPurged { pubkey_id, .. } => {
+                    self.purged_pubkeys.insert(pubkey_id);
+                    self.purge_local_pubkey(pubkey_id);
                 }
                 FsEvent::MessageEncrypted {
                     epoch_id, coord, ..
@@ -464,7 +486,20 @@ impl ForwardSecretProjector {
     }
 
     pub fn insert_local_private_key(&mut self, pubkey_id: EventId, private_key: [u8; 32]) {
+        if self.purged_pubkeys.contains(&pubkey_id) {
+            return;
+        }
         self.local_private_keys.insert(pubkey_id, private_key);
+        let wrapped_nodes = self
+            .wraps
+            .values()
+            .filter_map(|wrap| {
+                (wrap.pubkey_id == pubkey_id).then_some((wrap.epoch_id, wrap.node_prefix))
+            })
+            .collect::<Vec<_>>();
+        for (epoch_id, node_prefix) in wrapped_nodes {
+            self.try_unwrap(pubkey_id, epoch_id, node_prefix);
+        }
     }
 
     pub fn derive_events(&self, fuel: usize) -> Projection {
@@ -536,6 +571,19 @@ impl ForwardSecretProjector {
             });
         }
 
+        for pubkey_id in self.purge_obligations() {
+            if emitted_events.len() >= fuel {
+                break;
+            }
+            let Some(pubkey) = self.pubkeys.get(&pubkey_id) else {
+                continue;
+            };
+            emitted_events.push(FsEvent::PubkeyPurged {
+                workspace_id: pubkey.workspace_id,
+                pubkey_id,
+            });
+        }
+
         Projection { emitted_events }
     }
 
@@ -580,10 +628,14 @@ impl ForwardSecretProjector {
         if self.local_epoch_roots.contains_key(&epoch_id) && history.deleted.is_empty() {
             return true;
         }
-        let leaf = coord.leaf_index();
-        self.local_node_secrets
-            .keys()
-            .any(|(secret_epoch, node)| *secret_epoch == epoch_id && node.contains_leaf(leaf))
+        self.has_key_material_for(epoch_id, coord)
+    }
+
+    pub fn can_recover_material(&self, epoch_id: EventId, coord: HistoryCoord) -> bool {
+        self.histories
+            .get(&epoch_id)
+            .is_some_and(|history| history.messages.contains(&coord))
+            && self.has_key_material_for(epoch_id, coord)
     }
 
     pub fn invite_history_grant(
@@ -647,6 +699,7 @@ impl ForwardSecretProjector {
                 })
                 .collect(),
             receipts: self.receipts.iter().cloned().collect(),
+            purged_pubkeys: self.purged_pubkeys.iter().copied().collect(),
             retained_cover,
             purge_cover,
         }
@@ -695,6 +748,16 @@ impl ForwardSecretProjector {
         }
     }
 
+    fn purge_obligations(&self) -> BTreeSet<EventId> {
+        self.local_private_keys
+            .keys()
+            .copied()
+            .filter(|pubkey_id| !self.purged_pubkeys.contains(pubkey_id))
+            .filter(|pubkey_id| self.pubkey_is_retired(*pubkey_id))
+            .filter(|pubkey_id| self.all_known_wraps_receipted(*pubkey_id))
+            .collect()
+    }
+
     fn local_secret_for(&self, epoch_id: EventId, node_prefix: NodePrefix) -> Option<[u8; 32]> {
         if node_prefix == NodePrefix::ROOT {
             self.local_epoch_roots.get(&epoch_id).copied()
@@ -703,6 +766,45 @@ impl ForwardSecretProjector {
                 .get(&(epoch_id, node_prefix))
                 .copied()
         }
+    }
+
+    fn has_key_material_for(&self, epoch_id: EventId, coord: HistoryCoord) -> bool {
+        if self.local_epoch_roots.contains_key(&epoch_id) {
+            return true;
+        }
+        let leaf = coord.leaf_index();
+        self.local_node_secrets
+            .keys()
+            .any(|(secret_epoch, node)| *secret_epoch == epoch_id && node.contains_leaf(leaf))
+            || self.local_unwrapped_by_pubkey.values().any(|nodes| {
+                nodes.iter().any(|(secret_epoch, node)| {
+                    *secret_epoch == epoch_id && node.contains_leaf(leaf)
+                })
+            })
+    }
+
+    fn try_unwrap(&mut self, pubkey_id: EventId, epoch_id: EventId, node_prefix: NodePrefix) {
+        if self.purged_pubkeys.contains(&pubkey_id) {
+            return;
+        }
+        let Some(private_key) = self.local_private_keys.get(&pubkey_id) else {
+            return;
+        };
+        let Some(pubkey) = self.pubkeys.get(&pubkey_id) else {
+            return;
+        };
+        if public_key_for_private(*private_key) != pubkey.public_key {
+            return;
+        }
+        self.local_unwrapped_by_pubkey
+            .entry(pubkey_id)
+            .or_default()
+            .insert((epoch_id, node_prefix));
+    }
+
+    fn purge_local_pubkey(&mut self, pubkey_id: EventId) {
+        self.local_private_keys.remove(&pubkey_id);
+        self.local_unwrapped_by_pubkey.remove(&pubkey_id);
     }
 
     fn has_wrap_for(&self, obligation: &WrapKey) -> bool {
@@ -725,6 +827,24 @@ impl ForwardSecretProjector {
                 recipient_is_active.then_some(*pubkey_id)
             })
             .collect()
+    }
+
+    fn pubkey_is_retired(&self, pubkey_id: EventId) -> bool {
+        self.pubkeys.get(&pubkey_id).is_some_and(|pubkey| {
+            self.pubkey_is_tombstoned(pubkey_id, pubkey.recipient_id)
+                || self.recipient_removed(pubkey.recipient_id)
+        })
+    }
+
+    fn all_known_wraps_receipted(&self, pubkey_id: EventId) -> bool {
+        self.wraps.values().all(|wrap| {
+            wrap.pubkey_id != pubkey_id
+                || self.receipts.contains(&WrapKey {
+                    epoch_id: wrap.epoch_id,
+                    pubkey_id,
+                    node_prefix: wrap.node_prefix,
+                })
+        })
     }
 
     fn removed_recipients_at_epoch(&self, epoch_id: EventId) -> BTreeSet<EventId> {

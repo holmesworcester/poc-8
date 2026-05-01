@@ -11,6 +11,12 @@ pub const TYPE_CONNECTION: u8 = 3;
 pub const TYPE_SYNC_COMPARE: u8 = 4;
 pub const TYPE_SYNC_HAVE: u8 = 5;
 pub const TYPE_SYNC_NEED: u8 = 6;
+pub const TYPE_REACTION: u8 = 7;
+pub const TYPE_MESSAGE_DELETION: u8 = 8;
+pub const TYPE_FILE: u8 = 9;
+pub const TYPE_ACCOUNT: u8 = 10;
+pub const TYPE_INVITE: u8 = 11;
+pub const TYPE_INVITE_ACCEPTED: u8 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -31,6 +37,12 @@ impl Scope {
 pub enum Event {
     Workspace(WorkspaceEvent),
     Message(MessageEvent),
+    Reaction(ReactionEvent),
+    MessageDeletion(MessageDeletionEvent),
+    File(FileEvent),
+    Account(AccountEvent),
+    Invite(InviteEvent),
+    InviteAccepted(InviteAcceptedEvent),
     Connection(ConnectionEvent),
     SyncCompare(SyncCompareEvent),
     SyncHave(SyncHaveEvent),
@@ -40,7 +52,14 @@ pub enum Event {
 impl Event {
     pub fn scope(&self) -> Scope {
         match self {
-            Event::Workspace(_) | Event::Message(_) => Scope::Shared,
+            Event::Workspace(_)
+            | Event::Message(_)
+            | Event::Reaction(_)
+            | Event::MessageDeletion(_)
+            | Event::File(_)
+            | Event::Account(_)
+            | Event::Invite(_)
+            | Event::InviteAccepted(_) => Scope::Shared,
             Event::Connection(_)
             | Event::SyncCompare(_)
             | Event::SyncHave(_)
@@ -52,6 +71,12 @@ impl Event {
         match self {
             Event::Workspace(e) => e.workspace_id,
             Event::Message(e) => e.workspace_id,
+            Event::Reaction(e) => e.workspace_id,
+            Event::MessageDeletion(e) => e.workspace_id,
+            Event::File(e) => e.workspace_id,
+            Event::Account(e) => e.workspace_id,
+            Event::Invite(e) => e.workspace_id,
+            Event::InviteAccepted(e) => e.workspace_id,
             Event::Connection(e) => e.workspace_id,
             Event::SyncCompare(e) => e.workspace_id,
             Event::SyncHave(e) => e.workspace_id,
@@ -66,6 +91,12 @@ impl Event {
             | Event::SyncHave(_)
             | Event::SyncNeed(_) => Vec::new(),
             Event::Message(e) => non_zero_ids([e.workspace_event_id, e.reply_to_event_id]),
+            Event::Reaction(e) => non_zero_ids([e.message_event_id]),
+            Event::MessageDeletion(e) => non_zero_ids([e.message_event_id]),
+            Event::File(e) => non_zero_ids([e.workspace_event_id]),
+            Event::Account(e) => non_zero_ids([e.workspace_event_id]),
+            Event::Invite(e) => non_zero_ids([e.workspace_event_id]),
+            Event::InviteAccepted(e) => non_zero_ids([e.invite_event_id]),
             Event::Connection(e) => non_zero_ids([e.workspace_event_id]),
         }
     }
@@ -84,6 +115,52 @@ pub struct MessageEvent {
     pub reply_to_event_id: EventId,
     pub fanout_connection_id: ConnectionId,
     pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactionEvent {
+    pub workspace_id: WorkspaceId,
+    pub message_event_id: EventId,
+    pub emoji: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageDeletionEvent {
+    pub workspace_id: WorkspaceId,
+    pub message_event_id: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEvent {
+    pub workspace_id: WorkspaceId,
+    pub workspace_event_id: EventId,
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountEvent {
+    pub workspace_id: WorkspaceId,
+    pub workspace_event_id: EventId,
+    pub account_id: [u8; 32],
+    pub username: String,
+    pub device_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteEvent {
+    pub workspace_id: WorkspaceId,
+    pub workspace_event_id: EventId,
+    pub invite_id: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteAcceptedEvent {
+    pub workspace_id: WorkspaceId,
+    pub invite_event_id: EventId,
+    pub account_id: [u8; 32],
+    pub username: String,
+    pub device_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +268,55 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_messages_workspace
             ON messages(workspace_id);
+        CREATE TABLE IF NOT EXISTS reactions (
+            event_id BLOB PRIMARY KEY NOT NULL,
+            workspace_id BLOB NOT NULL,
+            message_event_id BLOB NOT NULL,
+            emoji TEXT NOT NULL,
+            source_event_id BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_reactions_message
+            ON reactions(message_event_id);
+        CREATE TABLE IF NOT EXISTS deleted_messages (
+            message_event_id BLOB PRIMARY KEY NOT NULL,
+            deletion_event_id BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS files (
+            event_id BLOB PRIMARY KEY NOT NULL,
+            workspace_id BLOB NOT NULL,
+            name TEXT NOT NULL,
+            byte_len INTEGER NOT NULL,
+            content_hash TEXT NOT NULL,
+            bytes BLOB NOT NULL,
+            source_event_id BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_files_workspace
+            ON files(workspace_id);
+        CREATE TABLE IF NOT EXISTS accounts (
+            account_id BLOB PRIMARY KEY NOT NULL,
+            workspace_id BLOB NOT NULL,
+            username TEXT NOT NULL,
+            device_name TEXT NOT NULL,
+            source_event_id BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_accounts_workspace
+            ON accounts(workspace_id);
+        CREATE TABLE IF NOT EXISTS invites (
+            event_id BLOB PRIMARY KEY NOT NULL,
+            workspace_id BLOB NOT NULL,
+            invite_id BLOB NOT NULL,
+            source_event_id BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_invites_workspace
+            ON invites(workspace_id);
+        CREATE TABLE IF NOT EXISTS invite_acceptances (
+            account_id BLOB PRIMARY KEY NOT NULL,
+            workspace_id BLOB NOT NULL,
+            invite_event_id BLOB NOT NULL,
+            source_event_id BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_invite_acceptances_workspace
+            ON invite_acceptances(workspace_id);
         CREATE TABLE IF NOT EXISTS connections (
             connection_id BLOB PRIMARY KEY NOT NULL,
             workspace_id BLOB NOT NULL,
@@ -231,10 +357,33 @@ pub fn project(
     match event {
         Event::Workspace(e) => project_workspace(event_id, e),
         Event::Message(e) => project_message(event_id, e, labels),
+        Event::Reaction(e) => project_reaction(event_id, e, labels),
+        Event::MessageDeletion(e) => project_message_deletion(event_id, e),
+        Event::File(e) => project_file(event_id, e),
+        Event::Account(e) => project_account(event_id, e),
+        Event::Invite(e) => project_invite(event_id, e),
+        Event::InviteAccepted(e) => project_invite_accepted(event_id, e),
         Event::Connection(e) => project_connection(event_id, e),
         Event::SyncCompare(e) => project_sync_compare(event_id, e),
         Event::SyncHave(e) => project_sync_have(event_id, e),
         Event::SyncNeed(e) => project_sync_need(event_id, e, context),
+    }
+}
+
+pub fn event_type_name(event: &Event) -> &'static str {
+    match event {
+        Event::Workspace(_) => "workspace",
+        Event::Message(_) => "message",
+        Event::Reaction(_) => "reaction",
+        Event::MessageDeletion(_) => "message_deletion",
+        Event::File(_) => "file",
+        Event::Account(_) => "account",
+        Event::Invite(_) => "invite",
+        Event::InviteAccepted(_) => "invite_accepted",
+        Event::Connection(_) => "connection",
+        Event::SyncCompare(_) => "sync_compare",
+        Event::SyncHave(_) => "sync_have",
+        Event::SyncNeed(_) => "sync_need",
     }
 }
 
@@ -302,6 +451,196 @@ fn project_message(
     }
 
     projection
+}
+
+fn project_reaction(
+    event_id: EventId,
+    event: &ReactionEvent,
+    labels: &HashMap<EventId, Vec<String>>,
+) -> Projection {
+    if labels
+        .get(&event.message_event_id)
+        .is_some_and(|labels| labels.iter().any(|label| label == "deleted"))
+    {
+        return Projection::default();
+    }
+
+    Projection {
+        row_ops: vec![RowOp::upsert(
+            "reactions",
+            &[
+                "event_id",
+                "workspace_id",
+                "message_event_id",
+                "emoji",
+                "source_event_id",
+            ],
+            vec![
+                SqlValue::Blob(event_id.to_vec()),
+                SqlValue::Blob(event.workspace_id.to_vec()),
+                SqlValue::Blob(event.message_event_id.to_vec()),
+                SqlValue::Text(event.emoji.clone()),
+                SqlValue::Blob(event_id.to_vec()),
+            ],
+        )],
+        labels: vec![LabelOp {
+            subject_event_id: event_id,
+            label: "reaction".to_string(),
+        }],
+        ..Projection::default()
+    }
+}
+
+fn project_message_deletion(event_id: EventId, event: &MessageDeletionEvent) -> Projection {
+    Projection {
+        row_ops: vec![RowOp::upsert(
+            "deleted_messages",
+            &["message_event_id", "deletion_event_id"],
+            vec![
+                SqlValue::Blob(event.message_event_id.to_vec()),
+                SqlValue::Blob(event_id.to_vec()),
+            ],
+        )],
+        labels: vec![
+            LabelOp {
+                subject_event_id: event.message_event_id,
+                label: "deleted".to_string(),
+            },
+            LabelOp {
+                subject_event_id: event_id,
+                label: "message_deletion".to_string(),
+            },
+        ],
+        ..Projection::default()
+    }
+}
+
+fn project_file(event_id: EventId, event: &FileEvent) -> Projection {
+    Projection {
+        row_ops: vec![RowOp::upsert(
+            "files",
+            &[
+                "event_id",
+                "workspace_id",
+                "name",
+                "byte_len",
+                "content_hash",
+                "bytes",
+                "source_event_id",
+            ],
+            vec![
+                SqlValue::Blob(event_id.to_vec()),
+                SqlValue::Blob(event.workspace_id.to_vec()),
+                SqlValue::Text(event.name.clone()),
+                SqlValue::Integer(event.bytes.len() as i64),
+                SqlValue::Text(blake3::hash(&event.bytes).to_hex().to_string()),
+                SqlValue::Blob(event.bytes.clone()),
+                SqlValue::Blob(event_id.to_vec()),
+            ],
+        )],
+        labels: vec![LabelOp {
+            subject_event_id: event_id,
+            label: "file".to_string(),
+        }],
+        ..Projection::default()
+    }
+}
+
+fn project_account(event_id: EventId, event: &AccountEvent) -> Projection {
+    Projection {
+        row_ops: vec![account_row(
+            event.account_id,
+            event.workspace_id,
+            &event.username,
+            &event.device_name,
+            event_id,
+        )],
+        labels: vec![LabelOp {
+            subject_event_id: event_id,
+            label: "account".to_string(),
+        }],
+        ..Projection::default()
+    }
+}
+
+fn project_invite(event_id: EventId, event: &InviteEvent) -> Projection {
+    Projection {
+        row_ops: vec![RowOp::upsert(
+            "invites",
+            &["event_id", "workspace_id", "invite_id", "source_event_id"],
+            vec![
+                SqlValue::Blob(event_id.to_vec()),
+                SqlValue::Blob(event.workspace_id.to_vec()),
+                SqlValue::Blob(event.invite_id.to_vec()),
+                SqlValue::Blob(event_id.to_vec()),
+            ],
+        )],
+        labels: vec![LabelOp {
+            subject_event_id: event_id,
+            label: "invite".to_string(),
+        }],
+        ..Projection::default()
+    }
+}
+
+fn project_invite_accepted(event_id: EventId, event: &InviteAcceptedEvent) -> Projection {
+    Projection {
+        row_ops: vec![
+            account_row(
+                event.account_id,
+                event.workspace_id,
+                &event.username,
+                &event.device_name,
+                event_id,
+            ),
+            RowOp::upsert(
+                "invite_acceptances",
+                &[
+                    "account_id",
+                    "workspace_id",
+                    "invite_event_id",
+                    "source_event_id",
+                ],
+                vec![
+                    SqlValue::Blob(event.account_id.to_vec()),
+                    SqlValue::Blob(event.workspace_id.to_vec()),
+                    SqlValue::Blob(event.invite_event_id.to_vec()),
+                    SqlValue::Blob(event_id.to_vec()),
+                ],
+            ),
+        ],
+        labels: vec![LabelOp {
+            subject_event_id: event_id,
+            label: "invite_accepted".to_string(),
+        }],
+        ..Projection::default()
+    }
+}
+
+fn account_row(
+    account_id: [u8; 32],
+    workspace_id: WorkspaceId,
+    username: &str,
+    device_name: &str,
+    source_event_id: EventId,
+) -> RowOp {
+    RowOp::upsert(
+        "accounts",
+        &[
+            "account_id",
+            "workspace_id",
+            "username",
+            "device_name",
+            "source_event_id",
+        ],
+        vec![
+            SqlValue::Blob(account_id.to_vec()),
+            SqlValue::Blob(workspace_id.to_vec()),
+            SqlValue::Text(username.to_string()),
+            SqlValue::Text(device_name.to_string()),
+            SqlValue::Blob(source_event_id.to_vec()),
+        ],
+    )
 }
 
 fn project_connection(event_id: EventId, event: &ConnectionEvent) -> Projection {
@@ -454,6 +793,83 @@ pub fn encode_connection(
     out
 }
 
+pub fn encode_reaction(
+    workspace_id: WorkspaceId,
+    message_event_id: EventId,
+    emoji: &str,
+) -> Vec<u8> {
+    let mut out = vec![TYPE_REACTION];
+    out.extend_from_slice(&workspace_id);
+    out.extend_from_slice(&message_event_id);
+    put_string_u16(&mut out, emoji);
+    out
+}
+
+pub fn encode_message_deletion(workspace_id: WorkspaceId, message_event_id: EventId) -> Vec<u8> {
+    let mut out = vec![TYPE_MESSAGE_DELETION];
+    out.extend_from_slice(&workspace_id);
+    out.extend_from_slice(&message_event_id);
+    out
+}
+
+pub fn encode_file(
+    workspace_id: WorkspaceId,
+    workspace_event_id: EventId,
+    name: &str,
+    bytes: &[u8],
+) -> Vec<u8> {
+    let mut out = vec![TYPE_FILE];
+    out.extend_from_slice(&workspace_id);
+    out.extend_from_slice(&workspace_event_id);
+    put_string_u16(&mut out, name);
+    put_bytes_u64(&mut out, bytes);
+    out
+}
+
+pub fn encode_account(
+    workspace_id: WorkspaceId,
+    workspace_event_id: EventId,
+    account_id: [u8; 32],
+    username: &str,
+    device_name: &str,
+) -> Vec<u8> {
+    let mut out = vec![TYPE_ACCOUNT];
+    out.extend_from_slice(&workspace_id);
+    out.extend_from_slice(&workspace_event_id);
+    out.extend_from_slice(&account_id);
+    put_string_u16(&mut out, username);
+    put_string_u16(&mut out, device_name);
+    out
+}
+
+pub fn encode_invite(
+    workspace_id: WorkspaceId,
+    workspace_event_id: EventId,
+    invite_id: [u8; 32],
+) -> Vec<u8> {
+    let mut out = vec![TYPE_INVITE];
+    out.extend_from_slice(&workspace_id);
+    out.extend_from_slice(&workspace_event_id);
+    out.extend_from_slice(&invite_id);
+    out
+}
+
+pub fn encode_invite_accepted(
+    workspace_id: WorkspaceId,
+    invite_event_id: EventId,
+    account_id: [u8; 32],
+    username: &str,
+    device_name: &str,
+) -> Vec<u8> {
+    let mut out = vec![TYPE_INVITE_ACCEPTED];
+    out.extend_from_slice(&workspace_id);
+    out.extend_from_slice(&invite_event_id);
+    out.extend_from_slice(&account_id);
+    put_string_u16(&mut out, username);
+    put_string_u16(&mut out, device_name);
+    out
+}
+
 pub fn encode_sync_compare(
     workspace_id: WorkspaceId,
     connection_id: ConnectionId,
@@ -501,6 +917,80 @@ pub fn decode(bytes: &[u8]) -> Result<Event, EventError> {
                 reply_to_event_id,
                 fanout_connection_id,
                 body,
+            }))
+        }
+        TYPE_REACTION => {
+            let workspace_id = cursor.id()?;
+            let message_event_id = cursor.id()?;
+            let emoji = cursor.string_u16()?;
+            cursor.finish()?;
+            Ok(Event::Reaction(ReactionEvent {
+                workspace_id,
+                message_event_id,
+                emoji,
+            }))
+        }
+        TYPE_MESSAGE_DELETION => {
+            let workspace_id = cursor.id()?;
+            let message_event_id = cursor.id()?;
+            cursor.finish()?;
+            Ok(Event::MessageDeletion(MessageDeletionEvent {
+                workspace_id,
+                message_event_id,
+            }))
+        }
+        TYPE_FILE => {
+            let workspace_id = cursor.id()?;
+            let workspace_event_id = cursor.id()?;
+            let name = cursor.string_u16()?;
+            let bytes = cursor.bytes_u64()?;
+            cursor.finish()?;
+            Ok(Event::File(FileEvent {
+                workspace_id,
+                workspace_event_id,
+                name,
+                bytes,
+            }))
+        }
+        TYPE_ACCOUNT => {
+            let workspace_id = cursor.id()?;
+            let workspace_event_id = cursor.id()?;
+            let account_id = cursor.id()?;
+            let username = cursor.string_u16()?;
+            let device_name = cursor.string_u16()?;
+            cursor.finish()?;
+            Ok(Event::Account(AccountEvent {
+                workspace_id,
+                workspace_event_id,
+                account_id,
+                username,
+                device_name,
+            }))
+        }
+        TYPE_INVITE => {
+            let workspace_id = cursor.id()?;
+            let workspace_event_id = cursor.id()?;
+            let invite_id = cursor.id()?;
+            cursor.finish()?;
+            Ok(Event::Invite(InviteEvent {
+                workspace_id,
+                workspace_event_id,
+                invite_id,
+            }))
+        }
+        TYPE_INVITE_ACCEPTED => {
+            let workspace_id = cursor.id()?;
+            let invite_event_id = cursor.id()?;
+            let account_id = cursor.id()?;
+            let username = cursor.string_u16()?;
+            let device_name = cursor.string_u16()?;
+            cursor.finish()?;
+            Ok(Event::InviteAccepted(InviteAcceptedEvent {
+                workspace_id,
+                invite_event_id,
+                account_id,
+                username,
+                device_name,
             }))
         }
         TYPE_CONNECTION => {
@@ -573,6 +1063,12 @@ fn put_string_u32(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(value.as_bytes());
 }
 
+fn put_bytes_u64(out: &mut Vec<u8>, value: &[u8]) {
+    let len = u64::try_from(value.len()).expect("bytes too large for u64 codec");
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(value);
+}
+
 struct Cursor<'a> {
     rest: &'a [u8],
 }
@@ -621,6 +1117,30 @@ impl<'a> Cursor<'a> {
         String::from_utf8(head.to_vec()).map_err(|_| EventError::InvalidUtf8)
     }
 
+    fn bytes_u64(&mut self) -> Result<Vec<u8>, EventError> {
+        if self.rest.len() < 8 {
+            return Err(EventError::Truncated);
+        }
+        let len = u64::from_be_bytes([
+            self.rest[0],
+            self.rest[1],
+            self.rest[2],
+            self.rest[3],
+            self.rest[4],
+            self.rest[5],
+            self.rest[6],
+            self.rest[7],
+        ]);
+        self.rest = &self.rest[8..];
+        let len = usize::try_from(len).map_err(|_| EventError::Truncated)?;
+        if self.rest.len() < len {
+            return Err(EventError::Truncated);
+        }
+        let (head, tail) = self.rest.split_at(len);
+        self.rest = tail;
+        Ok(head.to_vec())
+    }
+
     fn three_ids(&mut self) -> Result<([u8; 32], [u8; 32], [u8; 32]), EventError> {
         let first = self.id()?;
         let second = self.id()?;
@@ -664,5 +1184,75 @@ mod tests {
         let event = decode(&bytes).unwrap();
 
         assert_eq!(event.dependency_ids(), vec![workspace_event_id]);
+    }
+
+    #[test]
+    fn reaction_depends_on_message() {
+        let message_id = [4; 32];
+        let bytes = encode_reaction([1; 32], message_id, "heart");
+        let event = decode(&bytes).unwrap();
+
+        assert_eq!(event.dependency_ids(), vec![message_id]);
+        assert_eq!(event_type_name(&event), "reaction");
+    }
+
+    #[test]
+    fn file_codec_round_trips_and_depends_on_workspace() {
+        let workspace_id = [1; 32];
+        let workspace_event_id = [2; 32];
+        let bytes = encode_file(workspace_id, workspace_event_id, "a.bin", b"abc");
+        let event = decode(&bytes).unwrap();
+
+        assert_eq!(
+            event,
+            Event::File(FileEvent {
+                workspace_id,
+                workspace_event_id,
+                name: "a.bin".to_string(),
+                bytes: b"abc".to_vec(),
+            })
+        );
+        assert_eq!(event.dependency_ids(), vec![workspace_event_id]);
+        assert_eq!(event_type_name(&event), "file");
+    }
+
+    #[test]
+    fn account_and_invite_codecs_express_dependencies() {
+        let workspace_id = [1; 32];
+        let workspace_event_id = [2; 32];
+        let account_id = [3; 32];
+        let invite_id = [4; 32];
+        let account = decode(&encode_account(
+            workspace_id,
+            workspace_event_id,
+            account_id,
+            "alice",
+            "laptop",
+        ))
+        .unwrap();
+        let invite = decode(&encode_invite(workspace_id, workspace_event_id, invite_id)).unwrap();
+
+        assert_eq!(account.dependency_ids(), vec![workspace_event_id]);
+        assert_eq!(event_type_name(&account), "account");
+        assert_eq!(invite.dependency_ids(), vec![workspace_event_id]);
+        assert_eq!(event_type_name(&invite), "invite");
+    }
+
+    #[test]
+    fn invite_accepted_depends_on_invite() {
+        let workspace_id = [1; 32];
+        let invite_event_id = [9; 32];
+        let account_id = [3; 32];
+        let event = decode(&encode_invite_accepted(
+            workspace_id,
+            invite_event_id,
+            account_id,
+            "bob",
+            "phone",
+        ))
+        .unwrap();
+
+        assert_eq!(event.dependency_ids(), vec![invite_event_id]);
+        assert_eq!(event_type_name(&event), "invite_accepted");
     }
 }

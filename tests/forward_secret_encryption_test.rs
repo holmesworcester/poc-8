@@ -104,6 +104,21 @@ fn converge(projector: &mut ForwardSecretProjector, fuel: usize) {
     panic!("forward-secret projector did not converge");
 }
 
+fn converge_recording(projector: &mut ForwardSecretProjector, fuel: usize) -> Vec<FsEvent> {
+    let mut recorded = Vec::new();
+    for _ in 0..2048 {
+        let generated = projector.derive_events(fuel).emitted_events;
+        if generated.is_empty() {
+            return recorded;
+        }
+        for event in generated {
+            recorded.push(event.clone());
+            projector.apply_event(event, 0);
+        }
+    }
+    panic!("forward-secret projector did not converge");
+}
+
 #[test]
 fn out_of_order_tombstones_and_removals_still_converge() {
     let alice = id("alice-ooo");
@@ -129,6 +144,85 @@ fn out_of_order_tombstones_and_removals_still_converge() {
         .wraps
         .iter()
         .any(|wrap| wrap.epoch_id == first_epoch_id));
+}
+
+#[test]
+fn partitioned_join_unknown_to_remover_gets_wrap_after_heal() {
+    let alice = id("alice-partition");
+    let bob = id("bob-partition");
+    let cara = id("cara-partition");
+    let alice_key = pubkey(alice, None, "alice-partition-key");
+    let bob_key = pubkey(bob, None, "bob-partition-key");
+    let cara_key = pubkey(cara, None, "cara-partition-key");
+    let alice_key_id = alice_key.event_id();
+    let bob_key_id = bob_key.event_id();
+    let cara_key_id = cara_key.event_id();
+    let removal_epoch = epoch(None, Some(bob), "partition-removal-root");
+    let removal_epoch_id = removal_epoch.event_id();
+
+    let mut partitioned_rotator = ForwardSecretProjector::default();
+    apply_all(
+        &mut partitioned_rotator,
+        [
+            recipient(alice),
+            recipient(bob),
+            alice_key.clone(),
+            bob_key.clone(),
+            removal_epoch.clone(),
+        ],
+    );
+    partitioned_rotator.insert_local_epoch_root(removal_epoch_id, root("partition-removal-root"));
+    converge(&mut partitioned_rotator, 32);
+
+    let before_heal = partitioned_rotator.public_snapshot();
+    assert!(before_heal.wraps.contains(&WrapKey {
+        epoch_id: removal_epoch_id,
+        pubkey_id: alice_key_id,
+        node_prefix: NodePrefix::ROOT,
+    }));
+    assert!(!before_heal.wraps.contains(&WrapKey {
+        epoch_id: removal_epoch_id,
+        pubkey_id: bob_key_id,
+        node_prefix: NodePrefix::ROOT,
+    }));
+    assert!(!before_heal.wraps.contains(&WrapKey {
+        epoch_id: removal_epoch_id,
+        pubkey_id: cara_key_id,
+        node_prefix: NodePrefix::ROOT,
+    }));
+
+    partitioned_rotator.apply_event(recipient(cara), 0);
+    partitioned_rotator.apply_event(cara_key.clone(), 0);
+    converge(&mut partitioned_rotator, 32);
+
+    let mut all_at_once = ForwardSecretProjector::default();
+    apply_all(
+        &mut all_at_once,
+        [
+            recipient(cara),
+            cara_key,
+            removal_epoch,
+            bob_key,
+            recipient(bob),
+            alice_key,
+            recipient(alice),
+        ],
+    );
+    all_at_once.insert_local_epoch_root(removal_epoch_id, root("partition-removal-root"));
+    converge(&mut all_at_once, 32);
+
+    let healed = partitioned_rotator.public_snapshot();
+    assert!(healed.wraps.contains(&WrapKey {
+        epoch_id: removal_epoch_id,
+        pubkey_id: cara_key_id,
+        node_prefix: NodePrefix::ROOT,
+    }));
+    assert!(!healed.wraps.contains(&WrapKey {
+        epoch_id: removal_epoch_id,
+        pubkey_id: bob_key_id,
+        node_prefix: NodePrefix::ROOT,
+    }));
+    assert_eq!(healed, all_at_once.public_snapshot());
 }
 
 #[test]
@@ -232,6 +326,60 @@ fn pubkey_tombstones_receipts_and_removal_frontier_drive_wraps() {
         pubkey_id: cara_key_id,
         node_prefix: NodePrefix::ROOT,
     }));
+}
+
+#[test]
+fn purged_pubkey_blocks_post_compromise_recovery_from_canonical_events() {
+    let alice = id("alice-fs");
+    let alice_key_v1 = pubkey(alice, None, "alice-fs-key-v1");
+    let alice_key_v1_id = alice_key_v1.event_id();
+    let first_epoch = epoch(None, None, "fs-root");
+    let first_epoch_id = first_epoch.event_id();
+    let deleted_coord = coord(60, "fs-deleted");
+    let deleted_message = message(first_epoch_id, 60, "fs-deleted");
+
+    let mut canonical_events = vec![
+        recipient(alice),
+        alice_key_v1.clone(),
+        first_epoch.clone(),
+        deleted_message,
+    ];
+    let mut live = ForwardSecretProjector::default();
+    apply_all(&mut live, canonical_events.clone());
+    live.insert_local_epoch_root(first_epoch_id, root("fs-root"));
+    canonical_events.extend(converge_recording(&mut live, 32));
+
+    live.insert_local_private_key(alice_key_v1_id, private("alice-fs-key-v1"));
+    canonical_events.extend(converge_recording(&mut live, 32));
+
+    let alice_key_v2 = pubkey(alice, Some(alice_key_v1_id), "alice-fs-key-v2");
+    canonical_events.push(alice_key_v2.clone());
+    live.apply_event(alice_key_v2, 0);
+    canonical_events.extend(converge_recording(&mut live, 32));
+
+    assert!(live
+        .public_snapshot()
+        .purged_pubkeys
+        .contains(&alice_key_v1_id));
+
+    let delete_event = delete(first_epoch_id, vec![deleted_coord]);
+    canonical_events.push(delete_event.clone());
+    live.apply_event(delete_event, 0);
+    assert!(!live.can_decrypt(first_epoch_id, deleted_coord));
+
+    let mut attacker_after_purge = ForwardSecretProjector::default();
+    apply_all(&mut attacker_after_purge, canonical_events.clone());
+    attacker_after_purge.insert_local_private_key(alice_key_v1_id, private("alice-fs-key-v1"));
+    assert!(!attacker_after_purge.can_recover_material(first_epoch_id, deleted_coord));
+
+    let canonical_without_purge = canonical_events
+        .into_iter()
+        .filter(|event| !matches!(event, FsEvent::PubkeyPurged { .. }))
+        .collect::<Vec<_>>();
+    let mut attacker_before_purge = ForwardSecretProjector::default();
+    apply_all(&mut attacker_before_purge, canonical_without_purge);
+    attacker_before_purge.insert_local_private_key(alice_key_v1_id, private("alice-fs-key-v1"));
+    assert!(attacker_before_purge.can_recover_material(first_epoch_id, deleted_coord));
 }
 
 #[test]

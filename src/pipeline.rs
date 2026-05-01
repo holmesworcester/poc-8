@@ -24,6 +24,12 @@ pub fn open_memory() -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+pub fn open_path(path: impl AsRef<std::path::Path>) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(path)?;
+    ensure_schema(&conn)?;
+    Ok(conn)
+}
+
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
