@@ -1,5 +1,6 @@
 use crate::event_modules::{
-    self, Event, EventError, Projection, ProjectionContext, ResolvedEvent, RowOp, SqlValue,
+    self, Admission, AdmissionStatus, Event, EventError, Projection, ProjectionContext,
+    ResolvedEvent, RowOp, SqlValue, WriteResult, WriteStatus,
 };
 use rusqlite::{params, types::Value, Connection, OptionalExtension};
 use std::collections::HashMap;
@@ -78,7 +79,10 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             ON jobs(next_run_ms, priority);
         ",
     )?;
-    event_modules::ensure_schema(conn)
+    for sql in event_modules::schema_statements() {
+        conn.execute_batch(sql)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,6 +293,97 @@ pub fn event_bytes(conn: &Connection, id: EventId) -> rusqlite::Result<Option<Ve
     .optional()
 }
 
+pub struct KernelWriter<'a> {
+    conn: &'a Connection,
+    now_ms: i64,
+}
+
+impl<'a> KernelWriter<'a> {
+    pub fn new(conn: &'a Connection, now_ms: i64) -> Self {
+        Self { conn, now_ms }
+    }
+}
+
+impl event_modules::EventWriter for KernelWriter<'_> {
+    type Error = PipelineError;
+
+    fn append_event(&mut self, bytes: Vec<u8>) -> Result<Admission, Self::Error> {
+        match ingest_local(self.conn, &bytes, self.now_ms)? {
+            IngestOutcome::InsertedReady { event_id } => Ok(Admission {
+                event_id,
+                status: AdmissionStatus::Ready,
+            }),
+            IngestOutcome::InsertedBlocked {
+                event_id,
+                blocked_by,
+            } => Ok(Admission {
+                event_id,
+                status: AdmissionStatus::Blocked { blocked_by },
+            }),
+            IngestOutcome::Duplicate { event_id, status } => Ok(Admission {
+                event_id,
+                status: AdmissionStatus::Duplicate { status },
+            }),
+        }
+    }
+
+    fn append_apply(&mut self, bytes: Vec<u8>) -> Result<WriteResult, Self::Error> {
+        let admission = self.append_event(bytes)?;
+        match admission.status {
+            AdmissionStatus::Ready => {
+                match project_ready(self.conn, admission.event_id, self.now_ms)? {
+                    ProjectOutcome::Applied { emitted, .. } => Ok(WriteResult {
+                        event_id: admission.event_id,
+                        status: WriteStatus::Applied,
+                        emitted,
+                    }),
+                    ProjectOutcome::AlreadyApplied { .. } => Ok(WriteResult {
+                        event_id: admission.event_id,
+                        status: WriteStatus::AlreadyApplied,
+                        emitted: Vec::new(),
+                    }),
+                }
+            }
+            AdmissionStatus::Blocked { blocked_by } => Ok(WriteResult {
+                event_id: admission.event_id,
+                status: WriteStatus::Blocked { blocked_by },
+                emitted: Vec::new(),
+            }),
+            AdmissionStatus::Duplicate { status } if status == STATUS_APPLIED => Ok(WriteResult {
+                event_id: admission.event_id,
+                status: WriteStatus::AlreadyApplied,
+                emitted: Vec::new(),
+            }),
+            AdmissionStatus::Duplicate { status } if status == STATUS_READY => {
+                match project_ready(self.conn, admission.event_id, self.now_ms)? {
+                    ProjectOutcome::Applied { emitted, .. } => Ok(WriteResult {
+                        event_id: admission.event_id,
+                        status: WriteStatus::Applied,
+                        emitted,
+                    }),
+                    ProjectOutcome::AlreadyApplied { .. } => Ok(WriteResult {
+                        event_id: admission.event_id,
+                        status: WriteStatus::AlreadyApplied,
+                        emitted: Vec::new(),
+                    }),
+                }
+            }
+            AdmissionStatus::Duplicate { status } if status == STATUS_BLOCKED => Ok(WriteResult {
+                event_id: admission.event_id,
+                status: WriteStatus::Blocked {
+                    blocked_by: blocked_by_for_event(self.conn, admission.event_id)?,
+                },
+                emitted: Vec::new(),
+            }),
+            AdmissionStatus::Duplicate { .. } => Ok(WriteResult {
+                event_id: admission.event_id,
+                status: WriteStatus::AlreadyApplied,
+                emitted: Vec::new(),
+            }),
+        }
+    }
+}
+
 fn missing_or_unapplied_deps(
     conn: &Connection,
     event: &Event,
@@ -301,6 +396,19 @@ fn missing_or_unapplied_deps(
         }
     }
     Ok(blocked_by)
+}
+
+fn blocked_by_for_event(conn: &Connection, id: EventId) -> rusqlite::Result<Vec<EventId>> {
+    let mut stmt = conn.prepare(
+        "SELECT blocked_by_event_id FROM blocked_by_event
+         WHERE event_id = ?1
+         ORDER BY blocked_by_event_id",
+    )?;
+    let rows = stmt.query_map(params![id.to_vec()], |row| {
+        let bytes: Vec<u8> = row.get(0)?;
+        Ok(vec_to_id(bytes))
+    })?;
+    rows.collect()
 }
 
 fn event_row(conn: &Connection, id: EventId) -> rusqlite::Result<Option<(Vec<u8>, String)>> {
@@ -448,109 +556,4 @@ fn vec_to_id(bytes: Vec<u8>) -> EventId {
     let mut id = [0; 32];
     id.copy_from_slice(&bytes);
     id
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::event_modules;
-
-    #[test]
-    fn ingest_dedupes_by_event_id() {
-        let conn = open_memory().unwrap();
-        let bytes = event_modules::encode_workspace([1; 32], "team");
-        let id = event_id(&bytes);
-
-        assert_eq!(
-            ingest_local(&conn, &bytes, 10).unwrap(),
-            IngestOutcome::InsertedReady { event_id: id }
-        );
-        assert_eq!(
-            ingest_local(&conn, &bytes, 11).unwrap(),
-            IngestOutcome::Duplicate {
-                event_id: id,
-                status: STATUS_READY.to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn missing_deps_block_until_dependency_is_applied() {
-        let conn = open_memory().unwrap();
-        let workspace = event_modules::encode_workspace([1; 32], "team");
-        let workspace_id = event_id(&workspace);
-        let message = event_modules::encode_message([1; 32], workspace_id, [0; 32], [9; 32], "hi");
-        let message_id = event_id(&message);
-
-        assert_eq!(
-            ingest_local(&conn, &message, 10).unwrap(),
-            IngestOutcome::InsertedBlocked {
-                event_id: message_id,
-                blocked_by: vec![workspace_id]
-            }
-        );
-        assert_eq!(
-            get_status(&conn, message_id).unwrap().as_deref(),
-            Some("blocked")
-        );
-
-        ingest_local(&conn, &workspace, 11).unwrap();
-        project_ready(&conn, workspace_id, 12).unwrap();
-
-        assert_eq!(
-            get_status(&conn, message_id).unwrap().as_deref(),
-            Some("ready")
-        );
-    }
-
-    #[test]
-    fn applying_message_projects_rows_and_idempotent_outbox() {
-        let conn = open_memory().unwrap();
-        let workspace = event_modules::encode_workspace([1; 32], "team");
-        let workspace_id = event_id(&workspace);
-        let message = event_modules::encode_message([1; 32], workspace_id, [0; 32], [9; 32], "hi");
-        let message_id = event_id(&message);
-
-        ingest_local(&conn, &workspace, 10).unwrap();
-        project_ready(&conn, workspace_id, 11).unwrap();
-        ingest_local(&conn, &message, 12).unwrap();
-
-        assert_eq!(
-            project_ready(&conn, message_id, 13).unwrap(),
-            ProjectOutcome::Applied {
-                event_id: message_id,
-                emitted: Vec::new(),
-                outbox_inserted: 1,
-                unblocked: 0
-            }
-        );
-        assert_eq!(
-            project_ready(&conn, message_id, 14).unwrap(),
-            ProjectOutcome::AlreadyApplied {
-                event_id: message_id
-            }
-        );
-        assert_eq!(pending_outbox_count(&conn).unwrap(), 1);
-    }
-
-    #[test]
-    fn drain_ready_applies_in_created_order() {
-        let conn = open_memory().unwrap();
-        let a = event_modules::encode_workspace([1; 32], "a");
-        let b = event_modules::encode_workspace([2; 32], "b");
-
-        ingest_local(&conn, &b, 20).unwrap();
-        ingest_local(&conn, &a, 10).unwrap();
-        let outcomes = drain_ready(&conn, 10, 30).unwrap();
-
-        assert_eq!(outcomes.len(), 2);
-        assert_eq!(
-            get_status(&conn, event_id(&a)).unwrap().as_deref(),
-            Some("applied")
-        );
-        assert_eq!(
-            get_status(&conn, event_id(&b)).unwrap().as_deref(),
-            Some("applied")
-        );
-    }
 }

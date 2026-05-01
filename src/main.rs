@@ -30,54 +30,54 @@ fn run(args: Vec<String>) -> Result<(), String> {
 
     match command {
         Command::CreateWorkspace { name } => {
-            let workspace_id = deterministic_id(b"workspace:", name.as_bytes());
-            let bytes = event_modules::encode_workspace(workspace_id, &name);
-            let event_id = pipeline::event_id(&bytes);
-            pipeline::ingest_local(&conn, &bytes, now_ms)
-                .map_err(|err| format!("ingest workspace: {err}"))?;
-            drain_until_idle(&conn, now_ms)?;
+            let mut writer = pipeline::KernelWriter::new(&conn, now_ms);
+            let created = event_modules::workspace::create(&mut writer, &name)
+                .map_err(|err| format!("create workspace: {err}"))?;
 
             println!("workspace: {name}");
-            println!("workspace_id: {}", hex_id(&workspace_id));
-            println!("workspace_event_id: {}", hex_id(&event_id));
+            println!("workspace_id: {}", hex_id(&created.workspace_id));
+            println!("workspace_event_id: {}", hex_id(&created.event_id));
         }
         Command::CreateAccount {
             username,
             device_name,
         } => {
             let (workspace_id, workspace_event_id, workspace_name) = active_workspace(&conn)?;
-            let account_id = derive_account_id(workspace_id, &username, &device_name);
-            let bytes = event_modules::encode_account(
-                workspace_id,
-                workspace_event_id,
-                account_id,
-                &username,
-                &device_name,
-            );
-            let event_id = pipeline::event_id(&bytes);
-            pipeline::ingest_local(&conn, &bytes, now_ms)
-                .map_err(|err| format!("ingest account: {err}"))?;
-            drain_until_idle(&conn, now_ms)?;
+            let mut writer = pipeline::KernelWriter::new(&conn, now_ms);
+            let created = event_modules::account::create(
+                &mut writer,
+                event_modules::account::CreateAccountInput {
+                    workspace_id,
+                    workspace_event_id,
+                    username,
+                    device_name,
+                },
+            )
+            .map_err(|err| format!("create account: {err}"))?;
 
             println!("workspace: {workspace_name}");
-            println!("account: {username}");
-            println!("device: {device_name}");
-            println!("account_id: {}", hex_id(&account_id));
-            println!("event_id: {}", hex_id(&event_id));
+            println!("account: {}", created.username);
+            println!("device: {}", created.device_name);
+            println!("account_id: {}", hex_id(&created.account_id));
+            println!("event_id: {}", hex_id(&created.event_id));
         }
         Command::CreateInvite => {
             let (workspace_id, workspace_event_id, workspace_name) = active_workspace(&conn)?;
-            let invite_id = derive_unique_id(&conn, b"invite:", workspace_id, now_ms)?;
-            let bytes = event_modules::encode_invite(workspace_id, workspace_event_id, invite_id);
-            let invite_event_id = pipeline::event_id(&bytes);
-            pipeline::ingest_local(&conn, &bytes, now_ms)
-                .map_err(|err| format!("ingest invite: {err}"))?;
-            drain_until_idle(&conn, now_ms)?;
+            let mut writer = pipeline::KernelWriter::new(&conn, now_ms);
+            let invite = event_modules::invite::create(
+                &mut writer,
+                event_modules::invite::CreateInviteInput {
+                    workspace_id,
+                    workspace_event_id,
+                    nonce: unique_nonce(&conn, now_ms)?,
+                },
+            )
+            .map_err(|err| format!("create invite: {err}"))?;
 
             println!("workspace: {workspace_name}");
-            println!("invite_id: {}", hex_id(&invite_id));
-            println!("invite_event_id: {}", hex_id(&invite_event_id));
-            println!("{}", invite_link(workspace_id, invite_event_id));
+            println!("invite_id: {}", hex_id(&invite.invite_id));
+            println!("invite_event_id: {}", hex_id(&invite.event_id));
+            println!("{}", invite_link(workspace_id, invite.event_id));
         }
         Command::AcceptInvite {
             invite,
@@ -88,79 +88,67 @@ fn run(args: Vec<String>) -> Result<(), String> {
             if invite_acceptance_exists(&conn, workspace_id)? {
                 return Err("workspace invite already accepted on this endpoint".to_string());
             }
-            let account_id = derive_account_id(workspace_id, &username, &device_name);
-            let bytes = event_modules::encode_invite_accepted(
-                workspace_id,
-                invite_event_id,
-                account_id,
-                &username,
-                &device_name,
-            );
-            let event_id = pipeline::event_id(&bytes);
-            let outcome = pipeline::ingest_local(&conn, &bytes, now_ms)
-                .map_err(|err| format!("ingest invite acceptance: {err}"))?;
-            drain_until_idle(&conn, now_ms)?;
+            let mut writer = pipeline::KernelWriter::new(&conn, now_ms);
+            let accepted = event_modules::invite::accept(
+                &mut writer,
+                event_modules::invite::AcceptInviteInput {
+                    workspace_id,
+                    invite_event_id,
+                    username,
+                    device_name,
+                },
+            )
+            .map_err(|err| format!("accept invite: {err}"))?;
 
             println!("accepted_invite: {}", short_hex(&invite_event_id));
-            println!("account: {username}");
-            println!("device: {device_name}");
-            println!("account_id: {}", hex_id(&account_id));
-            println!("event_id: {}", hex_id(&event_id));
-            match outcome {
-                pipeline::IngestOutcome::InsertedBlocked { .. } => {
+            println!("account: {}", accepted.username);
+            println!("device: {}", accepted.device_name);
+            println!("account_id: {}", hex_id(&accepted.account_id));
+            println!("event_id: {}", hex_id(&accepted.event_id));
+            match accepted.status {
+                event_modules::invite::AcceptInviteStatus::BlockedUntilInviteSync => {
                     println!("status: blocked_until_invite_sync");
                 }
-                pipeline::IngestOutcome::InsertedReady { .. }
-                | pipeline::IngestOutcome::Duplicate { .. } => {
-                    println!("status: ready");
-                }
+                event_modules::invite::AcceptInviteStatus::Ready => println!("status: ready"),
             }
         }
         Command::Send { body } => {
             let (workspace_id, workspace_event_id, workspace_name) = active_workspace(&conn)?;
-            let bytes = event_modules::encode_message(
-                workspace_id,
-                workspace_event_id,
-                [0; 32],
-                [0; 32],
-                &body,
-            );
-            let event_id = pipeline::event_id(&bytes);
-            pipeline::ingest_local(&conn, &bytes, now_ms)
-                .map_err(|err| format!("ingest message: {err}"))?;
-            drain_until_idle(&conn, now_ms)?;
+            let mut writer = pipeline::KernelWriter::new(&conn, now_ms);
+            let sent = event_modules::message::send(
+                &mut writer,
+                event_modules::message::SendMessageInput {
+                    workspace_id,
+                    workspace_event_id,
+                    reply_to_event_id: [0; 32],
+                    fanout_connection_id: [0; 32],
+                    body,
+                },
+            )
+            .map_err(|err| format!("send message: {err}"))?;
 
             println!("workspace: {workspace_name}");
-            println!("event_id: {}", hex_id(&event_id));
+            println!("event_id: {}", hex_id(&sent.event_id));
         }
         Command::GenerateMessages { count, prefix } => {
             let (workspace_id, workspace_event_id, workspace_name) = active_workspace(&conn)?;
-            let (inserted_events, projected_events) = with_immediate_transaction(&conn, || {
-                let mut inserted_events = 0;
-                for idx in 0..count {
-                    let body = format!("{prefix} {idx:06}");
-                    let bytes = event_modules::encode_message(
+            let generated = with_immediate_transaction(&conn, || {
+                let mut writer = pipeline::KernelWriter::new(&conn, now_ms);
+                event_modules::message::generate(
+                    &mut writer,
+                    event_modules::message::GenerateMessagesInput {
                         workspace_id,
                         workspace_event_id,
-                        [0; 32],
-                        [0; 32],
-                        &body,
-                    );
-                    match pipeline::ingest_local(&conn, &bytes, now_ms)
-                        .map_err(|err| format!("ingest generated message: {err}"))?
-                    {
-                        pipeline::IngestOutcome::InsertedReady { .. }
-                        | pipeline::IngestOutcome::InsertedBlocked { .. } => inserted_events += 1,
-                        pipeline::IngestOutcome::Duplicate { .. } => {}
-                    }
-                }
-                let projected_events = drain_until_idle(&conn, now_ms)?;
-                Ok((inserted_events, projected_events))
+                        count,
+                        prefix,
+                    },
+                )
+                .map_err(|err| format!("generate messages: {err}"))
             })?;
 
             println!("workspace: {workspace_name}");
-            println!("generated_messages: {inserted_events}");
-            println!("projected_events: {projected_events}");
+            println!("generated_messages: {}", generated.written_events);
+            println!("projected_events: {}", generated.applied_events);
         }
         Command::SendFile { path } => {
             let (workspace_id, workspace_event_id, workspace_name) = active_workspace(&conn)?;
@@ -171,19 +159,23 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 .to_string();
             let bytes =
                 fs::read(&path).map_err(|err| format!("read file {}: {err}", path.display()))?;
-            let content_hash = blake3::hash(&bytes).to_hex().to_string();
-            let encoded =
-                event_modules::encode_file(workspace_id, workspace_event_id, &name, &bytes);
-            let event_id = pipeline::event_id(&encoded);
-            pipeline::ingest_local(&conn, &encoded, now_ms)
-                .map_err(|err| format!("ingest file: {err}"))?;
-            drain_until_idle(&conn, now_ms)?;
+            let mut writer = pipeline::KernelWriter::new(&conn, now_ms);
+            let sent = event_modules::file::send(
+                &mut writer,
+                event_modules::file::SendFileInput {
+                    workspace_id,
+                    workspace_event_id,
+                    name,
+                    bytes,
+                },
+            )
+            .map_err(|err| format!("send file: {err}"))?;
 
             println!("workspace: {workspace_name}");
-            println!("file: {name}");
-            println!("bytes: {}", bytes.len());
-            println!("content_hash: {content_hash}");
-            println!("event_id: {}", hex_id(&event_id));
+            println!("file: {}", sent.name);
+            println!("bytes: {}", sent.byte_len);
+            println!("content_hash: {}", sent.content_hash);
+            println!("event_id: {}", hex_id(&sent.event_id));
         }
         Command::SaveFile { selector, out_path } => {
             let (name, bytes) = file_by_selector(&conn, &selector)?;
@@ -197,25 +189,34 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         Command::React { emoji, selector } => {
             let (workspace_id, message_event_id) = message_id_by_selector(&conn, &selector)?;
-            let bytes = event_modules::encode_reaction(workspace_id, message_event_id, &emoji);
-            let event_id = pipeline::event_id(&bytes);
-            pipeline::ingest_local(&conn, &bytes, now_ms)
-                .map_err(|err| format!("ingest reaction: {err}"))?;
-            drain_until_idle(&conn, now_ms)?;
+            let mut writer = pipeline::KernelWriter::new(&conn, now_ms);
+            let reacted = event_modules::reaction::react(
+                &mut writer,
+                event_modules::reaction::ReactInput {
+                    workspace_id,
+                    message_event_id,
+                    emoji,
+                },
+            )
+            .map_err(|err| format!("react: {err}"))?;
 
             println!("Reacted");
-            println!("event_id: {}", hex_id(&event_id));
+            println!("event_id: {}", hex_id(&reacted.event_id));
         }
         Command::DeleteMessage { selector } => {
             let (workspace_id, message_event_id) = message_id_by_selector(&conn, &selector)?;
-            let bytes = event_modules::encode_message_deletion(workspace_id, message_event_id);
-            let event_id = pipeline::event_id(&bytes);
-            pipeline::ingest_local(&conn, &bytes, now_ms)
-                .map_err(|err| format!("ingest message deletion: {err}"))?;
-            drain_until_idle(&conn, now_ms)?;
+            let mut writer = pipeline::KernelWriter::new(&conn, now_ms);
+            let deleted = event_modules::message_deletion::delete(
+                &mut writer,
+                event_modules::message_deletion::DeleteMessageInput {
+                    workspace_id,
+                    message_event_id,
+                },
+            )
+            .map_err(|err| format!("delete message: {err}"))?;
 
             println!("Deleted");
-            println!("event_id: {}", hex_id(&event_id));
+            println!("event_id: {}", hex_id(&deleted.event_id));
         }
         Command::View => {
             print_view(&conn)?;
@@ -1197,38 +1198,14 @@ fn hex_nibble(byte: u8) -> Result<u8, String> {
     }
 }
 
-fn deterministic_id(prefix: &[u8], value: &[u8]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(prefix);
-    hasher.update(value);
-    *hasher.finalize().as_bytes()
-}
-
-fn derive_account_id(workspace_id: [u8; 32], username: &str, device_name: &str) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"account:");
-    hasher.update(&workspace_id);
-    hasher.update(username.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(device_name.as_bytes());
-    *hasher.finalize().as_bytes()
-}
-
-fn derive_unique_id(
-    conn: &Connection,
-    prefix: &[u8],
-    workspace_id: [u8; 32],
-    now_ms: i64,
-) -> Result<[u8; 32], String> {
+fn unique_nonce(conn: &Connection, now_ms: i64) -> Result<Vec<u8>, String> {
     let event_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
         .map_err(|err| format!("count events: {err}"))?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(prefix);
-    hasher.update(&workspace_id);
-    hasher.update(&now_ms.to_be_bytes());
-    hasher.update(&event_count.to_be_bytes());
-    Ok(*hasher.finalize().as_bytes())
+    let mut nonce = Vec::with_capacity(16);
+    nonce.extend_from_slice(&now_ms.to_be_bytes());
+    nonce.extend_from_slice(&event_count.to_be_bytes());
+    Ok(nonce)
 }
 
 fn vec_to_id(value: Vec<u8>) -> [u8; 32] {

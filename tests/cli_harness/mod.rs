@@ -1,12 +1,14 @@
 #![allow(dead_code)]
 
 use std::net::TcpListener;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
 pub fn topo(db: &str, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_topo"))
+    Command::new(topo_bin())
         .arg("--db")
         .arg(db)
         .args(args)
@@ -15,10 +17,34 @@ pub fn topo(db: &str, args: &[&str]) -> Output {
 }
 
 pub fn topo_no_db(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_topo"))
+    Command::new(topo_bin())
         .args(args)
         .output()
         .expect("run topo")
+}
+
+fn topo_bin() -> &'static Path {
+    static TOPO_BIN: OnceLock<PathBuf> = OnceLock::new();
+
+    TOPO_BIN.get_or_init(|| {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let target_dir = manifest_dir.join("target").join("cli-black-box");
+        let status = Command::new("cargo")
+            .arg("build")
+            .arg("--quiet")
+            .arg("--bin")
+            .arg("topo")
+            .arg("--manifest-path")
+            .arg(manifest_dir.join("Cargo.toml"))
+            .arg("--target-dir")
+            .arg(&target_dir)
+            .status()
+            .expect("build topo binary for black-box tests");
+        assert!(status.success(), "build topo binary for black-box tests");
+
+        let exe = if cfg!(windows) { "topo.exe" } else { "topo" };
+        target_dir.join("debug").join(exe)
+    })
 }
 
 pub fn stdout(output: &Output) -> String {
@@ -113,7 +139,7 @@ pub fn free_addr() -> String {
 }
 
 pub fn spawn_receive(db: &str, addr: &str, count: usize) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_topo"))
+    Command::new(topo_bin())
         .arg("--db")
         .arg(db)
         .arg("receive")

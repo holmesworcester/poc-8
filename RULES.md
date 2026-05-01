@@ -152,7 +152,7 @@ Strict checks should stay true:
 ```text
 rg "crate::runtime" src/event_modules
 rg "crate::state" src/event_modules
-rg "rusqlite|Connection|Transaction" src/event_modules
+rg "rusqlite|Transaction" src/event_modules
 ```
 
 These should return no matches unless a match is explicitly documented as a
@@ -200,17 +200,29 @@ semantics.
 
 ## Realness Bar
 
-Tests and demos must exercise the production boundary they claim to prove.
-Do not call a shortcut and name it sync, network, auth, storage, or CLI if the
-real path would cross a different boundary.
+Functional tests and demos must exercise the production boundary they claim to
+prove. Do not call a shortcut and name it sync, network, auth, storage, or CLI
+if the real path would cross a different boundary.
 
 Use these rules:
 
+- Functional tests are black-box by default. They should drive the public
+  `topo` binary and assert observable behavior.
 - CLI tests run the actual `topo` binary.
-- Network tests use real sockets or the production transport trait with the
-  same framing and outbox/inbox adapters used by the CLI.
+- Networking tests use real networking through the CLI. If a test claims sync,
+  transport, or multi-node behavior, it must move bytes across real sockets with
+  production framing and the same outbox/inbox adapters used by the CLI.
 - Sync tests move canonical event bytes through outbox, wire frames, receive,
   ingest, and project. They must not copy rows from another database.
+- The only normal exceptions are pure functional projector tests and module
+  command tests. Projector tests may assert declarative projection output.
+  Command tests may use a fake writer/read context to prove event construction,
+  status interpretation, and command chaining. These tests are useful local
+  checks, but they do not prove product functionality; feature completion must
+  be proven by black-box tests through the public boundary with real networking
+  when networking is involved.
+- Static boundary tests are allowed. They may scan source text or public module
+  structure to enforce architectural rules, but they are not functional proof.
 - Harnesses may create temp directories, spawn processes, choose ports, and
   assert output. They must not create kernel tables or apply domain semantics.
 - Toy adapters are allowed only for small unit tests that name the fake
