@@ -58,3 +58,28 @@ fn event_modules_do_not_use_event_rs_files() {
             .join("\n")
     );
 }
+
+#[test]
+fn event_modules_are_directories_not_collapsed_files() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/event_modules");
+    let offenders = std::fs::read_dir(&root)
+        .expect("read event_modules")
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .filter(|path| {
+            !path
+                .file_name()
+                .is_some_and(|name| name == "mod.rs" || name == "codec.rs")
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        offenders.is_empty(),
+        "event modules must be directories with codec/commands/projector files:\n{}",
+        offenders
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}

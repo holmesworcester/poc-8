@@ -142,11 +142,23 @@ fn poc7_reaction_sync_waits_for_message_dependency() {
     let reaction = assert_success(topo(&alice_db, &["react", "fire", "1"]));
     let reaction_id = line_value(&reaction, "event_id");
 
-    transfer_event(&alice_db, &bob_db, A_TO_B, &reaction_id, "reaction before message");
+    transfer_event(
+        &alice_db,
+        &bob_db,
+        A_TO_B,
+        &reaction_id,
+        "reaction before message",
+    );
     let before_message = assert_success(topo(&bob_db, &["messages"]));
     assert!(!before_message.contains("react-over-the-wire"));
 
-    transfer_event(&alice_db, &bob_db, A_TO_B, &message_id, "message after reaction");
+    transfer_event(
+        &alice_db,
+        &bob_db,
+        A_TO_B,
+        &message_id,
+        "message after reaction",
+    );
     let after_message = assert_success(topo(&bob_db, &["messages"]));
     assert!(after_message.contains("react-over-the-wire"));
     assert!(after_message.contains("fire"));
