@@ -38,3 +38,23 @@ fn event_modules_do_not_import_old_core_or_storage() {
         violations.join("\n")
     );
 }
+
+#[test]
+fn event_modules_do_not_use_event_rs_files() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/event_modules");
+    let offenders = read_rs_files(&root)
+        .into_iter()
+        .map(|(path, _)| path)
+        .filter(|path| path.file_name().is_some_and(|name| name == "event.rs"))
+        .collect::<Vec<_>>();
+
+    assert!(
+        offenders.is_empty(),
+        "event structs belong in codec.rs, not event.rs:\n{}",
+        offenders
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}

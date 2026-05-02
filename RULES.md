@@ -22,6 +22,10 @@ event_modules/<domain>/<module>/projector.rs
   EventWithContext -> Projection
 ```
 
+Do not create `event.rs` files in event modules. The typed event struct belongs
+in `codec.rs` with the canonical encode/decode logic. Commands belong in
+`commands.rs`.
+
 ## Event Writes Return Event IDs
 
 The substrate should expose an event writer API that returns the event id from
