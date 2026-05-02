@@ -12,7 +12,8 @@ UPDATED:
 
 - Inbound processing is a pure function chain; admission by event id happens before context loading.
 - Queue-like work is just module-owned table rows at wait/dedupe/retry/schedule/IO boundaries.
-- `events` stores durable, local, and endpoint-local canonical event bytes; `outbox` stores only `(connection_id, event_id)`.
+- Canonical events have scopes: shared, local-only, endpoint-scoped, or connection-scoped. The normal event id is always `BLAKE3(canonical_event_bytes)`; connection-scoped events include `connection_id` in their canonical bytes so their ids are naturally connection-local.
+- Durable shared data events live in durable event storage. Connection-scoped protocol events may live in transient storage, but still use normal canonical bytes and event ids. `outbox` stores only `(connection_id, event_id)`.
 - Blocking uses `blocked_by_event(blocked_by_event_id, event_id)` pair rows and same-transaction unblocking.
 - Connection wrapping has two modes: endpoint-pubkey bootstrap/repair and connection-secret ordinary traffic.
 - Outgoing TCP flow has one send owner per connection: `outbox` is the deduped source, a bounded hot queue keeps bytes ready, and TCP writability is the backpressure signal.
@@ -246,6 +247,16 @@ endpoint-local event:
   codec: yes
   signed: usually no
   may be sent to one endpoint/connection: yes
+
+connection-scoped event:
+  connection_id: yes
+  workspace_id: optional, when the event concerns a workspace over the connection
+  codec: yes
+  signed: usually no
+  storage: transient by default
+  may be sent only on that connection
+  id: BLAKE3(canonical bytes), with connection_id inside the bytes
+  examples: sync_compare, sync_have_id, sync_need_id
 
 local-only event:
   workspace_id: usually yes
@@ -571,27 +582,46 @@ When an event `d` becomes present, update the present-external-dep contribution 
 
 This is the same dep-aware comparison computed by poc-7's session code, but materialized as projected state instead of rebuilt as an on-demand session snapshot.
 
-## Endpoint-local sync events and outbox
+## Connection-scoped sync events and outbox
 
-Sync protocol messages are endpoint-local events. They are not durable shared events and do not need signatures. The connection already authenticates the endpoint pair; the messages are only hints:
+Sync protocol messages are connection-scoped events. They are not durable shared events and do not need signatures. The connection already authenticates the endpoint pair; the messages are only hints:
 
 ```
 compare this node
 I have these ids
 I need these ids
-send these event blobs
 ```
 
-Projectors do not write to sockets. They create deterministic endpoint-local events and add their ids to `outbox`:
+They still use the normal event model: a module `codec.rs` defines canonical bytes, and `event_id = BLAKE3(canonical_event_bytes)`. `connection_id` is part of the canonical sync event, so ids for otherwise identical sync messages do not overlap across connections.
+
+Plain sync events are fixed-shape:
 
 ```
-Have(id)    -> events(scope=endpoint_local), outbox(connection_id, event_id)
-Need(id)    -> events(scope=endpoint_local), outbox(connection_id, event_id)
+SyncCompare(connection_id, workspace_id, node, count, fingerprint)
+SyncHaveId(connection_id, workspace_id, node, event_id)
+SyncNeedId(connection_id, workspace_id, event_id)
+```
+
+Projectors do not write to sockets. They create deterministic connection-scoped events and add their ids to `outbox`:
+
+```
+Have(id)    -> connection_events(scope=connection), outbox(connection_id, event_id)
+Need(id)    -> connection_events(scope=connection), outbox(connection_id, event_id)
+Compare(v)  -> connection_events(scope=connection), outbox(connection_id, event_id)
 Send(id)    -> outbox(connection_id, durable_event_id)
-Compare(v)  -> events(scope=endpoint_local), outbox(connection_id, event_id)
 ```
 
-Duplicate projector output collapses because endpoint-local sync event bytes are deterministic and `outbox` is unique on `(connection_id, event_id)`.
+Duplicate projector output collapses because connection-scoped sync event bytes are deterministic and `outbox` is unique on `(connection_id, event_id)`.
+
+For the first implementation, this can be two storage classes rather than one clever table:
+
+```
+durable_events(event_id, canonical_event_bytes, ...)
+connection_events(connection_id, event_id, canonical_event_bytes, expires_at)
+outbox(connection_id, event_id)
+```
+
+The sender resolves an outbox `event_id` from durable storage or transient connection storage, wraps the canonical bytes with the connection module, and packs bytes into TCP frames. Sync modules do not batch ids into transport frames and do not create transit blobs.
 
 Outgoing dedupe belongs at the `outbox` boundary and the per-connection hot queue, not in every projector's context. Projectors should not need `recently_sent` sets. If suppression beyond pending-buffer dedupe is needed later, keep sent rows in `outbox` with a TTL.
 
