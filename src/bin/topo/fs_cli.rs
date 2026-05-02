@@ -2,9 +2,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aes_gcm::aead::Aead;
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use clap::Subcommand;
+use rand::rngs::OsRng;
 use rusqlite::{params, OptionalExtension};
 use tokio::sync::Mutex;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 use topo::crypto::{event_id_from_base64, event_id_from_hex, event_id_to_base64, EventId};
 use topo::event_modules::forward_secret::{ForwardSecretEvent, RECIPIENT_DEVICE, RECIPIENT_INVITE};
@@ -17,6 +21,9 @@ const POLL_DEADLINE: Duration = Duration::from_secs(120);
 const ZERO_ID: EventId = [0; 32];
 const ROOT_NODE: EventId = [0; 32];
 const ROOT_NODE_BITS: u32 = 0;
+const AES_GCM_NONCE_BYTES: usize = 12;
+const AES_GCM_TAG_BYTES: usize = 16;
+const X25519_PUBLIC_BYTES: usize = 32;
 
 #[derive(Subcommand, Debug)]
 pub enum FsCommand {
@@ -33,8 +40,8 @@ pub enum FsCommand {
     Pubkey {
         /// Hex or base64 recipient id from `fs recipient`.
         recipient_id: String,
-        /// Stable local label used to derive matching public/private material.
-        key_label: String,
+        /// Hex-encoded 32-byte X25519 private key.
+        private_key: String,
         /// Previous pubkey id to tombstone.
         #[arg(long)]
         prev: Option<String>,
@@ -42,8 +49,8 @@ pub enum FsCommand {
 
     /// Create a key epoch and retain its root locally.
     Epoch {
-        /// Stable local label used to derive the epoch root.
-        root_label: String,
+        /// Hex-encoded 32-byte epoch root secret.
+        root_secret: String,
         /// Previous epoch id, if this rotates an existing epoch.
         #[arg(long)]
         prev: Option<String>,
@@ -56,7 +63,7 @@ pub enum FsCommand {
     Message {
         /// Hex or base64 epoch id from `fs epoch`.
         epoch_id: String,
-        /// Stable coordinate/ciphertext label for this test message.
+        /// Stable coordinate label and plaintext for this test message.
         label: String,
     },
 
@@ -75,9 +82,12 @@ pub enum FsCommand {
     PrivateKey {
         /// Hex or base64 pubkey id from `fs pubkey`.
         pubkey_id: String,
-        /// Stable local label used when the pubkey was published.
-        key_label: String,
+        /// Hex-encoded 32-byte X25519 private key.
+        private_key: String,
     },
+
+    /// Generate a fresh X25519 private/public key pair for tests or manual use.
+    Keygen,
 
     /// Run bounded deterministic wrap/receipt/local-purge maintenance.
     Expand,
@@ -107,17 +117,17 @@ pub async fn run(
         FsCommand::Recipient { label, invite } => cmd_recipient(db_path, &label, invite).await,
         FsCommand::Pubkey {
             recipient_id,
-            key_label,
+            private_key,
             prev,
-        } => cmd_pubkey(db_path, &recipient_id, &key_label, prev.as_deref()).await,
+        } => cmd_pubkey(db_path, &recipient_id, &private_key, prev.as_deref()).await,
         FsCommand::Epoch {
-            root_label,
+            root_secret,
             prev,
             remove_recipient,
         } => {
             cmd_epoch(
                 db_path,
-                &root_label,
+                &root_secret,
                 prev.as_deref(),
                 remove_recipient.as_deref(),
             )
@@ -131,8 +141,9 @@ pub async fn run(
         } => cmd_delete(db_path, &epoch_id, &coord_event_id, unix_minute).await,
         FsCommand::PrivateKey {
             pubkey_id,
-            key_label,
-        } => cmd_private_key(db_path, &pubkey_id, &key_label),
+            private_key,
+        } => cmd_private_key(db_path, &pubkey_id, &private_key),
+        FsCommand::Keygen => cmd_keygen(),
         FsCommand::Expand => cmd_expand(db_path).await,
         FsCommand::Keys => cmd_keys(db_path),
         FsCommand::Wraps => cmd_wraps(db_path),
@@ -180,7 +191,7 @@ async fn cmd_recipient(
 async fn cmd_pubkey(
     db_path: &Path,
     recipient_id: &str,
-    key_label: &str,
+    private_key_hex: &str,
     prev: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let workspace_id = current_workspace(db_path)?;
@@ -189,7 +200,7 @@ async fn cmd_pubkey(
         Some(prev) => parse_id(prev, "prev")?,
         None => ZERO_ID,
     };
-    let private_key = private_key_for_label(&workspace_id, key_label);
+    let private_key = parse_private_key_hex(private_key_hex)?;
     let public_key = public_key_for_private(&private_key);
     let event = ParsedEvent::ForwardSecret(ForwardSecretEvent::device_pubkey(
         now_ms() as u64,
@@ -211,7 +222,7 @@ async fn cmd_pubkey(
 
 async fn cmd_epoch(
     db_path: &Path,
-    root_label: &str,
+    root_secret_hex: &str,
     prev: Option<&str>,
     remove_recipient: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -224,7 +235,7 @@ async fn cmd_epoch(
         Some(recipient) => parse_id(recipient, "remove-recipient")?,
         None => ZERO_ID,
     };
-    let root_secret = root_secret_for_label(&workspace_id, root_label);
+    let root_secret = parse_private_key_hex(root_secret_hex)?;
     let event = ParsedEvent::ForwardSecret(ForwardSecretEvent::key_epoch(
         now_ms() as u64,
         workspace_id,
@@ -268,20 +279,26 @@ async fn cmd_message(
         &epoch_id,
         label.as_bytes(),
     ]);
-    let ciphertext = hash_parts(&[
-        b"fs-message-ciphertext-v1",
-        &epoch_id,
-        &unix_minute.to_le_bytes(),
-        &coord_event_id,
-        label.as_bytes(),
-    ]);
+    let conn = open_ready_connection(db_path)?;
+    let root_secret = local_epoch_root(&conn, &id_b64(&workspace_id), &id_b64(&epoch_id))?
+        .ok_or_else(|| format!("missing local root for epoch {}", hex_id(&epoch_id)))?;
+    let leaf = history_leaf(&epoch_id, unix_minute, &coord_event_id);
+    let message_key = message_key(&root_secret, &leaf);
+    let nonce = deterministic_nonce(
+        b"fs-message-nonce-v1",
+        &[&epoch_id, &unix_minute.to_le_bytes(), &coord_event_id],
+    );
+    let ciphertext = encrypt_aes_gcm(&message_key, &nonce, label.as_bytes())?;
+    let payload = pack_nonce_ciphertext(&nonce, &ciphertext);
+    let ciphertext_hash = hash_parts(&[b"fs-message-ciphertext-hash-v1", &payload]);
     let event = ParsedEvent::ForwardSecret(ForwardSecretEvent::message_encrypted(
         now_ms() as u64,
         workspace_id,
         epoch_id,
         unix_minute,
         coord_event_id,
-        ciphertext,
+        ciphertext_hash,
+        payload,
     ));
     let message_id = emit_fs_event_and_wait(db_path, "fs_message", event, workspace_id).await?;
     println!(
@@ -324,13 +341,13 @@ async fn cmd_delete(
 fn cmd_private_key(
     db_path: &Path,
     pubkey_id: &str,
-    key_label: &str,
+    private_key_hex: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let workspace_id = current_workspace(db_path)?;
     let ws = id_b64(&workspace_id);
     let pubkey_id = parse_id(pubkey_id, "pubkey_id")?;
     let pubkey = id_b64(&pubkey_id);
-    let private_key = private_key_for_label(&workspace_id, key_label);
+    let private_key = parse_private_key_hex(private_key_hex)?;
     let public_key = public_key_for_private(&private_key);
     let conn = open_ready_connection(db_path)?;
 
@@ -355,7 +372,7 @@ fn cmd_private_key(
     };
     if expected.as_slice() != public_key {
         return Err(format!(
-            "private key label does not match pubkey_id {}",
+            "private key does not match pubkey_id {}",
             hex_id(&pubkey_id)
         )
         .into());
@@ -376,6 +393,18 @@ fn cmd_private_key(
     Ok(())
 }
 
+fn cmd_keygen() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let secret = StaticSecret::random_from_rng(OsRng);
+    let private_key = secret.to_bytes();
+    let public_key = PublicKey::from(&secret).to_bytes();
+    println!(
+        "private_key={} public_key={}",
+        hex::encode(private_key),
+        hex::encode(public_key)
+    );
+    Ok(())
+}
+
 async fn cmd_expand(db_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let workspace_id = current_workspace(db_path)?;
     let ws = id_b64(&workspace_id);
@@ -392,6 +421,14 @@ async fn cmd_expand(db_path: &Path) -> Result<(), Box<dyn std::error::Error + Se
             break;
         }
         for job in wrap_jobs {
+            let payload = encrypt_wrap_payload(
+                &job.root_secret,
+                &job.pubkey_id,
+                &job.public_key,
+                &ROOT_NODE,
+                ROOT_NODE_BITS,
+            )?;
+            let ciphertext_hash = hash_parts(&[b"fs-wrap-ciphertext-hash-v1", &payload]);
             let event = ParsedEvent::ForwardSecret(ForwardSecretEvent::key_wrap(
                 0,
                 workspace_id,
@@ -400,13 +437,8 @@ async fn cmd_expand(db_path: &Path) -> Result<(), Box<dyn std::error::Error + Se
                 ROOT_NODE,
                 ROOT_NODE_BITS,
                 secret_commitment(&job.root_secret, &ROOT_NODE, ROOT_NODE_BITS),
-                wrap_ciphertext_commitment(
-                    &job.root_secret,
-                    &job.pubkey_id,
-                    &job.public_key,
-                    &ROOT_NODE,
-                    ROOT_NODE_BITS,
-                ),
+                ciphertext_hash,
+                payload,
             ));
             let _ = emit_fs_event_and_wait(db_path, "fs_key_wrap", event, workspace_id).await?;
             emitted_wraps += 1;
@@ -601,43 +633,50 @@ fn cmd_recoverable(
     let epoch = id_b64(&epoch_id);
     let coord = id_b64(&coord_event_id);
     let conn = open_ready_connection(db_path)?;
-    let message_known: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM fs_messages
+    let message_payload: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT ciphertext FROM fs_messages
          WHERE workspace_id = ?1
            AND epoch_id = ?2
            AND unix_minute = ?3
-           AND coord_event_id = ?4)",
-        params![&ws, &epoch, unix_minute as i64, &coord],
-        |r| r.get(0),
-    )?;
-    let root_present: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM fs_local_epoch_roots
-         WHERE workspace_id = ?1 AND epoch_id = ?2)",
-        params![&ws, &epoch],
-        |r| r.get(0),
-    )?;
+           AND coord_event_id = ?4",
+            params![&ws, &epoch, unix_minute as i64, &coord],
+            |r| r.get(0),
+        )
+        .optional()?;
     let leaf = history_leaf(&epoch_id, unix_minute, &coord_event_id);
-    let mut unwrapped_present = false;
+    let mut local_root_decrypts = false;
+    if let Some(payload) = message_payload.as_deref() {
+        if let Some(root_secret) = local_epoch_root(&conn, &ws, &epoch)? {
+            local_root_decrypts = decrypt_message_payload(&root_secret, &leaf, payload).is_ok();
+        }
+    }
+    let mut unwrapped_node_decrypts = false;
     let mut stmt = conn.prepare(
-        "SELECT node_bytes, node_bit_len FROM fs_local_unwrapped_nodes
+        "SELECT node_bytes, node_bit_len, node_secret FROM fs_local_unwrapped_nodes
          WHERE workspace_id = ?1 AND epoch_id = ?2",
     )?;
     let mut rows = stmt.query(params![&ws, &epoch])?;
     while let Some(row) = rows.next()? {
         let node_bytes: Vec<u8> = row.get(0)?;
         let node_bit_len: u32 = row.get::<_, i64>(1)? as u32;
-        if prefix_contains(&node_bytes, node_bit_len, &leaf) {
-            unwrapped_present = true;
+        let node_secret = vec_to_id(row.get::<_, Vec<u8>>(2)?, "node_secret")?;
+        if message_payload.as_deref().is_some_and(|payload| {
+            prefix_contains(&node_bytes, node_bit_len, &leaf)
+                && decrypt_message_payload(&node_secret, &leaf, payload).is_ok()
+        }) {
+            unwrapped_node_decrypts = true;
             break;
         }
     }
-    let recoverable = message_known && (root_present || unwrapped_present);
+    let message_known = message_payload.is_some();
+    let recoverable = local_root_decrypts || unwrapped_node_decrypts;
     println!(
         "recoverable={} message_known={} local_root={} unwrapped_node={}",
         if recoverable { "yes" } else { "no" },
         if message_known { "yes" } else { "no" },
-        if root_present { "yes" } else { "no" },
-        if unwrapped_present { "yes" } else { "no" }
+        if local_root_decrypts { "yes" } else { "no" },
+        if unwrapped_node_decrypts { "yes" } else { "no" }
     );
     Ok(())
 }
@@ -715,7 +754,7 @@ fn receipt_jobs(
     ws: &str,
 ) -> Result<Vec<ReceiptJob>, Box<dyn std::error::Error + Send + Sync>> {
     let mut stmt = conn.prepare(
-        "SELECT w.wrap_id, w.epoch_id, w.pubkey_id, w.node_bytes, w.node_bit_len,
+        "SELECT w.wrap_id, w.epoch_id, w.pubkey_id, w.node_bytes, w.node_bit_len, w.ciphertext,
                 p.public_key, lk.private_key
          FROM fs_key_wraps w
          JOIN fs_pubkeys p
@@ -743,21 +782,37 @@ fn receipt_jobs(
                 r.get::<_, i64>(4)?,
                 r.get::<_, Vec<u8>>(5)?,
                 r.get::<_, Vec<u8>>(6)?,
+                r.get::<_, Vec<u8>>(7)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let mut out = Vec::new();
-    for (wrap, epoch, pubkey, node_bytes, node_bit_len, public_key, private_key) in rows {
+    for (wrap, epoch, pubkey, node_bytes, node_bit_len, ciphertext, public_key, private_key) in rows
+    {
+        let pubkey_id = b64_to_id(&pubkey)?;
+        let node_bytes = vec_to_id(node_bytes, "node_bytes")?;
         let private_key = vec_to_id(private_key, "private_key")?;
         let public_key = vec_to_id(public_key, "public_key")?;
         if public_key_for_private(&private_key) != public_key {
             continue;
         }
+        if decrypt_wrap_payload(
+            &ciphertext,
+            &private_key,
+            &public_key,
+            &pubkey_id,
+            &node_bytes,
+            node_bit_len as u32,
+        )
+        .is_err()
+        {
+            continue;
+        }
         out.push(ReceiptJob {
             wrap_id: b64_to_id(&wrap)?,
             epoch_id: b64_to_id(&epoch)?,
-            pubkey_id: b64_to_id(&pubkey)?,
-            node_bytes: vec_to_id(node_bytes, "node_bytes")?,
+            pubkey_id,
+            node_bytes,
             node_bit_len: node_bit_len as u32,
         });
     }
@@ -856,7 +911,7 @@ fn materialize_unwrapped_nodes(
         return Ok(0);
     }
     let mut stmt = conn.prepare(
-        "SELECT epoch_id, node_bit_len, node_bytes
+        "SELECT epoch_id, node_bit_len, node_bytes, ciphertext
          FROM fs_key_wraps
          WHERE workspace_id = ?1 AND pubkey_id = ?2
          ORDER BY epoch_id ASC",
@@ -867,16 +922,37 @@ fn materialize_unwrapped_nodes(
                 r.get::<_, String>(0)?,
                 r.get::<_, i64>(1)?,
                 r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let mut inserted = 0usize;
-    for (epoch, node_bit_len, node_bytes) in wraps {
+    let pubkey_id = b64_to_id(pubkey)?;
+    for (epoch, node_bit_len, node_bytes, ciphertext) in wraps {
+        let node_bytes = vec_to_id(node_bytes, "node_bytes")?;
+        let node_secret = match decrypt_wrap_payload(
+            &ciphertext,
+            private_key,
+            &expected_public,
+            &pubkey_id,
+            &node_bytes,
+            node_bit_len as u32,
+        ) {
+            Ok(secret) => secret,
+            Err(_) => continue,
+        };
         let changed = conn.execute(
             "INSERT OR IGNORE INTO fs_local_unwrapped_nodes
-                (workspace_id, pubkey_id, epoch_id, node_bit_len, node_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![ws, pubkey, epoch, node_bit_len, node_bytes],
+                (workspace_id, pubkey_id, epoch_id, node_bit_len, node_bytes, node_secret)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                ws,
+                pubkey,
+                epoch,
+                node_bit_len,
+                node_bytes.to_vec(),
+                node_secret.to_vec()
+            ],
         )?;
         inserted += changed;
     }
@@ -991,16 +1067,13 @@ fn hash_parts(parts: &[&[u8]]) -> EventId {
     out
 }
 
-fn private_key_for_label(workspace_id: &EventId, label: &str) -> EventId {
-    hash_parts(&[b"fs-private-key-v1", workspace_id, label.as_bytes()])
+fn parse_private_key_hex(raw: &str) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    let bytes = hex::decode(raw.trim())?;
+    vec_to_id(bytes, "private_key")
 }
 
 fn public_key_for_private(private_key: &EventId) -> EventId {
-    hash_parts(&[b"fs-public-key-v1", private_key])
-}
-
-fn root_secret_for_label(workspace_id: &EventId, label: &str) -> EventId {
-    hash_parts(&[b"fs-root-secret-v1", workspace_id, label.as_bytes()])
+    PublicKey::from(&StaticSecret::from(*private_key)).to_bytes()
 }
 
 fn root_commitment(root_secret: &EventId) -> EventId {
@@ -1016,21 +1089,171 @@ fn secret_commitment(root_secret: &EventId, node_bytes: &EventId, node_bit_len: 
     ])
 }
 
-fn wrap_ciphertext_commitment(
+fn local_epoch_root(
+    conn: &rusqlite::Connection,
+    ws: &str,
+    epoch: &str,
+) -> Result<Option<EventId>, Box<dyn std::error::Error + Send + Sync>> {
+    conn.query_row(
+        "SELECT root_secret FROM fs_local_epoch_roots
+         WHERE workspace_id = ?1 AND epoch_id = ?2",
+        params![ws, epoch],
+        |r| r.get::<_, Vec<u8>>(0),
+    )
+    .optional()?
+    .map(|bytes| vec_to_id(bytes, "root_secret"))
+    .transpose()
+}
+
+fn message_key(node_secret: &EventId, leaf: &EventId) -> EventId {
+    hash_parts(&[b"fs-message-key-v1", node_secret, leaf])
+}
+
+fn deterministic_nonce(domain: &[u8], parts: &[&[u8]]) -> [u8; AES_GCM_NONCE_BYTES] {
+    let mut h = blake3::Hasher::new();
+    h.update(&(domain.len() as u64).to_le_bytes());
+    h.update(domain);
+    for part in parts {
+        h.update(&(part.len() as u64).to_le_bytes());
+        h.update(part);
+    }
+    let digest = h.finalize();
+    let mut out = [0u8; AES_GCM_NONCE_BYTES];
+    out.copy_from_slice(&digest.as_bytes()[..AES_GCM_NONCE_BYTES]);
+    out
+}
+
+fn encrypt_aes_gcm(
+    key: &EventId,
+    nonce: &[u8; AES_GCM_NONCE_BYTES],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| "invalid AES-GCM key length")?;
+    cipher
+        .encrypt(Nonce::from_slice(nonce), plaintext)
+        .map_err(|_| "AES-GCM encryption failed".into())
+}
+
+fn decrypt_aes_gcm(
+    key: &EventId,
+    nonce: &[u8; AES_GCM_NONCE_BYTES],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| "invalid AES-GCM key length")?;
+    cipher
+        .decrypt(Nonce::from_slice(nonce), ciphertext)
+        .map_err(|_| "AES-GCM authentication failed".into())
+}
+
+fn pack_nonce_ciphertext(nonce: &[u8; AES_GCM_NONCE_BYTES], ciphertext: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(AES_GCM_NONCE_BYTES + ciphertext.len());
+    out.extend_from_slice(nonce);
+    out.extend_from_slice(ciphertext);
+    out
+}
+
+fn unpack_nonce_ciphertext(
+    payload: &[u8],
+) -> Result<([u8; AES_GCM_NONCE_BYTES], &[u8]), Box<dyn std::error::Error + Send + Sync>> {
+    if payload.len() < AES_GCM_NONCE_BYTES + AES_GCM_TAG_BYTES {
+        return Err("encrypted payload is too short".into());
+    }
+    let mut nonce = [0u8; AES_GCM_NONCE_BYTES];
+    nonce.copy_from_slice(&payload[..AES_GCM_NONCE_BYTES]);
+    Ok((nonce, &payload[AES_GCM_NONCE_BYTES..]))
+}
+
+fn encrypt_wrap_payload(
     root_secret: &EventId,
     pubkey_id: &EventId,
-    public_key: &EventId,
+    recipient_public: &EventId,
     node_bytes: &EventId,
     node_bit_len: u32,
-) -> EventId {
-    hash_parts(&[
-        b"fs-wrap-ciphertext-v1",
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let node_bit_len_bytes = node_bit_len.to_le_bytes();
+    let ephemeral_seed = hash_parts(&[
+        b"fs-wrap-ephemeral-v1",
         root_secret,
         pubkey_id,
-        public_key,
+        recipient_public,
         node_bytes,
-        &node_bit_len.to_le_bytes(),
-    ])
+        &node_bit_len_bytes,
+    ]);
+    let ephemeral_secret = StaticSecret::from(ephemeral_seed);
+    let ephemeral_public = PublicKey::from(&ephemeral_secret).to_bytes();
+    let recipient_public_key = PublicKey::from(*recipient_public);
+    let shared = ephemeral_secret.diffie_hellman(&recipient_public_key);
+    let key = hash_parts(&[
+        b"fs-wrap-key-v1",
+        shared.as_bytes(),
+        pubkey_id,
+        recipient_public,
+        &ephemeral_public,
+        node_bytes,
+        &node_bit_len_bytes,
+    ]);
+    let nonce = deterministic_nonce(
+        b"fs-wrap-nonce-v1",
+        &[
+            pubkey_id,
+            recipient_public,
+            &ephemeral_public,
+            node_bytes,
+            &node_bit_len_bytes,
+        ],
+    );
+    let ciphertext = encrypt_aes_gcm(&key, &nonce, root_secret)?;
+    let mut payload =
+        Vec::with_capacity(X25519_PUBLIC_BYTES + AES_GCM_NONCE_BYTES + ciphertext.len());
+    payload.extend_from_slice(&ephemeral_public);
+    payload.extend_from_slice(&nonce);
+    payload.extend_from_slice(&ciphertext);
+    Ok(payload)
+}
+
+fn decrypt_wrap_payload(
+    payload: &[u8],
+    recipient_private: &EventId,
+    expected_public: &EventId,
+    pubkey_id: &EventId,
+    node_bytes: &EventId,
+    node_bit_len: u32,
+) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    if public_key_for_private(recipient_private) != *expected_public {
+        return Err("private key does not match recipient public key".into());
+    }
+    if payload.len() < X25519_PUBLIC_BYTES + AES_GCM_NONCE_BYTES + AES_GCM_TAG_BYTES {
+        return Err("wrap payload is too short".into());
+    }
+    let mut ephemeral_public = [0u8; X25519_PUBLIC_BYTES];
+    ephemeral_public.copy_from_slice(&payload[..X25519_PUBLIC_BYTES]);
+    let mut nonce = [0u8; AES_GCM_NONCE_BYTES];
+    nonce.copy_from_slice(&payload[X25519_PUBLIC_BYTES..X25519_PUBLIC_BYTES + AES_GCM_NONCE_BYTES]);
+    let ciphertext = &payload[X25519_PUBLIC_BYTES + AES_GCM_NONCE_BYTES..];
+    let recipient_secret = StaticSecret::from(*recipient_private);
+    let shared = recipient_secret.diffie_hellman(&PublicKey::from(ephemeral_public));
+    let node_bit_len_bytes = node_bit_len.to_le_bytes();
+    let key = hash_parts(&[
+        b"fs-wrap-key-v1",
+        shared.as_bytes(),
+        pubkey_id,
+        expected_public,
+        &ephemeral_public,
+        node_bytes,
+        &node_bit_len_bytes,
+    ]);
+    let plaintext = decrypt_aes_gcm(&key, &nonce, ciphertext)?;
+    vec_to_id(plaintext, "node_secret")
+}
+
+fn decrypt_message_payload(
+    node_secret: &EventId,
+    leaf: &EventId,
+    payload: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let message_key = message_key(node_secret, leaf);
+    let (nonce, ciphertext) = unpack_nonce_ciphertext(payload)?;
+    decrypt_aes_gcm(&message_key, &nonce, ciphertext)
 }
 
 fn history_leaf(epoch_id: &EventId, unix_minute: u64, coord_event_id: &EventId) -> EventId {

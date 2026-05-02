@@ -95,7 +95,7 @@ Minimal public tables:
 recipients(recipient_id, workspace_id, kind)
 device_pubkeys(pubkey_event_id, recipient_id, pubkey, prev_pubkey_event_id)
 key_epochs(epoch_id, workspace_id, prev_epoch_id, removal_event_id, removal_frontier, root_commitment)
-key_wraps(wrap_event_id, epoch_id, pubkey_event_id, node_prefix, ciphertext_commitment)
+key_wraps(wrap_event_id, epoch_id, pubkey_event_id, node_prefix, ciphertext_hash, ciphertext)
 key_wrap_receipts(receipt_event_id, epoch_id, pubkey_event_id, wrap_event_id)
 history_nodes(epoch_id, node_prefix, node_commitment, source_event_id)
 history_deletes(delete_event_id, epoch_id, deleted_cover, retained_cover_commitment)

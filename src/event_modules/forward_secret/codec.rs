@@ -4,6 +4,8 @@ use super::super::layout::field_spec::{
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{EventError, ParsedEvent, EVENT_TYPE_FORWARD_SECRET};
 
+pub const FORWARD_SECRET_PAYLOAD_BYTES: usize = 256;
+
 pub const KIND_RECIPIENT_CREATED: u8 = 1;
 pub const KIND_DEVICE_PUBKEY: u8 = 2;
 pub const KIND_KEY_EPOCH: u8 = 3;
@@ -29,6 +31,8 @@ pub const FORWARD_SECRET_FIELDS: &[FieldSpec] = &[
     FieldSpec::U64("scalar_1"),
     FieldSpec::U32("scalar_2"),
     FieldSpec::U8("small_1"),
+    FieldSpec::U32("payload_len"),
+    FieldSpec::FixedBytes("payload", FORWARD_SECRET_PAYLOAD_BYTES),
 ];
 
 pub const FORWARD_SECRET_WIRE_SIZE: usize = wire_size_for_fields(FORWARD_SECRET_FIELDS);
@@ -52,10 +56,10 @@ pub struct ForwardSecretEvent {
     pub coord_event_id: [u8; 32],
     /// History-tree node prefix bytes for wrap/receipt facts.
     pub node_bytes: [u8; 32],
-    /// Variant payload commitment:
-    /// public_key, root_commitment, secret_commitment, or ciphertext.
+    /// Variant payload commitment or hash:
+    /// public_key, root_commitment, secret_commitment, or ciphertext hash.
     pub data_1: [u8; 32],
-    /// Variant second payload commitment, typically wrap ciphertext.
+    /// Variant second payload hash, typically wrap ciphertext hash.
     pub data_2: [u8; 32],
     /// Variant scalar: unix minute for history coordinates.
     pub scalar_1: u64,
@@ -63,6 +67,10 @@ pub struct ForwardSecretEvent {
     pub scalar_2: u32,
     /// Variant small enum: recipient kind.
     pub small_1: u8,
+    /// Length of `payload` in bytes.
+    pub payload_len: u32,
+    /// Real encrypted payload bytes for key-wrap and encrypted-message facts.
+    pub payload: Vec<u8>,
 }
 
 impl ForwardSecretEvent {
@@ -126,8 +134,10 @@ impl ForwardSecretEvent {
         node_bytes: [u8; 32],
         node_bit_len: u32,
         secret_commitment: [u8; 32],
-        ciphertext_commitment: [u8; 32],
+        ciphertext_hash: [u8; 32],
+        ciphertext: Vec<u8>,
     ) -> Self {
+        let payload_len = ciphertext.len() as u32;
         Self {
             created_at_ms,
             workspace_id,
@@ -136,8 +146,10 @@ impl ForwardSecretEvent {
             aux_id_1: pubkey_id,
             node_bytes,
             data_1: secret_commitment,
-            data_2: ciphertext_commitment,
+            data_2: ciphertext_hash,
             scalar_2: node_bit_len,
+            payload_len,
+            payload: ciphertext,
             ..Self::blank()
         }
     }
@@ -170,16 +182,20 @@ impl ForwardSecretEvent {
         epoch_id: [u8; 32],
         unix_minute: u64,
         coord_event_id: [u8; 32],
-        ciphertext_commitment: [u8; 32],
+        ciphertext_hash: [u8; 32],
+        ciphertext: Vec<u8>,
     ) -> Self {
+        let payload_len = ciphertext.len() as u32;
         Self {
             created_at_ms,
             workspace_id,
             kind: KIND_MESSAGE_ENCRYPTED,
             subject_id: epoch_id,
             coord_event_id,
-            data_1: ciphertext_commitment,
+            data_1: ciphertext_hash,
             scalar_1: unix_minute,
+            payload_len,
+            payload: ciphertext,
             ..Self::blank()
         }
     }
@@ -217,6 +233,8 @@ impl ForwardSecretEvent {
             scalar_1: 0,
             scalar_2: 0,
             small_1: 0,
+            payload_len: 0,
+            payload: Vec::new(),
         }
     }
 }
@@ -246,6 +264,11 @@ pub fn kind_name(kind: u8) -> &'static str {
 
 pub fn parse_forward_secret(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let values = decode_fields(EVENT_TYPE_FORWARD_SECRET, FORWARD_SECRET_FIELDS, blob)?;
+    let payload_len = values[13].as_u32().unwrap() as usize;
+    if payload_len > FORWARD_SECRET_PAYLOAD_BYTES {
+        return Err(EventError::ContentTooLong(payload_len));
+    }
+    let payload_slot = values[14].as_fixed_bytes().unwrap();
     Ok(ParsedEvent::ForwardSecret(ForwardSecretEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         workspace_id: values[1].as_event_id().unwrap(),
@@ -260,6 +283,8 @@ pub fn parse_forward_secret(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         scalar_1: values[10].as_u64().unwrap(),
         scalar_2: values[11].as_u32().unwrap(),
         small_1: values[12].as_u8().unwrap(),
+        payload_len: payload_len as u32,
+        payload: payload_slot[..payload_len].to_vec(),
     }))
 }
 
@@ -268,6 +293,11 @@ pub fn encode_forward_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError>
         ParsedEvent::ForwardSecret(event) => event,
         _ => return Err(EventError::WrongVariant),
     };
+    if event.payload.len() > FORWARD_SECRET_PAYLOAD_BYTES {
+        return Err(EventError::ContentTooLong(event.payload.len()));
+    }
+    let mut payload = vec![0u8; FORWARD_SECRET_PAYLOAD_BYTES];
+    payload[..event.payload.len()].copy_from_slice(&event.payload);
     let values = vec![
         FieldValue::Timestamp(event.created_at_ms),
         FieldValue::EventId(event.workspace_id),
@@ -282,6 +312,8 @@ pub fn encode_forward_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError>
         FieldValue::U64(event.scalar_1),
         FieldValue::U32(event.scalar_2),
         FieldValue::U8(event.small_1),
+        FieldValue::U32(event.payload.len() as u32),
+        FieldValue::FixedBytes(payload),
     ];
     Ok(encode_fields(
         EVENT_TYPE_FORWARD_SECRET,

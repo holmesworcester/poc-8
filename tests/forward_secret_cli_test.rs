@@ -79,6 +79,17 @@ fn create_workspace(db: &str) {
     run(db, &["create-workspace", "fs-cli"]);
 }
 
+struct Keypair {
+    private_key: String,
+}
+
+fn keygen(db: &str) -> Keypair {
+    let out = run(db, &["fs", "keygen"]);
+    Keypair {
+        private_key: field(&out, "private_key"),
+    }
+}
+
 #[test]
 fn forward_secret_cli_purges_old_pubkey_and_deleted_message_is_unrecoverable() {
     let (_dir, db) = temp_db();
@@ -86,11 +97,10 @@ fn forward_secret_cli_purges_old_pubkey_and_deleted_message_is_unrecoverable() {
     create_workspace(&db);
 
     let alice = field(&run(&db, &["fs", "recipient", "alice"]), "recipient_id");
-    let old_pubkey = field(
-        &run(&db, &["fs", "pubkey", &alice, "alice-v1"]),
-        "pubkey_id",
-    );
-    let epoch = field(&run(&db, &["fs", "epoch", "root-v1"]), "epoch_id");
+    let alice_v1 = keygen(&db).private_key;
+    let old_pubkey = field(&run(&db, &["fs", "pubkey", &alice, &alice_v1]), "pubkey_id");
+    let root_secret = keygen(&db).private_key;
+    let epoch = field(&run(&db, &["fs", "epoch", &root_secret]), "epoch_id");
     let message_out = run(&db, &["fs", "message", &epoch, "msg-1"]);
     let coord = field(&message_out, "coord_event_id");
     let minute = field(&message_out, "unix_minute");
@@ -101,7 +111,20 @@ fn forward_secret_cli_purges_old_pubkey_and_deleted_message_is_unrecoverable() {
         "expected initial wrap:\n{expand}"
     );
 
-    let local_key = run(&db, &["fs", "private-key", &old_pubkey, "alice-v1"]);
+    let wrong_key = keygen(&db).private_key;
+    let rejected = topo_cmd(&db, &["fs", "private-key", &old_pubkey, &wrong_key]);
+    assert!(
+        !rejected.status.success(),
+        "unrelated private key must not be accepted"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("private key does not match pubkey_id"),
+        "wrong private key should fail by decrypt-relevant public-key mismatch:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&rejected.stdout),
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+
+    let local_key = run(&db, &["fs", "private-key", &old_pubkey, &alice_v1]);
     assert!(
         local_key.contains("local_material=present"),
         "expected private key install:\n{local_key}"
@@ -113,10 +136,11 @@ fn forward_secret_cli_purges_old_pubkey_and_deleted_message_is_unrecoverable() {
         "expected receipt after private key install:\n{expand}"
     );
 
+    let alice_v2 = keygen(&db).private_key;
     let new_pubkey = field(
         &run(
             &db,
-            &["fs", "pubkey", &alice, "alice-v2", "--prev", &old_pubkey],
+            &["fs", "pubkey", &alice, &alice_v2, "--prev", &old_pubkey],
         ),
         "pubkey_id",
     );
@@ -141,7 +165,7 @@ fn forward_secret_cli_purges_old_pubkey_and_deleted_message_is_unrecoverable() {
     );
 
     run(&db, &["fs", "delete", &epoch, &coord, &minute]);
-    let compromised_old = run(&db, &["fs", "private-key", &old_pubkey, "alice-v1"]);
+    let compromised_old = run(&db, &["fs", "private-key", &old_pubkey, &alice_v1]);
     assert!(
         compromised_old.contains("local_material=purged skipped=true"),
         "post-purge compromise should not restore old key material:\n{compromised_old}"
@@ -161,15 +185,18 @@ fn forward_secret_cli_partitioned_join_gets_wrap_but_removed_recipient_does_not(
     create_workspace(&db);
 
     let alice = field(&run(&db, &["fs", "recipient", "alice"]), "recipient_id");
-    let alice_pubkey = field(
-        &run(&db, &["fs", "pubkey", &alice, "alice-v1"]),
-        "pubkey_id",
-    );
+    let alice_v1 = keygen(&db).private_key;
+    let alice_pubkey = field(&run(&db, &["fs", "pubkey", &alice, &alice_v1]), "pubkey_id");
     let bob = field(&run(&db, &["fs", "recipient", "bob"]), "recipient_id");
-    let bob_pubkey = field(&run(&db, &["fs", "pubkey", &bob, "bob-v1"]), "pubkey_id");
+    let bob_v1 = keygen(&db).private_key;
+    let bob_pubkey = field(&run(&db, &["fs", "pubkey", &bob, &bob_v1]), "pubkey_id");
 
+    let root_secret = keygen(&db).private_key;
     let epoch = field(
-        &run(&db, &["fs", "epoch", "root-v1", "--remove-recipient", &bob]),
+        &run(
+            &db,
+            &["fs", "epoch", &root_secret, "--remove-recipient", &bob],
+        ),
         "epoch_id",
     );
     let expand = run(&db, &["fs", "expand"]);
@@ -188,7 +215,8 @@ fn forward_secret_cli_partitioned_join_gets_wrap_but_removed_recipient_does_not(
     );
 
     let cara = field(&run(&db, &["fs", "recipient", "cara"]), "recipient_id");
-    let cara_pubkey = field(&run(&db, &["fs", "pubkey", &cara, "cara-v1"]), "pubkey_id");
+    let cara_v1 = keygen(&db).private_key;
+    let cara_pubkey = field(&run(&db, &["fs", "pubkey", &cara, &cara_v1]), "pubkey_id");
     let expand = run(&db, &["fs", "expand"]);
     assert!(
         expand.contains("emitted_wraps=1"),

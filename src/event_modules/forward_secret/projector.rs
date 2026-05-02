@@ -79,7 +79,8 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             node_bit_len INTEGER NOT NULL,
             node_bytes BLOB NOT NULL,
             secret_commitment BLOB NOT NULL,
-            ciphertext_commitment BLOB NOT NULL,
+            ciphertext_hash BLOB NOT NULL,
+            ciphertext BLOB NOT NULL,
             PRIMARY KEY (workspace_id, wrap_id)
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_fs_key_wraps_unique_target
@@ -111,7 +112,8 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             epoch_id TEXT NOT NULL,
             unix_minute INTEGER NOT NULL,
             coord_event_id TEXT NOT NULL,
-            ciphertext_commitment BLOB NOT NULL,
+            ciphertext_hash BLOB NOT NULL,
+            ciphertext BLOB NOT NULL,
             PRIMARY KEY (workspace_id, message_id)
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_fs_messages_coord
@@ -148,6 +150,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             epoch_id TEXT NOT NULL,
             node_bit_len INTEGER NOT NULL,
             node_bytes BLOB NOT NULL,
+            node_secret BLOB NOT NULL,
             PRIMARY KEY (workspace_id, pubkey_id, epoch_id, node_bit_len, node_bytes)
         );
         ",
@@ -187,6 +190,9 @@ pub fn project_pure(
     }
     if event.scalar_2 > 256 {
         return ProjectorResult::reject("node_bit_len must be <= 256".to_string());
+    }
+    if event.payload_len as usize != event.payload.len() {
+        return ProjectorResult::reject("payload_len does not match payload".to_string());
     }
     if event.kind == KIND_RECIPIENT_CREATED
         && !matches!(event.small_1, RECIPIENT_DEVICE | RECIPIENT_INVITE)
@@ -320,7 +326,8 @@ pub fn project_pure(
                     "node_bit_len",
                     "node_bytes",
                     "secret_commitment",
-                    "ciphertext_commitment",
+                    "ciphertext_hash",
+                    "ciphertext",
                 ],
                 values: vec![
                     SqlVal::Text(ws),
@@ -331,6 +338,7 @@ pub fn project_pure(
                     SqlVal::Blob(event.node_bytes.to_vec()),
                     SqlVal::Blob(event.data_1.to_vec()),
                     SqlVal::Blob(event.data_2.to_vec()),
+                    SqlVal::Blob(event.payload.clone()),
                 ],
             });
         }
@@ -366,7 +374,8 @@ pub fn project_pure(
                     "epoch_id",
                     "unix_minute",
                     "coord_event_id",
-                    "ciphertext_commitment",
+                    "ciphertext_hash",
+                    "ciphertext",
                 ],
                 values: vec![
                     SqlVal::Text(ws),
@@ -375,6 +384,7 @@ pub fn project_pure(
                     SqlVal::Int(event.scalar_1 as i64),
                     SqlVal::Text(coord),
                     SqlVal::Blob(event.data_1.to_vec()),
+                    SqlVal::Blob(event.payload.clone()),
                 ],
             });
         }
