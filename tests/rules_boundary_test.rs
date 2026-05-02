@@ -16,6 +16,24 @@ fn rust_files(root: &Path) -> Vec<std::path::PathBuf> {
     files
 }
 
+fn file_contains_violations(
+    root: &Path,
+    files: &[std::path::PathBuf],
+    forbidden: &[&str],
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    for path in files {
+        let text = std::fs::read_to_string(path).expect("read rust file");
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        for needle in forbidden {
+            if text.contains(needle) {
+                violations.push(format!("{} contains {needle}", relative.display()));
+            }
+        }
+    }
+    violations
+}
+
 #[test]
 fn event_modules_do_not_use_event_rs() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/event_modules");
@@ -38,6 +56,42 @@ fn event_modules_are_directories() {
     assert!(
         offenders.is_empty(),
         "event modules must be directories: {offenders:?}"
+    );
+}
+
+#[test]
+#[ignore = "target boundary: current prototype sync still owns TCP orchestration"]
+fn sync_event_module_does_not_own_transport_or_frame_io() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sync_root = root.join("src/event_modules/sync");
+    let files = rust_files(&sync_root);
+    let forbidden = [
+        "TcpStream",
+        "TcpListener",
+        "crate::network",
+        "read_frame",
+        "write_frame",
+    ];
+    let violations = file_contains_violations(root, &files, &forbidden);
+    assert!(
+        violations.is_empty(),
+        "sync event modules must not own TCP transport or frame IO:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+#[ignore = "target boundary: replace prototype session messages with connection-scoped events"]
+fn sync_event_module_does_not_use_session_message_vocabulary() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sync_root = root.join("src/event_modules/sync");
+    let files = rust_files(&sync_root);
+    let forbidden = ["Hello", "HelloAck", "Done", "Events"];
+    let violations = file_contains_violations(root, &files, &forbidden);
+    assert!(
+        violations.is_empty(),
+        "sync protocol items must be connection-scoped events, not session messages:\n{}",
+        violations.join("\n")
     );
 }
 
