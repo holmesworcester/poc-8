@@ -363,17 +363,24 @@ assert eventual convergence and measure sync-start to all-counted time.
 Keep the kernel boring:
 
 - `network` owns TCP, frame boundaries, connection attempts, and byte IO only.
-- `store` owns durable bytes, peer addresses, and generic event-set reads/writes
-  only.
+- `store` owns durable bytes, generic module-owned rows, and generic event-set
+  reads/writes only.
 - `event_modules/content` owns content event construction, codec, and projection.
 - `event_modules/sync` owns all negentropy, compare/have/need/range decisions,
   connection-scoped sync events, and sync jobs.
+- `event_modules/connection` owns endpoint identity, bootstrap/connection
+  events, established-connection rows, and the route facts needed to reach an
+  endpoint.
 
 The kernel should be a pleasure to read: small files, direct control flow,
 plain names, and no hidden protocol cleverness. A reader should understand the
 kernel as an executor, durable byte store, and TCP byte mover without learning
 the content or sync protocols. All real domain and protocol logic belongs in
 event modules.
+
+Core kernel files must not own connection, peer, or bootstrap schema. If a
+protocol needs a durable or transient table, the owning event module declares
+the table and writes it through generic storage/projector output.
 
 Do not put sync protocol vocabulary or decisions in core files. In particular,
 `store`, `network`, and CLI glue may not decide what a negentropy range means,

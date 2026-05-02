@@ -1,4 +1,4 @@
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 
 use crate::network;
 use crate::store::{EventId, Store};
@@ -12,61 +12,23 @@ const EVENT_ENTRY_OVERHEAD_BYTES: usize = 4;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SyncReport {
-    pub peers_synced: usize,
+    pub routes_synced: usize,
     pub sent_events: usize,
     pub received_events: usize,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ServeReport {
-    pub accepted_connections: usize,
-    pub received_events: usize,
-}
-
-pub fn connect(store: &Store, addr: SocketAddr) -> Result<(), String> {
-    let mut stream = network::connect(addr).map_err(|err| format!("open tcp stream: {err}"))?;
-    write_message(&mut stream, &Message::Hello)?;
-    match read_message(&mut stream)? {
-        Message::HelloAck => {
-            store
-                .insert_peer(addr)
-                .map_err(|err| format!("store peer: {err}"))?;
-            Ok(())
-        }
-        other => Err(format!("expected hello ack, got {other:?}")),
-    }
-}
-
-pub fn sync(store: &Store) -> Result<SyncReport, String> {
-    let peers = store.peers().map_err(|err| format!("load peers: {err}"))?;
+pub fn sync(store: &Store, targets: Vec<SocketAddr>) -> Result<SyncReport, String> {
     let mut report = SyncReport::default();
-    for peer in peers {
-        let peer_report = sync_peer(store, peer)?;
-        report.peers_synced += 1;
-        report.sent_events += peer_report.sent_events;
-        report.received_events += peer_report.received_events;
+    for target in targets {
+        let target_report = sync_target(store, target)?;
+        report.routes_synced += 1;
+        report.sent_events += target_report.sent_events;
+        report.received_events += target_report.received_events;
     }
     Ok(report)
 }
 
-pub fn serve(
-    store: &Store,
-    listener: TcpListener,
-    accept_count: usize,
-) -> Result<ServeReport, String> {
-    let mut report = ServeReport::default();
-    for _ in 0..accept_count {
-        let (mut stream, _) = listener
-            .accept()
-            .map_err(|err| format!("accept tcp stream: {err}"))?;
-        let received = serve_stream(store, &mut stream)?;
-        report.accepted_connections += 1;
-        report.received_events += received;
-    }
-    Ok(report)
-}
-
-fn sync_peer(store: &Store, addr: SocketAddr) -> Result<SyncReport, String> {
+fn sync_target(store: &Store, addr: SocketAddr) -> Result<SyncReport, String> {
     let mut stream = network::connect(addr).map_err(|err| format!("open tcp stream: {err}"))?;
     let local = queries::summary(store)?;
     write_message(&mut stream, &Message::Summary(local))?;
@@ -119,14 +81,18 @@ fn sync_peer(store: &Store, addr: SocketAddr) -> Result<SyncReport, String> {
     }
 
     Ok(SyncReport {
-        peers_synced: 1,
+        routes_synced: 1,
         sent_events,
         received_events,
     })
 }
 
-fn serve_stream(store: &Store, stream: &mut TcpStream) -> Result<usize, String> {
-    match read_message(stream)? {
+pub fn serve_first_message(
+    store: &Store,
+    stream: &mut TcpStream,
+    message: Message,
+) -> Result<usize, String> {
+    match message {
         Message::Hello => {
             write_message(stream, &Message::HelloAck)?;
             Ok(0)

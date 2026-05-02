@@ -115,3 +115,30 @@ fn core_files_do_not_contain_sync_protocol_logic() {
         violations.join("\n")
     );
 }
+
+#[test]
+fn core_storage_and_transport_do_not_own_connection_or_bootstrap_schema() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let files = ["src/store.rs", "src/network.rs"];
+    let forbidden = [
+        "peer",
+        "bootstrap",
+        "connection_id",
+        "connection_events",
+        "connection.",
+    ];
+    let mut violations = Vec::new();
+    for file in files {
+        let text = std::fs::read_to_string(root.join(file)).expect("read file");
+        for needle in forbidden {
+            if text.contains(needle) {
+                violations.push(format!("{file} contains {needle}"));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "connection/bootstrap storage belongs in event_modules/connection:\n{}",
+        violations.join("\n")
+    );
+}

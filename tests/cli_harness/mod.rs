@@ -7,6 +7,8 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub const BOOTSTRAP_TOKEN: &str = "test-bootstrap-token";
+
 pub fn topo(db: &str, args: &[&str]) -> Output {
     Command::new(topo_bin())
         .arg("--db")
@@ -96,6 +98,8 @@ pub fn start_listener(db: &str, port: u16, accept: usize) -> Child {
             &port.to_string(),
             "--accept",
             &accept.to_string(),
+            "--bootstrap",
+            BOOTSTRAP_TOKEN,
         ],
     )
 }
@@ -103,7 +107,7 @@ pub fn start_listener(db: &str, port: u16, accept: usize) -> Child {
 pub fn connect_with_retry(db: &str, port: u16) -> String {
     let mut last = String::new();
     for _ in 0..50 {
-        let output = topo(db, &["connect", "127.0.0.1", &port.to_string()]);
+        let output = connect_with_token(db, port, BOOTSTRAP_TOKEN);
         if output.status.success() {
             return stdout(&output);
         }
@@ -111,6 +115,32 @@ pub fn connect_with_retry(db: &str, port: u16) -> String {
         thread::sleep(Duration::from_millis(50));
     }
     panic!("connect never succeeded: {last}");
+}
+
+pub fn connect_with_token(db: &str, port: u16, token: &str) -> Output {
+    topo(
+        db,
+        &[
+            "connect",
+            "127.0.0.1",
+            &port.to_string(),
+            "--bootstrap",
+            token,
+        ],
+    )
+}
+
+pub fn connect_with_token_after_listener(db: &str, port: u16, token: &str) -> Output {
+    let mut last = None;
+    for _ in 0..50 {
+        let output = connect_with_token(db, port, token);
+        if output.status.success() || !stderr(&output).contains("open tcp stream") {
+            return output;
+        }
+        last = Some(output);
+        thread::sleep(Duration::from_millis(50));
+    }
+    last.expect("connect attempted")
 }
 
 pub fn generate(db: &str, count: usize, size: usize) -> String {
@@ -129,6 +159,20 @@ pub fn count(db: &str) -> usize {
     line_value(&out, "events")
         .parse()
         .expect("parse event count")
+}
+
+pub fn connection_count(db: &str) -> usize {
+    let out = assert_success(topo(db, &["count"]));
+    line_value(&out, "connections")
+        .parse()
+        .expect("parse connection count")
+}
+
+pub fn connection_event_count(db: &str) -> usize {
+    let out = assert_success(topo(db, &["count"]));
+    line_value(&out, "connection_events")
+        .parse()
+        .expect("parse connection event count")
 }
 
 pub fn assert_eventually_count(db: &str, expected: usize, timeout: Duration) {

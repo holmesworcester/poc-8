@@ -7,7 +7,7 @@ use std::io::Write;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 
-use event_modules::{content, sync};
+use event_modules::{connection, content, sync};
 use store::Store;
 
 fn main() {
@@ -22,8 +22,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
     let store = Store::open(db_path).map_err(|err| format!("open store: {err}"))?;
 
     match command {
-        Command::Connect { addr } => {
-            sync::commands::connect(&store, addr).map_err(|err| format!("connect: {err}"))?;
+        Command::Connect { addr: _ } => {
+            return Err(usage("connect requires --bootstrap TOKEN"));
+        }
+        Command::ConnectBootstrap {
+            addr,
+            bootstrap_token,
+        } => {
+            connect(&store, addr, &bootstrap_token).map_err(|err| format!("connect: {err}"))?;
             println!("connected: {addr}");
         }
         Command::Generate {
@@ -40,6 +46,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         Command::Sync {
             listen,
             accept_count,
+            bootstrap_token,
         } => {
             if let Some(addr) = listen {
                 let listener = TcpListener::bind(addr).map_err(|err| format!("listen: {err}"))?;
@@ -50,13 +57,15 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 std::io::stdout()
                     .flush()
                     .map_err(|err| format!("flush stdout: {err}"))?;
-                let report = sync::commands::serve(&store, listener, accept_count)
-                    .map_err(|err| format!("serve sync: {err}"))?;
+                let report = serve(&store, listener, accept_count, bootstrap_token.as_deref())
+                    .map_err(|err| format!("serve: {err}"))?;
                 println!("accepted_connections: {}", report.accepted_connections);
                 println!("received_events: {}", report.received_events);
             } else {
-                let report = sync::commands::sync(&store).map_err(|err| format!("sync: {err}"))?;
-                println!("peers_synced: {}", report.peers_synced);
+                let targets = connection::commands::transport_targets(&store)?;
+                let report =
+                    sync::commands::sync(&store, targets).map_err(|err| format!("sync: {err}"))?;
+                println!("routes_synced: {}", report.routes_synced);
                 println!("sent_events: {}", report.sent_events);
                 println!("received_events: {}", report.received_events);
             }
@@ -70,6 +79,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 .map_err(|err| format!("count bytes: {err}"))?;
             println!("events: {count}");
             println!("payload_bytes: {bytes}");
+            println!(
+                "connections: {}",
+                connection::commands::connection_count(&store)?
+            );
+            println!(
+                "connection_events: {}",
+                connection::commands::connection_event_count(&store)?
+            );
         }
     }
 
@@ -81,6 +98,10 @@ enum Command {
     Connect {
         addr: SocketAddr,
     },
+    ConnectBootstrap {
+        addr: SocketAddr,
+        bootstrap_token: String,
+    },
     Generate {
         num_events: usize,
         event_size: usize,
@@ -88,6 +109,7 @@ enum Command {
     Sync {
         listen: Option<SocketAddr>,
         accept_count: usize,
+        bootstrap_token: Option<String>,
     },
     Count,
 }
@@ -120,7 +142,25 @@ fn parse_args(args: Vec<String>) -> Result<(PathBuf, Command), String> {
             let addr = format!("{ip}:{port}")
                 .parse::<SocketAddr>()
                 .map_err(|_| usage("connect requires IP PORT"))?;
-            Command::Connect { addr }
+            let mut bootstrap_token = None;
+            let mut idx = 3;
+            while idx < rest.len() {
+                match rest[idx].as_str() {
+                    "--bootstrap" => {
+                        bootstrap_token = rest.get(idx + 1).cloned();
+                        idx += 2;
+                    }
+                    other => return Err(usage(&format!("unknown connect option `{other}`"))),
+                }
+            }
+            if let Some(bootstrap_token) = bootstrap_token {
+                Command::ConnectBootstrap {
+                    addr,
+                    bootstrap_token,
+                }
+            } else {
+                Command::Connect { addr }
+            }
         }
         "generate" => {
             let num_events = parse_usize(rest.get(1), "generate requires NUM_EVENTS EVENT_SIZE")?;
@@ -133,6 +173,7 @@ fn parse_args(args: Vec<String>) -> Result<(PathBuf, Command), String> {
         "sync" => {
             let mut listen = None;
             let mut accept_count = 1usize;
+            let mut bootstrap_token = None;
             let mut idx = 1;
             while idx < rest.len() {
                 match rest[idx].as_str() {
@@ -157,6 +198,10 @@ fn parse_args(args: Vec<String>) -> Result<(PathBuf, Command), String> {
                         )?;
                         idx += 2;
                     }
+                    "--bootstrap" => {
+                        bootstrap_token = rest.get(idx + 1).cloned();
+                        idx += 2;
+                    }
                     other => return Err(usage(&format!("unknown sync option `{other}`"))),
                 }
             }
@@ -166,6 +211,7 @@ fn parse_args(args: Vec<String>) -> Result<(PathBuf, Command), String> {
             Command::Sync {
                 listen,
                 accept_count,
+                bootstrap_token,
             }
         }
         "count" | "status" => Command::Count,
@@ -186,6 +232,67 @@ fn parse_usize(value: Option<&String>, message: &str) -> Result<usize, String> {
 
 fn usage(message: &str) -> String {
     format!(
-        "{message}\nusage:\n  topo --db PATH connect IP PORT\n  topo --db PATH generate NUM_EVENTS EVENT_SIZE_BYTES\n  topo --db PATH sync [--listen IP PORT --accept N]\n  topo --db PATH count"
+        "{message}\nusage:\n  topo --db PATH connect IP PORT --bootstrap TOKEN\n  topo --db PATH generate NUM_EVENTS EVENT_SIZE_BYTES\n  topo --db PATH sync [--listen IP PORT --accept N --bootstrap TOKEN]\n  topo --db PATH count"
     )
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ServeReport {
+    accepted_connections: usize,
+    received_events: usize,
+}
+
+fn connect(store: &Store, addr: SocketAddr, bootstrap_token: &str) -> Result<(), String> {
+    let mut stream = network::connect(addr).map_err(|err| format!("open tcp stream: {err}"))?;
+    let request = connection::commands::create_request(store, bootstrap_token)?;
+    network::write_frame(&mut stream, &request.bytes)
+        .map_err(|err| format!("send request: {err}"))?;
+    let response = network::read_frame(&mut stream).map_err(|err| format!("read ack: {err}"))?;
+    let result = connection::commands::accept_ack(
+        store,
+        response,
+        request.local_endpoint,
+        request.request_id,
+    )?;
+    let connection_id = result
+        .connection_id
+        .ok_or_else(|| "connection ack did not establish a connection".to_string())?;
+    connection::commands::record_transport_target(store, connection_id, addr)?;
+    Ok(())
+}
+
+fn serve(
+    store: &Store,
+    listener: TcpListener,
+    accept_count: usize,
+    bootstrap_token: Option<&str>,
+) -> Result<ServeReport, String> {
+    let mut report = ServeReport::default();
+    for _ in 0..accept_count {
+        let (mut stream, peer_addr) = listener
+            .accept()
+            .map_err(|err| format!("accept tcp stream: {err}"))?;
+        let first_frame =
+            network::read_frame(&mut stream).map_err(|err| format!("read first frame: {err}"))?;
+        if connection::commands::is_connection_event(&first_frame) {
+            let bootstrap_token = bootstrap_token
+                .ok_or_else(|| "connection request requires --bootstrap TOKEN".to_string())?;
+            let result = connection::commands::accept_request(store, first_frame, bootstrap_token)?;
+            if let Some(response) = result.response {
+                network::write_frame(&mut stream, &response)
+                    .map_err(|err| format!("send connection response: {err}"))?;
+            }
+            let connection_id = result
+                .connection_id
+                .ok_or_else(|| "connection request did not establish a connection".to_string())?;
+            connection::commands::record_transport_target(store, connection_id, peer_addr)?;
+            report.accepted_connections += 1;
+        } else {
+            let message = sync::codec::decode(&first_frame)?;
+            report.received_events +=
+                sync::commands::serve_first_message(store, &mut stream, message)?;
+            report.accepted_connections += 1;
+        }
+    }
+    Ok(report)
 }

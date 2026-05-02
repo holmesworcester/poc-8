@@ -22,7 +22,7 @@ fn sync_converges_over_real_tcp() {
 
     let started = Instant::now();
     let sync_out = sync(&alice);
-    assert!(sync_out.contains("peers_synced: 1"), "{sync_out}");
+    assert!(sync_out.contains("routes_synced: 1"), "{sync_out}");
 
     let server_out = wait_success(listener, "sync listener");
     assert!(
@@ -58,7 +58,7 @@ fn sync_perf_reports_10k_event_rate_from_sync_start_to_all_counted() {
 
     let started = Instant::now();
     let sync_out = sync(&alice);
-    assert!(sync_out.contains("peers_synced: 1"), "{sync_out}");
+    assert!(sync_out.contains("routes_synced: 1"), "{sync_out}");
     wait_success(listener, "perf sync listener");
     assert_eventually_count(&bob, event_count, Duration::from_secs(30));
     let elapsed = started.elapsed();
@@ -92,7 +92,7 @@ fn sync_splits_large_payloads_into_transport_sized_frames() {
 
     let started = Instant::now();
     let sync_out = sync(&alice);
-    assert!(sync_out.contains("peers_synced: 1"), "{sync_out}");
+    assert!(sync_out.contains("routes_synced: 1"), "{sync_out}");
     wait_success(listener, "large payload sync listener");
     assert_eventually_count(&bob, event_count, Duration::from_secs(60));
     let elapsed = started.elapsed();

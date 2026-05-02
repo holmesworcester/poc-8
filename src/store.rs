@@ -1,8 +1,14 @@
 use rusqlite::{params, Connection, OptionalExtension};
-use std::net::SocketAddr;
 use std::path::Path;
 
 pub type EventId = [u8; 32];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleRow {
+    pub table: &'static str,
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventRecord {
@@ -29,29 +35,62 @@ impl Store {
         Ok(store)
     }
 
-    pub fn insert_peer(&self, addr: SocketAddr) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO peers (addr) VALUES (?1)",
-            params![addr.to_string()],
-        )?;
-        Ok(())
+    pub fn insert_module_rows(&self, rows: Vec<ModuleRow>) -> rusqlite::Result<usize> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let mut inserted = 0;
+            for row in rows {
+                inserted += self.conn.execute(
+                    "INSERT OR IGNORE INTO module_rows
+                        (table_name, row_key, row_value)
+                     VALUES (?1, ?2, ?3)",
+                    params![row.table, row.key, row.value],
+                )?;
+            }
+            Ok::<usize, rusqlite::Error>(inserted)
+        })();
+
+        match result {
+            Ok(inserted) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(inserted)
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
     }
 
-    pub fn peers(&self) -> rusqlite::Result<Vec<SocketAddr>> {
-        let mut stmt = self.conn.prepare("SELECT addr FROM peers ORDER BY addr")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut out = Vec::new();
-        for row in rows {
-            let addr = row?.parse::<SocketAddr>().map_err(|err| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(err),
-                )
-            })?;
-            out.push(addr);
-        }
-        Ok(out)
+    pub fn module_row(&self, table: &'static str, key: &[u8]) -> rusqlite::Result<Option<Vec<u8>>> {
+        self.conn
+            .query_row(
+                "SELECT row_value FROM module_rows
+                 WHERE table_name = ?1 AND row_key = ?2",
+                params![table, key],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    pub fn module_row_count(&self, table: &'static str) -> rusqlite::Result<usize> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM module_rows WHERE table_name = ?1",
+                params![table],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count as usize)
+    }
+
+    pub fn module_rows(&self, table: &'static str) -> rusqlite::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT row_key, row_value FROM module_rows
+             WHERE table_name = ?1
+             ORDER BY row_key",
+        )?;
+        let rows = stmt.query_map(params![table], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
     }
 
     pub fn insert_events(&self, events: Vec<EventRecord>) -> rusqlite::Result<usize> {
@@ -182,8 +221,11 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_events_bucket
                 ON events(bucket, event_id);
 
-            CREATE TABLE IF NOT EXISTS peers (
-                addr TEXT PRIMARY KEY NOT NULL
+            CREATE TABLE IF NOT EXISTS module_rows (
+                table_name TEXT NOT NULL,
+                row_key BLOB NOT NULL,
+                row_value BLOB NOT NULL,
+                PRIMARY KEY (table_name, row_key)
             );
             ",
         )
