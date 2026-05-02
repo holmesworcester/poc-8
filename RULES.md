@@ -236,6 +236,13 @@ Functional tests and demos must exercise the production boundary they claim to
 prove. Do not call a shortcut and name it sync, network, auth, storage, or CLI
 if the real path would cross a different boundary.
 
+Do not stop working at a partial, fake, or merely scaffolded result. A task is
+not complete until the claimed behavior is real through the production boundary,
+covered by the appropriate black-box test, and any remaining fake or missing
+piece is either removed or explicitly marked out of scope. If the real result
+cannot be completed in the current branch, stop claiming the feature works and
+leave a concrete blocker instead of passing placeholder coverage.
+
 Use these rules:
 
 - Functional tests are black-box by default. They should drive the public
