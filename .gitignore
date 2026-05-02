@@ -1,6 +1,0 @@
-/target
-*.db
-*.db*
-*.jar
-docs/tla/states/
-*.pyc
