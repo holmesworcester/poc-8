@@ -1,160 +1,213 @@
-use std::net::{SocketAddr, TcpStream};
-
-use crate::network;
 use crate::store::{EventId, Store};
 
-use super::codec::{self, Message};
+use super::codec::{self, Frame, SyncItem};
 use super::{projector, queries};
 
-const EVENT_FRAME_LIMIT_BYTES: usize = 32 * 1024 * 1024;
-const EVENTS_MESSAGE_OVERHEAD_BYTES: usize = 5;
-const EVENT_ENTRY_OVERHEAD_BYTES: usize = 4;
+const FRAME_TARGET_BYTES: usize = 32 * 1024 * 1024;
+const FRAME_HEADER_BYTES: usize = 14;
+const DATA_ITEM_HEADER_BYTES: usize = 1 + 32 + 4;
+const DATA_ENTRY_BYTES: usize = 4;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SyncReport {
-    pub routes_synced: usize,
     pub sent_events: usize,
     pub received_events: usize,
 }
 
-pub fn sync(store: &Store, targets: Vec<SocketAddr>) -> Result<SyncReport, String> {
-    let mut report = SyncReport::default();
-    for target in targets {
-        let target_report = sync_target(store, target)?;
-        report.routes_synced += 1;
-        report.sent_events += target_report.sent_events;
-        report.received_events += target_report.received_events;
-    }
-    Ok(report)
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Incoming {
+    pub connection_id: Option<EventId>,
+    pub compare: Option<[codec::BucketSummary; codec::BUCKETS]>,
+    pub haves: Vec<(u8, EventId)>,
+    pub needs: Vec<EventId>,
+    pub received_events: usize,
 }
 
-fn sync_target(store: &Store, addr: SocketAddr) -> Result<SyncReport, String> {
-    let mut stream = network::connect(addr).map_err(|err| format!("open tcp stream: {err}"))?;
+pub fn emit_start(
+    store: &Store,
+    connection_id: EventId,
+    mut emit: impl FnMut(Vec<u8>) -> Result<(), String>,
+) -> Result<SyncReport, String> {
+    let mut items = vec![SyncItem::Compare {
+        connection_id,
+        summary: queries::summary(store)?,
+    }];
+    items.extend(all_have_items(store, connection_id)?);
+    emit_items(items, &mut emit)?;
+    Ok(SyncReport::default())
+}
+
+pub fn absorb_frame(store: &Store, bytes: &[u8], incoming: &mut Incoming) -> Result<bool, String> {
+    let frame = codec::decode(bytes)?;
+    for item in frame.items {
+        match item {
+            SyncItem::Compare {
+                connection_id,
+                summary,
+            } => {
+                observe_connection(incoming, connection_id)?;
+                incoming.compare = Some(summary);
+            }
+            SyncItem::HaveId {
+                connection_id,
+                bucket,
+                id,
+            } => {
+                observe_connection(incoming, connection_id)?;
+                incoming.haves.push((bucket, id));
+            }
+            SyncItem::NeedId { connection_id, id } => {
+                observe_connection(incoming, connection_id)?;
+                incoming.needs.push(id);
+            }
+            SyncItem::Data {
+                connection_id,
+                items,
+            } => {
+                observe_connection(incoming, connection_id)?;
+                incoming.received_events += queries::insert_events(store, items)?;
+            }
+        }
+    }
+    Ok(frame.more)
+}
+
+pub fn emit_start_response(
+    store: &Store,
+    incoming: Incoming,
+    mut emit: impl FnMut(Vec<u8>) -> Result<(), String>,
+) -> Result<SyncReport, String> {
+    let connection_id = incoming_connection_id(&incoming)?;
+    let mut items = Vec::new();
     let local = queries::summary(store)?;
-    write_message(&mut stream, &Message::Summary(local))?;
-
-    let remote = expect_summary(read_message(&mut stream)?)?;
-    let differing = projector::differing_buckets(&local, &remote);
-    for bucket in &differing {
-        write_message(
-            &mut stream,
-            &Message::Have {
-                bucket: *bucket,
-                ids: queries::ids_in_bucket(store, *bucket)?,
-            },
-        )?;
+    items.push(SyncItem::Compare {
+        connection_id,
+        summary: local,
+    });
+    if let Some(remote) = incoming.compare {
+        items.extend(have_items_for_compare(store, connection_id, local, remote)?);
     }
-    write_message(&mut stream, &Message::Done)?;
-
-    let mut sent_events = 0;
-    let mut ids_to_request = Vec::new();
-    loop {
-        match read_message(&mut stream)? {
-            Message::Have { ids, .. } => {
-                ids_to_request.extend(missing_ids(store, &ids)?);
-            }
-            Message::Need { ids } => {
-                sent_events += send_events(store, &mut stream, &ids)?;
-            }
-            Message::Done => break,
-            other => return Err(format!("unexpected sync phase message {other:?}")),
-        }
-    }
-
-    write_message(
-        &mut stream,
-        &Message::Need {
-            ids: ids_to_request,
-        },
-    )?;
-    write_message(&mut stream, &Message::Done)?;
-
-    let mut received_events = 0;
-    loop {
-        match read_message(&mut stream)? {
-            Message::Events { events } => {
-                received_events += queries::insert_events(store, events)?;
-            }
-            Message::Done => break,
-            other => return Err(format!("unexpected final sync message {other:?}")),
-        }
-    }
-
+    add_needs_for_haves(store, &incoming, &mut items)?;
+    emit_items(items, &mut emit)?;
     Ok(SyncReport {
-        routes_synced: 1,
-        sent_events,
-        received_events,
+        sent_events: 0,
+        received_events: incoming.received_events,
     })
 }
 
-pub fn serve_first_message(
+pub fn emit_answer_response(
     store: &Store,
-    stream: &mut TcpStream,
-    message: Message,
-) -> Result<usize, String> {
-    match message {
-        Message::Hello => {
-            write_message(stream, &Message::HelloAck)?;
-            Ok(0)
-        }
-        Message::Summary(remote) => serve_sync(store, stream, remote),
-        other => Err(format!("unexpected first message {other:?}")),
+    incoming: Incoming,
+    mut emit: impl FnMut(Vec<u8>) -> Result<(), String>,
+) -> Result<SyncReport, String> {
+    let connection_id = incoming_connection_id(&incoming)?;
+    let mut control_items = Vec::new();
+    add_needs_for_haves(store, &incoming, &mut control_items)?;
+    let sent_events = emit_control_and_requested_data(
+        store,
+        connection_id,
+        control_items,
+        &incoming.needs,
+        &mut emit,
+    )?;
+    Ok(SyncReport {
+        sent_events,
+        received_events: incoming.received_events,
+    })
+}
+
+pub fn emit_finish_response(
+    store: &Store,
+    incoming: Incoming,
+    mut emit: impl FnMut(Vec<u8>) -> Result<(), String>,
+) -> Result<SyncReport, String> {
+    let connection_id = incoming_connection_id(&incoming)?;
+    let sent_events = emit_control_and_requested_data(
+        store,
+        connection_id,
+        Vec::new(),
+        &incoming.needs,
+        &mut emit,
+    )?;
+    Ok(SyncReport {
+        sent_events,
+        received_events: incoming.received_events,
+    })
+}
+
+pub fn finish(incoming: Incoming) -> SyncReport {
+    SyncReport {
+        sent_events: 0,
+        received_events: incoming.received_events,
     }
 }
 
-fn serve_sync(
+fn observe_connection(incoming: &mut Incoming, connection_id: EventId) -> Result<(), String> {
+    if let Some(existing) = incoming.connection_id {
+        if existing != connection_id {
+            return Err("sync frame mixed connection ids".to_string());
+        }
+    } else {
+        incoming.connection_id = Some(connection_id);
+    }
+    Ok(())
+}
+
+fn incoming_connection_id(incoming: &Incoming) -> Result<EventId, String> {
+    incoming
+        .connection_id
+        .ok_or_else(|| "sync frame had no connection id".to_string())
+}
+
+fn all_have_items(store: &Store, connection_id: EventId) -> Result<Vec<SyncItem>, String> {
+    let mut items = Vec::new();
+    for bucket in 0..codec::BUCKETS {
+        let ids = queries::ids_in_bucket(store, bucket as u8)?;
+        for id in ids {
+            items.push(SyncItem::HaveId {
+                connection_id,
+                bucket: bucket as u8,
+                id,
+            });
+        }
+    }
+    Ok(items)
+}
+
+fn have_items_for_compare(
     store: &Store,
-    stream: &mut TcpStream,
-    remote: [super::codec::BucketSummary; super::codec::BUCKETS],
-) -> Result<usize, String> {
-    let local = queries::summary(store)?;
-    write_message(stream, &Message::Summary(local))?;
-    let differing = projector::differing_buckets(&local, &remote);
-
-    let mut ids_to_request = Vec::new();
-    loop {
-        match read_message(stream)? {
-            Message::Have { bucket, ids } => {
-                ids_to_request.extend(missing_ids(store, &ids)?);
-                if differing.contains(&bucket) {
-                    write_message(
-                        stream,
-                        &Message::Have {
-                            bucket,
-                            ids: queries::ids_in_bucket(store, bucket)?,
-                        },
-                    )?;
-                }
-            }
-            Message::Done => break,
-            other => return Err(format!("unexpected have phase message {other:?}")),
+    connection_id: EventId,
+    local: [codec::BucketSummary; codec::BUCKETS],
+    remote: [codec::BucketSummary; codec::BUCKETS],
+) -> Result<Vec<SyncItem>, String> {
+    let mut items = Vec::new();
+    for bucket in projector::differing_buckets(&local, &remote) {
+        let ids = queries::ids_in_bucket(store, bucket)?;
+        for id in ids {
+            items.push(SyncItem::HaveId {
+                connection_id,
+                bucket,
+                id,
+            });
         }
     }
+    Ok(items)
+}
 
-    write_message(
-        stream,
-        &Message::Need {
-            ids: ids_to_request,
-        },
-    )?;
-    write_message(stream, &Message::Done)?;
-
-    let mut received_events = 0;
-    let mut ids_to_send = Vec::new();
-    loop {
-        match read_message(stream)? {
-            Message::Events { events } => {
-                received_events += queries::insert_events(store, events)?;
-            }
-            Message::Need { ids } => ids_to_send.extend(ids),
-            Message::Done => break,
-            other => return Err(format!("unexpected event phase message {other:?}")),
-        }
+fn add_needs_for_haves(
+    store: &Store,
+    incoming: &Incoming,
+    out: &mut Vec<SyncItem>,
+) -> Result<(), String> {
+    let connection_id = incoming_connection_id(incoming)?;
+    let mut ids = Vec::new();
+    ids.extend(incoming.haves.iter().map(|(_, id)| *id));
+    ids.sort();
+    ids.dedup();
+    for id in missing_ids(store, &ids)? {
+        out.push(SyncItem::NeedId { connection_id, id });
     }
-
-    send_events(store, stream, &ids_to_send)?;
-    write_message(stream, &Message::Done)?;
-    Ok(received_events)
+    Ok(())
 }
 
 fn missing_ids(store: &Store, ids: &[EventId]) -> Result<Vec<EventId>, String> {
@@ -170,63 +223,83 @@ fn missing_ids(store: &Store, ids: &[EventId]) -> Result<Vec<EventId>, String> {
     ))
 }
 
-fn send_events(store: &Store, stream: &mut TcpStream, ids: &[EventId]) -> Result<usize, String> {
-    let mut sent = 0;
-    let mut events = Vec::new();
-    let mut encoded_len = EVENTS_MESSAGE_OVERHEAD_BYTES;
-
-    for id in ids {
-        let Some(event) = queries::event_byte(store, id)? else {
-            continue;
-        };
-        let entry_len = EVENT_ENTRY_OVERHEAD_BYTES + event.len();
-        if entry_len > EVENT_FRAME_LIMIT_BYTES {
-            return Err(format!(
-                "event is too large for a sync event frame: {} bytes",
-                event.len()
-            ));
-        }
-        if !events.is_empty() && encoded_len + entry_len > EVENT_FRAME_LIMIT_BYTES {
-            sent += flush_events(stream, &mut events)?;
-            encoded_len = EVENTS_MESSAGE_OVERHEAD_BYTES;
-        }
-        encoded_len += entry_len;
-        events.push(event);
-    }
-
-    sent += flush_events(stream, &mut events)?;
-    Ok(sent)
-}
-
-fn flush_events(stream: &mut TcpStream, events: &mut Vec<Vec<u8>>) -> Result<usize, String> {
-    if events.is_empty() {
+fn emit_control_and_requested_data(
+    store: &Store,
+    connection_id: EventId,
+    control_items: Vec<SyncItem>,
+    requested_ids: &[EventId],
+    emit: &mut impl FnMut(Vec<u8>) -> Result<(), String>,
+) -> Result<usize, String> {
+    if requested_ids.is_empty() {
+        emit_items(control_items, emit)?;
         return Ok(0);
     }
-    let sent = events.len();
-    write_message(
-        stream,
-        &Message::Events {
-            events: std::mem::take(events),
-        },
-    )?;
+
+    let mut ids = requested_ids.to_vec();
+    ids.sort();
+    ids.dedup();
+
+    let mut sent = 0;
+    let mut pending_control = control_items;
+    let mut data_items = Vec::new();
+    let mut encoded_len = FRAME_HEADER_BYTES + DATA_ITEM_HEADER_BYTES;
+
+    for id in ids {
+        let Some(item) = queries::event_byte(store, &id)? else {
+            continue;
+        };
+        let entry_len = DATA_ENTRY_BYTES + item.len();
+        if entry_len > FRAME_TARGET_BYTES {
+            return Err(format!(
+                "event is too large for a sync data frame: {} bytes",
+                item.len()
+            ));
+        }
+        if !data_items.is_empty() && encoded_len + entry_len > FRAME_TARGET_BYTES {
+            sent += emit_frame(
+                std::mem::take(&mut pending_control),
+                connection_id,
+                std::mem::take(&mut data_items),
+                true,
+                emit,
+            )?;
+            encoded_len = FRAME_HEADER_BYTES + DATA_ITEM_HEADER_BYTES;
+        }
+        encoded_len += entry_len;
+        data_items.push(item);
+    }
+
+    if data_items.is_empty() {
+        emit_items(pending_control, emit)?;
+    } else {
+        sent += emit_frame(pending_control, connection_id, data_items, false, emit)?;
+    }
     Ok(sent)
 }
 
-fn expect_summary(
-    message: Message,
-) -> Result<[super::codec::BucketSummary; super::codec::BUCKETS], String> {
-    match message {
-        Message::Summary(summary) => Ok(summary),
-        other => Err(format!("expected summary, got {other:?}")),
+fn emit_items(
+    items: Vec<SyncItem>,
+    emit: &mut impl FnMut(Vec<u8>) -> Result<(), String>,
+) -> Result<(), String> {
+    if items.is_empty() {
+        return Ok(());
     }
+    emit(codec::encode(&Frame { more: false, items }))
 }
 
-fn write_message(stream: &mut TcpStream, message: &Message) -> Result<(), String> {
-    network::write_frame(stream, &codec::encode(message))
-        .map_err(|err| format!("write frame: {err}"))
-}
-
-fn read_message(stream: &mut TcpStream) -> Result<Message, String> {
-    let bytes = network::read_frame(stream).map_err(|err| format!("read frame: {err}"))?;
-    codec::decode(&bytes)
+fn emit_frame(
+    control_items: Vec<SyncItem>,
+    connection_id: EventId,
+    data_items: Vec<Vec<u8>>,
+    more: bool,
+    emit: &mut impl FnMut(Vec<u8>) -> Result<(), String>,
+) -> Result<usize, String> {
+    let sent = data_items.len();
+    let mut items = control_items;
+    items.push(SyncItem::Data {
+        connection_id,
+        items: data_items,
+    });
+    emit(codec::encode(&Frame { more, items }))?;
+    Ok(sent)
 }

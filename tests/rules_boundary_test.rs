@@ -60,7 +60,6 @@ fn event_modules_are_directories() {
 }
 
 #[test]
-#[ignore = "target boundary: current prototype sync still owns TCP orchestration"]
 fn sync_event_module_does_not_own_transport_or_frame_io() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let sync_root = root.join("src/event_modules/sync");
@@ -81,7 +80,6 @@ fn sync_event_module_does_not_own_transport_or_frame_io() {
 }
 
 #[test]
-#[ignore = "target boundary: replace prototype session messages with connection-scoped events"]
 fn sync_event_module_does_not_use_session_message_vocabulary() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let sync_root = root.join("src/event_modules/sync");

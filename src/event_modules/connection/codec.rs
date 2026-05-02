@@ -1,4 +1,5 @@
 use crate::store::EventId;
+use crate::wire::{Reader, Writer};
 
 pub type EndpointId = [u8; 32];
 pub type ConnectionId = [u8; 32];
@@ -49,18 +50,18 @@ pub fn event_id(bytes: &[u8]) -> EventId {
 }
 
 pub fn encode(event: &ConnectionEvent) -> Vec<u8> {
-    let mut out = Vec::with_capacity(10 + 1 + 32 * 4);
-    out.extend_from_slice(MAGIC);
+    let mut out = Writer::with_capacity(10 + 1 + 32 * 4);
+    out.raw(MAGIC);
     match event {
         ConnectionEvent::Request {
             from_endpoint,
             nonce,
             bootstrap_hash,
         } => {
-            out.push(TAG_REQUEST);
-            out.extend_from_slice(from_endpoint);
-            out.extend_from_slice(nonce);
-            out.extend_from_slice(bootstrap_hash);
+            out.u8(TAG_REQUEST);
+            out.id(from_endpoint);
+            out.id(nonce);
+            out.id(bootstrap_hash);
         }
         ConnectionEvent::Ack {
             from_endpoint,
@@ -68,57 +69,36 @@ pub fn encode(event: &ConnectionEvent) -> Vec<u8> {
             request_id,
             connection_id,
         } => {
-            out.push(TAG_ACK);
-            out.extend_from_slice(from_endpoint);
-            out.extend_from_slice(to_endpoint);
-            out.extend_from_slice(request_id);
-            out.extend_from_slice(connection_id);
+            out.u8(TAG_ACK);
+            out.id(from_endpoint);
+            out.id(to_endpoint);
+            out.id(request_id);
+            out.id(connection_id);
         }
     }
-    out
+    out.finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<ConnectionEvent, String> {
     if !bytes.starts_with(MAGIC) {
         return Err("not a connection event".to_string());
     }
-    let mut rest = &bytes[MAGIC.len()..];
-    let tag = take_u8(&mut rest)?;
+    let mut reader = Reader::new(&bytes[MAGIC.len()..], "connection event");
+    let tag = reader.u8()?;
     let event = match tag {
         TAG_REQUEST => ConnectionEvent::Request {
-            from_endpoint: take_id(&mut rest)?,
-            nonce: take_id(&mut rest)?,
-            bootstrap_hash: take_id(&mut rest)?,
+            from_endpoint: reader.id()?,
+            nonce: reader.id()?,
+            bootstrap_hash: reader.id()?,
         },
         TAG_ACK => ConnectionEvent::Ack {
-            from_endpoint: take_id(&mut rest)?,
-            to_endpoint: take_id(&mut rest)?,
-            request_id: take_id(&mut rest)?,
-            connection_id: take_id(&mut rest)?,
+            from_endpoint: reader.id()?,
+            to_endpoint: reader.id()?,
+            request_id: reader.id()?,
+            connection_id: reader.id()?,
         },
         other => return Err(format!("unknown connection event tag {other}")),
     };
-    if !rest.is_empty() {
-        return Err("trailing connection event bytes".to_string());
-    }
+    reader.finish()?;
     Ok(event)
-}
-
-fn take_u8(rest: &mut &[u8]) -> Result<u8, String> {
-    if rest.is_empty() {
-        return Err("truncated connection event".to_string());
-    }
-    let value = rest[0];
-    *rest = &rest[1..];
-    Ok(value)
-}
-
-fn take_id(rest: &mut &[u8]) -> Result<[u8; 32], String> {
-    if rest.len() < 32 {
-        return Err("truncated connection event".to_string());
-    }
-    let mut out = [0; 32];
-    out.copy_from_slice(&rest[..32]);
-    *rest = &rest[32..];
-    Ok(out)
 }

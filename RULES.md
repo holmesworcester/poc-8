@@ -152,6 +152,22 @@ Event modules may:
 - return declarative projector output: rows, labels, outbox operations,
   emitted events, and purges
 
+`codec.rs` describes the module's canonical/wire format: tags, field order,
+and event-specific validation. Shared binary mechanics such as integer
+encoding, length prefixes, fixed-size ids, truncation checks, and trailing-byte
+checks belong in a format-agnostic utility, not reimplemented in every codec.
+
+Canonical event fields should be fixed-width per event type: once the event
+type tag is known, the field layout and canonical byte length are known.
+Different event types may have different fixed lengths. Use fixed-size ids,
+fixed-size hashes, fixed-size integers, fixed-size enum tags, and fixed-size
+domain fields. Do not introduce varints, maps, self-describing encodings,
+nullable ad hoc fields, or variable-width strings into canonical event codecs.
+If variable application data must cross a boundary, express it as fixed-size
+chunk event types or padded size-bucket event types. Counted transport batches
+may carry repeated fixed-format items or opaque canonical event bytes, but that
+batch framing is not itself an open-ended canonical event schema.
+
 Strict checks should stay true:
 
 ```text

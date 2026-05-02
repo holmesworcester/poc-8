@@ -20,6 +20,12 @@ pub struct InboundResult {
     pub connection_id: Option<ConnectionId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportRoute {
+    pub connection_id: ConnectionId,
+    pub addr: SocketAddr,
+}
+
 pub fn create_request(store: &Store, bootstrap_token: &str) -> Result<OutboundRequest, String> {
     let local_endpoint = ensure_local_endpoint(store)?;
     let request = ConnectionEvent::Request {
@@ -99,15 +105,21 @@ pub fn record_transport_target(
     )
 }
 
-pub fn transport_targets(store: &Store) -> Result<Vec<SocketAddr>, String> {
+pub fn transport_routes(store: &Store) -> Result<Vec<TransportRoute>, String> {
     let rows = store
         .module_rows(tables::TRANSPORT_TARGETS)
         .map_err(|err| format!("load transport targets: {err}"))?;
     rows.into_iter()
-        .map(|(_, value)| {
+        .map(|(key, value)| {
+            let connection_id = bytes_to_id(&key)?;
             let text = String::from_utf8(value)
                 .map_err(|err| format!("transport target is not utf8: {err}"))?;
-            SocketAddr::from_str(&text).map_err(|err| format!("transport target is invalid: {err}"))
+            let addr = SocketAddr::from_str(&text)
+                .map_err(|err| format!("transport target is invalid: {err}"))?;
+            Ok(TransportRoute {
+                connection_id,
+                addr,
+            })
         })
         .collect()
 }

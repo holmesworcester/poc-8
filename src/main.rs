@@ -1,10 +1,11 @@
 mod event_modules;
 mod network;
 mod store;
+mod wire;
 
 use std::env;
 use std::io::Write;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 
 use event_modules::{connection, content, sync};
@@ -62,9 +63,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 println!("accepted_connections: {}", report.accepted_connections);
                 println!("received_events: {}", report.received_events);
             } else {
-                let targets = connection::commands::transport_targets(&store)?;
-                let report =
-                    sync::commands::sync(&store, targets).map_err(|err| format!("sync: {err}"))?;
+                let routes = connection::commands::transport_routes(&store)?;
+                let report = sync_routes(&store, routes).map_err(|err| format!("sync: {err}"))?;
                 println!("routes_synced: {}", report.routes_synced);
                 println!("sent_events: {}", report.sent_events);
                 println!("received_events: {}", report.received_events);
@@ -242,6 +242,13 @@ struct ServeReport {
     received_events: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CliSyncReport {
+    routes_synced: usize,
+    sent_events: usize,
+    received_events: usize,
+}
+
 fn connect(store: &Store, addr: SocketAddr, bootstrap_token: &str) -> Result<(), String> {
     let mut stream = network::connect(addr).map_err(|err| format!("open tcp stream: {err}"))?;
     let request = connection::commands::create_request(store, bootstrap_token)?;
@@ -288,11 +295,126 @@ fn serve(
             connection::commands::record_transport_target(store, connection_id, peer_addr)?;
             report.accepted_connections += 1;
         } else {
-            let message = sync::codec::decode(&first_frame)?;
-            report.received_events +=
-                sync::commands::serve_first_message(store, &mut stream, message)?;
+            report.received_events += serve_sync_frames(store, &mut stream, first_frame)?;
             report.accepted_connections += 1;
         }
     }
     Ok(report)
+}
+
+fn sync_routes(
+    store: &Store,
+    routes: Vec<connection::commands::TransportRoute>,
+) -> Result<CliSyncReport, String> {
+    let mut report = CliSyncReport::default();
+    for route in routes {
+        let route_report = sync_route(store, route)?;
+        report.routes_synced += 1;
+        report.sent_events += route_report.sent_events;
+        report.received_events += route_report.received_events;
+    }
+    Ok(report)
+}
+
+fn sync_route(
+    store: &Store,
+    route: connection::commands::TransportRoute,
+) -> Result<CliSyncReport, String> {
+    let mut stream =
+        network::connect(route.addr).map_err(|err| format!("open tcp stream: {err}"))?;
+    let mut report = CliSyncReport {
+        routes_synced: 1,
+        ..CliSyncReport::default()
+    };
+
+    let start = sync::commands::emit_start(store, route.connection_id, |bytes| {
+        write_transport_frame(&mut stream, bytes)
+    })?;
+    report.sent_events += start.sent_events;
+
+    let incoming = read_sync_group(store, &mut stream)?;
+    let mut wrote_answer = false;
+    let answer = sync::commands::emit_answer_response(store, incoming, |bytes| {
+        wrote_answer = true;
+        write_transport_frame(&mut stream, bytes)
+    })?;
+    report.sent_events += answer.sent_events;
+    report.received_events += answer.received_events;
+    if !wrote_answer {
+        let _ = stream.shutdown(Shutdown::Write);
+    }
+
+    if let Some(incoming) = read_optional_sync_group(store, &mut stream)? {
+        let final_report = sync::commands::finish(incoming);
+        report.received_events += final_report.received_events;
+    }
+    let _ = stream.shutdown(Shutdown::Both);
+    Ok(report)
+}
+
+fn serve_sync_frames(
+    store: &Store,
+    stream: &mut TcpStream,
+    first_frame: Vec<u8>,
+) -> Result<usize, String> {
+    let incoming = read_sync_group_from_first(store, stream, first_frame)?;
+    let start_response = sync::commands::emit_start_response(store, incoming, |bytes| {
+        write_transport_frame(stream, bytes)
+    })?;
+    let mut received_events = start_response.received_events;
+
+    let Some(incoming) = read_optional_sync_group(store, stream)? else {
+        return Ok(received_events);
+    };
+    let finish_response = sync::commands::emit_finish_response(store, incoming, |bytes| {
+        write_transport_frame(stream, bytes)
+    })?;
+    received_events += finish_response.received_events;
+    Ok(received_events)
+}
+
+fn read_sync_group(
+    store: &Store,
+    stream: &mut TcpStream,
+) -> Result<sync::commands::Incoming, String> {
+    let first = network::read_frame(stream).map_err(|err| format!("read sync frame: {err}"))?;
+    read_sync_group_from_first(store, stream, first)
+}
+
+fn read_optional_sync_group(
+    store: &Store,
+    stream: &mut TcpStream,
+) -> Result<Option<sync::commands::Incoming>, String> {
+    match network::read_frame(stream) {
+        Ok(first) => read_sync_group_from_first(store, stream, first).map(Some),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(format!("read sync frame: {err}")),
+    }
+}
+
+fn read_sync_group_from_first(
+    store: &Store,
+    stream: &mut TcpStream,
+    first: Vec<u8>,
+) -> Result<sync::commands::Incoming, String> {
+    let mut incoming = sync::commands::Incoming::default();
+    let mut more = sync::commands::absorb_frame(store, &first, &mut incoming)?;
+    while more {
+        let bytes = network::read_frame(stream).map_err(|err| format!("read sync frame: {err}"))?;
+        more = sync::commands::absorb_frame(store, &bytes, &mut incoming)?;
+    }
+    Ok(incoming)
+}
+
+fn write_transport_frame(stream: &mut TcpStream, bytes: Vec<u8>) -> Result<(), String> {
+    network::write_frame(stream, &bytes).map_err(|err| format!("write frame: {err}"))
 }
