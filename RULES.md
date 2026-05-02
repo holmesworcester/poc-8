@@ -238,7 +238,7 @@ if the real path would cross a different boundary.
 
 Do not stop working at a partial, fake, or merely scaffolded result. A task is
 not complete until the claimed behavior is real through the production boundary,
-covered by the appropriate black-box test, and any remaining fake or missing
+proven with an appropriate black-box test, and any remaining fake or missing
 piece is either removed or explicitly marked out of scope. If the real result
 cannot be completed in the current branch, stop claiming the feature works and
 leave a concrete blocker instead of passing placeholder coverage.
