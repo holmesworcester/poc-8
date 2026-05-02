@@ -324,6 +324,8 @@ InboundBytes
 
 Admission happens before parse context. Known event ids stop at `admit_event_id`. Parse failures mark the inbound bytes invalid and release the event claim. Blocked events write `blocked_by_event` rows and stop.
 
+The first POC kernel may run this inbound chain directly from the socket reader without first durably queuing `InboundBytes`. That is still a kernel pipeline boundary: the socket reader only passes `(origin, bytes)` into `pipeline.ingest_frame`, and event modules decide meaning and emit follow-on bytes. A durable `inbound_bytes` table is added when we need crash replay, fairness across many sockets, leases, or independent retry.
+
 Boundary tables that need claim/retry ownership are ordinary module-owned tables with status metadata:
 
 ```
@@ -403,7 +405,7 @@ The control loop has no sync, bootstrap, auth, connection, dependency, or event-
 
 ## Network
 
-**transport** owns TCP byte I/O between network routes (listeners, socket cache, `[u32 length][bytes]` framing, addresses learned from invite/`observed_address`/incoming connections). `TransportSend { target, bytes }` is the only egress, where `target` is a concrete route such as `(ip, port)` or an existing socket id, not a `connection_id`. Inbound bytes land on the inbound-bytes buffer with origin `(ip, port, socket_id, observed endpoint if known)`. *Invariant: transport produces and interprets no transit bytes; if it sends bytes, those bytes were produced by an event module.*
+**transport** owns TCP byte I/O between network routes (listeners, socket cache, `[u32 length][bytes]` framing, addresses learned from invite/`observed_address`/incoming connections). `TransportSend { target, bytes }` is the only egress, where `target` is a concrete route such as `(ip, port)` or an existing socket id, not a `connection_id`. Inbound bytes enter the kernel pipeline with origin `(ip, port, socket_id, observed endpoint if known)`; a durable inbound-bytes buffer is optional until replay/fairness requirements justify it. *Invariant: transport produces and interprets no transit bytes; if it sends bytes, those bytes were produced by an event module.*
 
 **connection** is an event module. A connection event references two endpoints and carries `shared_workspaces`. Each workspace entry's authority is established by the connection event's own dependencies and signature: deps point at endpoint/bootstrap authorization plus workspace capability events (workspace-membership grant, invite, etc.) that authorize the signer to bind that workspace to that connection, and the pipeline's standard signature/dep validation is what makes the entry trustworthy. Rotation, revocation, and expiry are further connection-related events with their own deps/sigs. The same module owns `connection_secrets`: globally-unique `connection_secret_id` → `(key, direction, connection_id, ttl)`, with separate inbound and outbound secrets per connection, each known only to the two endpoints.
 
@@ -631,6 +633,8 @@ Outgoing dedupe belongs at the `outbox` boundary and the per-connection hot queu
 ## Incoming buffer dedupe
 
 Transport remains byte-only. On receive, the buffer hashes bytes before parsing:
+
+For the minimal reactive POC this buffer can be memory-only or skipped: the socket reader calls the kernel pipeline immediately, and recurring sync can recreate transient control traffic after a crash. When durable ingress is enabled, use the shape below.
 
 ```
 wire_id = BLAKE3(bytes)

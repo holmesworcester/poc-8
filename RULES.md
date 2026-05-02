@@ -208,6 +208,12 @@ The kernel may:
   module-produced bytes into TCP frames and writing sockets
 - schedule bounded work
 
+The first POC may process inbound frames reactively without a durable inbound
+queue. The socket reader hands `(origin, bytes)` to the kernel pipeline; the
+pipeline applies module projectors immediately and returns module-produced
+outgoing bytes. This shortcut is allowed only while the socket reader remains
+semantic-free and recurring sync can recreate lost transient control traffic.
+
 The kernel must not:
 
 - contain a bespoke sync coordinator

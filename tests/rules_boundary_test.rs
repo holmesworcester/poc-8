@@ -96,7 +96,12 @@ fn sync_event_module_does_not_use_session_message_vocabulary() {
 #[test]
 fn core_files_do_not_contain_sync_protocol_logic() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let files = ["src/main.rs", "src/store.rs", "src/network.rs"];
+    let files = [
+        "src/main.rs",
+        "src/pipeline.rs",
+        "src/store.rs",
+        "src/network.rs",
+    ];
     let forbidden = ["negentropy", "Compare", "Have", "Need", "differing_buckets"];
     let mut violations = Vec::new();
     for file in files {

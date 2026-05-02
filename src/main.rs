@@ -1,5 +1,6 @@
 mod event_modules;
 mod network;
+mod pipeline;
 mod store;
 mod wire;
 
@@ -8,7 +9,7 @@ use std::io::Write;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 
-use event_modules::{connection, content, sync};
+use event_modules::{connection, content};
 use store::Store;
 
 fn main() {
@@ -252,19 +253,17 @@ struct CliSyncReport {
 fn connect(store: &Store, addr: SocketAddr, bootstrap_token: &str) -> Result<(), String> {
     let mut stream = network::connect(addr).map_err(|err| format!("open tcp stream: {err}"))?;
     let request = connection::commands::create_request(store, bootstrap_token)?;
-    network::write_frame(&mut stream, &request.bytes)
-        .map_err(|err| format!("send request: {err}"))?;
-    let response = network::read_frame(&mut stream).map_err(|err| format!("read ack: {err}"))?;
-    let result = connection::commands::accept_ack(
+    network::write_frames(&mut stream, vec![request.bytes])?;
+    let report = drive_stream(
         store,
-        response,
-        request.local_endpoint,
-        request.request_id,
+        &mut stream,
+        addr,
+        pipeline::IngestOptions::default(),
+        None,
     )?;
-    let connection_id = result
-        .connection_id
-        .ok_or_else(|| "connection ack did not establish a connection".to_string())?;
-    connection::commands::record_transport_target(store, connection_id, addr)?;
+    if report.established_connections == 0 {
+        return Err("connection was not established".to_string());
+    }
     Ok(())
 }
 
@@ -281,23 +280,15 @@ fn serve(
             .map_err(|err| format!("accept tcp stream: {err}"))?;
         let first_frame =
             network::read_frame(&mut stream).map_err(|err| format!("read first frame: {err}"))?;
-        if connection::commands::is_connection_event(&first_frame) {
-            let bootstrap_token = bootstrap_token
-                .ok_or_else(|| "connection request requires --bootstrap TOKEN".to_string())?;
-            let result = connection::commands::accept_request(store, first_frame, bootstrap_token)?;
-            if let Some(response) = result.response {
-                network::write_frame(&mut stream, &response)
-                    .map_err(|err| format!("send connection response: {err}"))?;
-            }
-            let connection_id = result
-                .connection_id
-                .ok_or_else(|| "connection request did not establish a connection".to_string())?;
-            connection::commands::record_transport_target(store, connection_id, peer_addr)?;
-            report.accepted_connections += 1;
-        } else {
-            report.received_events += serve_sync_frames(store, &mut stream, first_frame)?;
-            report.accepted_connections += 1;
-        }
+        let stream_report = drive_stream(
+            store,
+            &mut stream,
+            peer_addr,
+            pipeline::IngestOptions { bootstrap_token },
+            Some(first_frame),
+        )?;
+        report.received_events += stream_report.received_events;
+        report.accepted_connections += 1;
     }
     Ok(report)
 }
@@ -326,95 +317,75 @@ fn sync_route(
         routes_synced: 1,
         ..CliSyncReport::default()
     };
-
-    let start = sync::commands::emit_start(store, route.connection_id, |bytes| {
-        write_transport_frame(&mut stream, bytes)
-    })?;
+    let start = pipeline::start_sync(store, route)?;
     report.sent_events += start.sent_events;
+    network::write_frames(&mut stream, start.outgoing)?;
+    let stream_report = drive_stream(
+        store,
+        &mut stream,
+        route.addr,
+        pipeline::IngestOptions::default(),
+        None,
+    )?;
+    report.sent_events += stream_report.sent_events;
+    report.received_events += stream_report.received_events;
+    Ok(report)
+}
 
-    let incoming = read_sync_group(store, &mut stream)?;
-    let mut wrote_answer = false;
-    let answer = sync::commands::emit_answer_response(store, incoming, |bytes| {
-        wrote_answer = true;
-        write_transport_frame(&mut stream, bytes)
-    })?;
-    report.sent_events += answer.sent_events;
-    report.received_events += answer.received_events;
-    if !wrote_answer {
-        let _ = stream.shutdown(Shutdown::Write);
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StreamReport {
+    established_connections: usize,
+    sent_events: usize,
+    received_events: usize,
+}
+
+fn drive_stream(
+    store: &Store,
+    stream: &mut TcpStream,
+    origin: SocketAddr,
+    options: pipeline::IngestOptions<'_>,
+    first_frame: Option<Vec<u8>>,
+) -> Result<StreamReport, String> {
+    let mut report = StreamReport::default();
+    if let Some(bytes) = first_frame {
+        let result = pipeline::ingest_frame(store, origin, bytes, options)?;
+        apply_stream_result(stream, &mut report, result)?;
     }
-
-    if let Some(incoming) = read_optional_sync_group(store, &mut stream)? {
-        let final_report = sync::commands::finish(incoming);
-        report.received_events += final_report.received_events;
+    loop {
+        match network::read_frame(stream) {
+            Ok(bytes) => {
+                let result = pipeline::ingest_frame(store, origin, bytes, options)?;
+                apply_stream_result(stream, &mut report, result)?;
+            }
+            Err(err) if is_stream_closed(&err) => break,
+            Err(err) => return Err(format!("read frame: {err}")),
+        }
     }
     let _ = stream.shutdown(Shutdown::Both);
     Ok(report)
 }
 
-fn serve_sync_frames(
-    store: &Store,
+fn apply_stream_result(
     stream: &mut TcpStream,
-    first_frame: Vec<u8>,
-) -> Result<usize, String> {
-    let incoming = read_sync_group_from_first(store, stream, first_frame)?;
-    let start_response = sync::commands::emit_start_response(store, incoming, |bytes| {
-        write_transport_frame(stream, bytes)
-    })?;
-    let mut received_events = start_response.received_events;
-
-    let Some(incoming) = read_optional_sync_group(store, stream)? else {
-        return Ok(received_events);
-    };
-    let finish_response = sync::commands::emit_finish_response(store, incoming, |bytes| {
-        write_transport_frame(stream, bytes)
-    })?;
-    received_events += finish_response.received_events;
-    Ok(received_events)
-}
-
-fn read_sync_group(
-    store: &Store,
-    stream: &mut TcpStream,
-) -> Result<sync::commands::Incoming, String> {
-    let first = network::read_frame(stream).map_err(|err| format!("read sync frame: {err}"))?;
-    read_sync_group_from_first(store, stream, first)
-}
-
-fn read_optional_sync_group(
-    store: &Store,
-    stream: &mut TcpStream,
-) -> Result<Option<sync::commands::Incoming>, String> {
-    match network::read_frame(stream) {
-        Ok(first) => read_sync_group_from_first(store, stream, first).map(Some),
-        Err(err)
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::UnexpectedEof
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::BrokenPipe
-            ) =>
-        {
-            Ok(None)
-        }
-        Err(err) => Err(format!("read sync frame: {err}")),
+    report: &mut StreamReport,
+    result: pipeline::IngestResult,
+) -> Result<(), String> {
+    report.established_connections += result.established_connections;
+    report.sent_events += result.sent_events;
+    report.received_events += result.received_events;
+    let has_outgoing = !result.outgoing.is_empty();
+    network::write_frames(stream, result.outgoing)?;
+    if !has_outgoing {
+        let _ = stream.shutdown(Shutdown::Write);
     }
+    Ok(())
 }
 
-fn read_sync_group_from_first(
-    store: &Store,
-    stream: &mut TcpStream,
-    first: Vec<u8>,
-) -> Result<sync::commands::Incoming, String> {
-    let mut incoming = sync::commands::Incoming::default();
-    let mut more = sync::commands::absorb_frame(store, &first, &mut incoming)?;
-    while more {
-        let bytes = network::read_frame(stream).map_err(|err| format!("read sync frame: {err}"))?;
-        more = sync::commands::absorb_frame(store, &bytes, &mut incoming)?;
-    }
-    Ok(incoming)
-}
-
-fn write_transport_frame(stream: &mut TcpStream, bytes: Vec<u8>) -> Result<(), String> {
-    network::write_frame(stream, &bytes).map_err(|err| format!("write frame: {err}"))
+fn is_stream_closed(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+    )
 }

@@ -18,6 +18,13 @@ pub fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> 
     stream.flush()
 }
 
+pub fn write_frames(stream: &mut TcpStream, frames: Vec<Vec<u8>>) -> Result<(), String> {
+    for bytes in frames {
+        write_frame(stream, &bytes).map_err(|err| format!("write frame: {err}"))?;
+    }
+    Ok(())
+}
+
 pub fn read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
     stream.read_exact(&mut len)?;

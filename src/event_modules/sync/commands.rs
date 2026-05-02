@@ -14,16 +14,7 @@ pub struct SyncReport {
     pub received_events: usize,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Incoming {
-    pub connection_id: Option<EventId>,
-    pub compare: Option<[codec::BucketSummary; codec::BUCKETS]>,
-    pub haves: Vec<(u8, EventId)>,
-    pub needs: Vec<EventId>,
-    pub received_events: usize,
-}
-
-pub fn emit_start(
+pub fn start(
     store: &Store,
     connection_id: EventId,
     mut emit: impl FnMut(Vec<u8>) -> Result<(), String>,
@@ -37,126 +28,87 @@ pub fn emit_start(
     Ok(SyncReport::default())
 }
 
-pub fn absorb_frame(store: &Store, bytes: &[u8], incoming: &mut Incoming) -> Result<bool, String> {
+pub fn ingest_frame(
+    store: &Store,
+    bytes: &[u8],
+    mut emit: impl FnMut(Vec<u8>) -> Result<(), String>,
+) -> Result<SyncReport, String> {
     let frame = codec::decode(bytes)?;
+    let mut frame_connection_id = None;
+    let mut response_items = Vec::new();
+    let mut requested_ids = Vec::new();
+    let mut received_events = 0;
+
     for item in frame.items {
         match item {
             SyncItem::Compare {
                 connection_id,
                 summary,
             } => {
-                observe_connection(incoming, connection_id)?;
-                incoming.compare = Some(summary);
+                observe_connection(&mut frame_connection_id, connection_id)?;
+                let local = queries::summary(store)?;
+                if local != summary {
+                    response_items.extend(have_items_for_compare(
+                        store,
+                        connection_id,
+                        local,
+                        summary,
+                    )?);
+                }
             }
             SyncItem::HaveId {
                 connection_id,
-                bucket,
+                bucket: _,
                 id,
             } => {
-                observe_connection(incoming, connection_id)?;
-                incoming.haves.push((bucket, id));
+                observe_connection(&mut frame_connection_id, connection_id)?;
+                if !queries::has_event(store, &id)? {
+                    response_items.push(SyncItem::NeedId { connection_id, id });
+                }
             }
             SyncItem::NeedId { connection_id, id } => {
-                observe_connection(incoming, connection_id)?;
-                incoming.needs.push(id);
+                observe_connection(&mut frame_connection_id, connection_id)?;
+                requested_ids.push(id);
             }
             SyncItem::Data {
                 connection_id,
                 items,
             } => {
-                observe_connection(incoming, connection_id)?;
-                incoming.received_events += queries::insert_events(store, items)?;
+                observe_connection(&mut frame_connection_id, connection_id)?;
+                received_events += queries::insert_events(store, items)?;
             }
         }
     }
-    Ok(frame.more)
-}
 
-pub fn emit_start_response(
-    store: &Store,
-    incoming: Incoming,
-    mut emit: impl FnMut(Vec<u8>) -> Result<(), String>,
-) -> Result<SyncReport, String> {
-    let connection_id = incoming_connection_id(&incoming)?;
-    let mut items = Vec::new();
-    let local = queries::summary(store)?;
-    items.push(SyncItem::Compare {
-        connection_id,
-        summary: local,
-    });
-    if let Some(remote) = incoming.compare {
-        items.extend(have_items_for_compare(store, connection_id, local, remote)?);
-    }
-    add_needs_for_haves(store, &incoming, &mut items)?;
-    emit_items(items, &mut emit)?;
-    Ok(SyncReport {
-        sent_events: 0,
-        received_events: incoming.received_events,
-    })
-}
-
-pub fn emit_answer_response(
-    store: &Store,
-    incoming: Incoming,
-    mut emit: impl FnMut(Vec<u8>) -> Result<(), String>,
-) -> Result<SyncReport, String> {
-    let connection_id = incoming_connection_id(&incoming)?;
-    let mut control_items = Vec::new();
-    add_needs_for_haves(store, &incoming, &mut control_items)?;
+    let Some(connection_id) = frame_connection_id else {
+        return Ok(SyncReport::default());
+    };
     let sent_events = emit_control_and_requested_data(
         store,
         connection_id,
-        control_items,
-        &incoming.needs,
+        response_items,
+        &requested_ids,
         &mut emit,
     )?;
+
     Ok(SyncReport {
         sent_events,
-        received_events: incoming.received_events,
+        received_events,
     })
 }
 
-pub fn emit_finish_response(
-    store: &Store,
-    incoming: Incoming,
-    mut emit: impl FnMut(Vec<u8>) -> Result<(), String>,
-) -> Result<SyncReport, String> {
-    let connection_id = incoming_connection_id(&incoming)?;
-    let sent_events = emit_control_and_requested_data(
-        store,
-        connection_id,
-        Vec::new(),
-        &incoming.needs,
-        &mut emit,
-    )?;
-    Ok(SyncReport {
-        sent_events,
-        received_events: incoming.received_events,
-    })
-}
-
-pub fn finish(incoming: Incoming) -> SyncReport {
-    SyncReport {
-        sent_events: 0,
-        received_events: incoming.received_events,
-    }
-}
-
-fn observe_connection(incoming: &mut Incoming, connection_id: EventId) -> Result<(), String> {
-    if let Some(existing) = incoming.connection_id {
-        if existing != connection_id {
+fn observe_connection(
+    frame_connection_id: &mut Option<EventId>,
+    connection_id: EventId,
+) -> Result<(), String> {
+    if let Some(existing) = frame_connection_id {
+        if *existing != connection_id {
             return Err("sync frame mixed connection ids".to_string());
         }
     } else {
-        incoming.connection_id = Some(connection_id);
+        *frame_connection_id = Some(connection_id);
     }
     Ok(())
-}
-
-fn incoming_connection_id(incoming: &Incoming) -> Result<EventId, String> {
-    incoming
-        .connection_id
-        .ok_or_else(|| "sync frame had no connection id".to_string())
 }
 
 fn all_have_items(store: &Store, connection_id: EventId) -> Result<Vec<SyncItem>, String> {
@@ -192,35 +144,6 @@ fn have_items_for_compare(
         }
     }
     Ok(items)
-}
-
-fn add_needs_for_haves(
-    store: &Store,
-    incoming: &Incoming,
-    out: &mut Vec<SyncItem>,
-) -> Result<(), String> {
-    let connection_id = incoming_connection_id(incoming)?;
-    let mut ids = Vec::new();
-    ids.extend(incoming.haves.iter().map(|(_, id)| *id));
-    ids.sort();
-    ids.dedup();
-    for id in missing_ids(store, &ids)? {
-        out.push(SyncItem::NeedId { connection_id, id });
-    }
-    Ok(())
-}
-
-fn missing_ids(store: &Store, ids: &[EventId]) -> Result<Vec<EventId>, String> {
-    let mut present = Vec::new();
-    for id in ids {
-        if queries::has_event(store, id)? {
-            present.push(*id);
-        }
-    }
-    Ok(projector::missing_ids(
-        |id| present.binary_search(id).is_ok(),
-        ids,
-    ))
 }
 
 fn emit_control_and_requested_data(

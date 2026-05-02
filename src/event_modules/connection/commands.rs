@@ -63,12 +63,24 @@ pub fn accept_request(
     })
 }
 
-pub fn accept_ack(
-    store: &Store,
-    bytes: Vec<u8>,
-    local_endpoint: EndpointId,
-    request_id: EventId,
-) -> Result<InboundResult, String> {
+pub fn accept_ack(store: &Store, bytes: Vec<u8>) -> Result<InboundResult, String> {
+    let local_endpoint = ensure_local_endpoint(store)?;
+    let event = codec::decode(&bytes)?;
+    let ConnectionEvent::Ack { request_id, .. } = event else {
+        return Err("expected connection ack".to_string());
+    };
+    let request_bytes = store
+        .module_row(tables::CONNECTION_EVENTS, &request_id)
+        .map_err(|err| format!("load connection request: {err}"))?
+        .ok_or_else(|| "connection ack references an unknown request".to_string())?;
+    let request = codec::decode(&request_bytes)?;
+    let ConnectionEvent::Request { from_endpoint, .. } = request else {
+        return Err("connection ack references a non-request event".to_string());
+    };
+    if from_endpoint != local_endpoint {
+        return Err("connection ack references another endpoint's request".to_string());
+    }
+
     let projection = projector::project_inbound_ack(bytes, local_endpoint, request_id)?;
     let connection_id = projection.connection_id;
     apply(store, projection)?;
@@ -80,6 +92,21 @@ pub fn accept_ack(
 
 pub fn is_connection_event(bytes: &[u8]) -> bool {
     codec::decode(bytes).is_ok()
+}
+
+pub fn ingest(
+    store: &Store,
+    bytes: Vec<u8>,
+    bootstrap_token: Option<&str>,
+) -> Result<InboundResult, String> {
+    match codec::decode(&bytes)? {
+        ConnectionEvent::Request { .. } => {
+            let bootstrap_token = bootstrap_token
+                .ok_or_else(|| "connection request requires bootstrap token".to_string())?;
+            accept_request(store, bytes, bootstrap_token)
+        }
+        ConnectionEvent::Ack { .. } => accept_ack(store, bytes),
+    }
 }
 
 pub fn connection_count(store: &Store) -> Result<usize, String> {
