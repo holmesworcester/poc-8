@@ -321,3 +321,53 @@ topo daemon status --json
 
 The success criterion is that realistic CLI tests can run unchanged against the
 old core and the replacement kernel.
+
+## Fresh Minimal Rewrite Guardrails
+
+The fresh rewrite starts from `plan.md` and `RULES.md` only. Add code back only
+when it serves the minimal black-box path:
+
+```text
+topo --db PATH connect IP PORT
+topo --db PATH generate NUM_EVENTS EVENT_SIZE_BYTES
+topo --db PATH sync
+```
+
+A read-only `count`/`status` command is allowed solely so black-box tests can
+assert eventual convergence and measure sync-start to all-counted time.
+
+Keep the kernel boring:
+
+- `network` owns TCP, frame boundaries, connection attempts, and byte IO only.
+- `store` owns durable bytes, peer addresses, and generic event-set reads/writes
+  only.
+- `event_modules/content` owns content event construction, codec, and projection.
+- `event_modules/sync` owns all negentropy, compare/have/need/range decisions,
+  wire sync messages, and sync jobs.
+
+The kernel should be a pleasure to read: small files, direct control flow,
+plain names, and no hidden protocol cleverness. A reader should understand the
+kernel as an executor, durable byte store, and TCP byte mover without learning
+the content or sync protocols. All real domain and protocol logic belongs in
+event modules.
+
+Do not put sync protocol vocabulary or decisions in core files. In particular,
+`store`, `network`, and CLI glue may not decide what a negentropy range means,
+when to split a range, which ids are needed, or which events satisfy a sync
+request. They may only call event-module functions and move returned bytes.
+
+Event modules stay directory-shaped:
+
+```text
+event_modules/<name>/commands.rs
+event_modules/<name>/codec.rs
+event_modules/<name>/projector.rs
+event_modules/<name>/queries.rs   # only when needed
+event_modules/<name>/mod.rs
+```
+
+Never create `event.rs`.
+
+Functional proof for this rewrite means black-box CLI tests that spawn the real
+`topo` binary, use real TCP sockets, start `sync`, wait through the CLI-observed
+event count, and report both events/s and MiB/s for perf cases.
