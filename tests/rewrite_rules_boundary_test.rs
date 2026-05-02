@@ -83,3 +83,36 @@ fn event_modules_are_directories_not_collapsed_files() {
             .join("\n")
     );
 }
+
+#[test]
+fn kernel_files_do_not_contain_sync_protocol_semantics() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let kernel_files = ["src/pipeline.rs", "src/control_loop.rs", "src/network.rs"];
+    let forbidden = [
+        "negentropy",
+        "SyncCompare",
+        "SyncHave",
+        "SyncNeed",
+        "sync_compare",
+        "sync_have",
+        "sync_need",
+        "compare/have/need",
+    ];
+
+    let mut violations = Vec::new();
+    for relative in kernel_files {
+        let path = manifest_dir.join(relative);
+        let text = std::fs::read_to_string(&path).expect("read kernel file");
+        for needle in forbidden {
+            if text.contains(needle) {
+                violations.push(format!("{relative} contains `{needle}`"));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "kernel files must stay protocol-agnostic; sync belongs in event modules:\n{}",
+        violations.join("\n")
+    );
+}

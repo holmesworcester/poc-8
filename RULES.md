@@ -194,6 +194,8 @@ The kernel must not:
 - contain a bespoke sync coordinator
 - contain connection protocol state machines
 - inspect sync ranges or negentropy trees except through module-declared tables
+- contain negentropy, compare/have/need, or sync-range vocabulary in
+  `pipeline.rs`, `control_loop.rs`, or `network.rs`
 - special-case have/need/compare behavior outside event modules
 - bypass event admission for protocol messages
 - use side-channel protocol messages when an event can express the fact
