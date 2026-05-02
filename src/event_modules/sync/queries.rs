@@ -28,17 +28,10 @@ pub fn has_event(store: &Store, event_id: &EventId) -> Result<bool, String> {
         .map_err(|err| format!("check event presence: {err}"))
 }
 
-pub fn event_bytes(store: &Store, ids: &[EventId]) -> Result<Vec<Vec<u8>>, String> {
-    let mut events = Vec::with_capacity(ids.len());
-    for id in ids {
-        if let Some(bytes) = store
-            .event_bytes(id)
-            .map_err(|err| format!("load event bytes: {err}"))?
-        {
-            events.push(bytes);
-        }
-    }
-    Ok(events)
+pub fn event_byte(store: &Store, id: &EventId) -> Result<Option<Vec<u8>>, String> {
+    store
+        .event_bytes(id)
+        .map_err(|err| format!("load event bytes: {err}"))
 }
 
 pub fn insert_events(store: &Store, events: Vec<Vec<u8>>) -> Result<usize, String> {

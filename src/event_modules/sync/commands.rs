@@ -6,7 +6,9 @@ use crate::store::{EventId, Store};
 use super::codec::{self, Message};
 use super::{projector, queries};
 
-const EVENT_BATCH_LIMIT: usize = 1024;
+const EVENT_FRAME_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+const EVENTS_MESSAGE_OVERHEAD_BYTES: usize = 5;
+const EVENT_ENTRY_OVERHEAD_BYTES: usize = 4;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SyncReport {
@@ -204,13 +206,43 @@ fn missing_ids(store: &Store, ids: &[EventId]) -> Result<Vec<EventId>, String> {
 
 fn send_events(store: &Store, stream: &mut TcpStream, ids: &[EventId]) -> Result<usize, String> {
     let mut sent = 0;
-    for chunk in ids.chunks(EVENT_BATCH_LIMIT) {
-        let events = queries::event_bytes(store, chunk)?;
-        sent += events.len();
-        if !events.is_empty() {
-            write_message(stream, &Message::Events { events })?;
+    let mut events = Vec::new();
+    let mut encoded_len = EVENTS_MESSAGE_OVERHEAD_BYTES;
+
+    for id in ids {
+        let Some(event) = queries::event_byte(store, id)? else {
+            continue;
+        };
+        let entry_len = EVENT_ENTRY_OVERHEAD_BYTES + event.len();
+        if entry_len > EVENT_FRAME_LIMIT_BYTES {
+            return Err(format!(
+                "event is too large for a sync event frame: {} bytes",
+                event.len()
+            ));
         }
+        if !events.is_empty() && encoded_len + entry_len > EVENT_FRAME_LIMIT_BYTES {
+            sent += flush_events(stream, &mut events)?;
+            encoded_len = EVENTS_MESSAGE_OVERHEAD_BYTES;
+        }
+        encoded_len += entry_len;
+        events.push(event);
     }
+
+    sent += flush_events(stream, &mut events)?;
+    Ok(sent)
+}
+
+fn flush_events(stream: &mut TcpStream, events: &mut Vec<Vec<u8>>) -> Result<usize, String> {
+    if events.is_empty() {
+        return Ok(0);
+    }
+    let sent = events.len();
+    write_message(
+        stream,
+        &Message::Events {
+            events: std::mem::take(events),
+        },
+    )?;
     Ok(sent)
 }
 
