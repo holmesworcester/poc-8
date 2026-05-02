@@ -104,10 +104,19 @@ pub fn start_listener(db: &str, port: u16, accept: usize) -> Child {
     )
 }
 
-pub fn connect_with_retry(db: &str, port: u16) -> String {
+pub fn invite(db: &str) -> String {
+    invite_with_token(db, BOOTSTRAP_TOKEN)
+}
+
+pub fn invite_with_token(db: &str, token: &str) -> String {
+    let out = assert_success(topo(db, &["invite", "--bootstrap", token]));
+    line_value(&out, "invite")
+}
+
+pub fn connect_with_retry(db: &str, port: u16, invite: &str) -> String {
     let mut last = String::new();
     for _ in 0..50 {
-        let output = connect_with_token(db, port, BOOTSTRAP_TOKEN);
+        let output = connect_with_invite(db, port, invite);
         if output.status.success() {
             return stdout(&output);
         }
@@ -117,23 +126,23 @@ pub fn connect_with_retry(db: &str, port: u16) -> String {
     panic!("connect never succeeded: {last}");
 }
 
-pub fn connect_with_token(db: &str, port: u16, token: &str) -> Output {
+pub fn connect_with_invite(db: &str, port: u16, invite: &str) -> Output {
     topo(
         db,
         &[
             "connect",
             "127.0.0.1",
             &port.to_string(),
-            "--bootstrap",
-            token,
+            "--invite",
+            invite,
         ],
     )
 }
 
-pub fn connect_with_token_after_listener(db: &str, port: u16, token: &str) -> Output {
+pub fn connect_with_invite_after_listener(db: &str, port: u16, invite: &str) -> Output {
     let mut last = None;
     for _ in 0..50 {
-        let output = connect_with_token(db, port, token);
+        let output = connect_with_invite(db, port, invite);
         if output.status.success() || !stderr(&output).contains("open tcp stream") {
             return output;
         }

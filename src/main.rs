@@ -25,14 +25,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
 
     match command {
         Command::Connect { addr: _ } => {
-            return Err(usage("connect requires --bootstrap TOKEN"));
+            return Err(usage("connect requires --invite INVITE"));
         }
-        Command::ConnectBootstrap {
-            addr,
-            bootstrap_token,
-        } => {
-            connect(&store, addr, &bootstrap_token).map_err(|err| format!("connect: {err}"))?;
+        Command::ConnectInvite { addr, invite } => {
+            connect(&store, addr, &invite).map_err(|err| format!("connect: {err}"))?;
             println!("connected: {addr}");
+        }
+        Command::Invite { bootstrap_token } => {
+            let invite = connection::commands::create_invite(&store, &bootstrap_token)
+                .map_err(|err| format!("invite: {err}"))?;
+            println!("invite: {invite}");
         }
         Command::Generate {
             num_events,
@@ -99,8 +101,11 @@ enum Command {
     Connect {
         addr: SocketAddr,
     },
-    ConnectBootstrap {
+    ConnectInvite {
         addr: SocketAddr,
+        invite: String,
+    },
+    Invite {
         bootstrap_token: String,
     },
     Generate {
@@ -143,24 +148,38 @@ fn parse_args(args: Vec<String>) -> Result<(PathBuf, Command), String> {
             let addr = format!("{ip}:{port}")
                 .parse::<SocketAddr>()
                 .map_err(|_| usage("connect requires IP PORT"))?;
-            let mut bootstrap_token = None;
+            let mut invite = None;
             let mut idx = 3;
+            while idx < rest.len() {
+                match rest[idx].as_str() {
+                    "--invite" => {
+                        invite = rest.get(idx + 1).cloned();
+                        idx += 2;
+                    }
+                    other => return Err(usage(&format!("unknown connect option `{other}`"))),
+                }
+            }
+            if let Some(invite) = invite {
+                Command::ConnectInvite { addr, invite }
+            } else {
+                Command::Connect { addr }
+            }
+        }
+        "invite" => {
+            let mut bootstrap_token = None;
+            let mut idx = 1;
             while idx < rest.len() {
                 match rest[idx].as_str() {
                     "--bootstrap" => {
                         bootstrap_token = rest.get(idx + 1).cloned();
                         idx += 2;
                     }
-                    other => return Err(usage(&format!("unknown connect option `{other}`"))),
+                    other => return Err(usage(&format!("unknown invite option `{other}`"))),
                 }
             }
-            if let Some(bootstrap_token) = bootstrap_token {
-                Command::ConnectBootstrap {
-                    addr,
-                    bootstrap_token,
-                }
-            } else {
-                Command::Connect { addr }
+            Command::Invite {
+                bootstrap_token: bootstrap_token
+                    .ok_or_else(|| usage("invite requires --bootstrap TOKEN"))?,
             }
         }
         "generate" => {
@@ -233,7 +252,7 @@ fn parse_usize(value: Option<&String>, message: &str) -> Result<usize, String> {
 
 fn usage(message: &str) -> String {
     format!(
-        "{message}\nusage:\n  topo --db PATH connect IP PORT --bootstrap TOKEN\n  topo --db PATH generate NUM_EVENTS EVENT_SIZE_BYTES\n  topo --db PATH sync [--listen IP PORT --accept N --bootstrap TOKEN]\n  topo --db PATH count"
+        "{message}\nusage:\n  topo --db PATH invite --bootstrap TOKEN\n  topo --db PATH connect IP PORT --invite INVITE\n  topo --db PATH generate NUM_EVENTS EVENT_SIZE_BYTES\n  topo --db PATH sync [--listen IP PORT --accept N --bootstrap TOKEN]\n  topo --db PATH count"
     )
 }
 
@@ -250,15 +269,18 @@ struct CliSyncReport {
     received_events: usize,
 }
 
-fn connect(store: &Store, addr: SocketAddr, bootstrap_token: &str) -> Result<(), String> {
+fn connect(store: &Store, addr: SocketAddr, invite: &str) -> Result<(), String> {
     let mut stream = network::connect(addr).map_err(|err| format!("open tcp stream: {err}"))?;
-    let request = connection::commands::create_request(store, bootstrap_token)?;
+    let request = connection::commands::create_request(store, invite)?;
     network::write_frames(&mut stream, vec![request.bytes])?;
     let report = drive_stream(
         store,
         &mut stream,
         addr,
-        pipeline::IngestOptions::default(),
+        pipeline::IngestOptions {
+            bootstrap_token: None,
+            record_transport_target: true,
+        },
         None,
     )?;
     if report.established_connections == 0 {
@@ -284,7 +306,10 @@ fn serve(
             store,
             &mut stream,
             peer_addr,
-            pipeline::IngestOptions { bootstrap_token },
+            pipeline::IngestOptions {
+                bootstrap_token,
+                record_transport_target: false,
+            },
             Some(first_frame),
         )?;
         report.received_events += stream_report.received_events;
@@ -324,7 +349,10 @@ fn sync_route(
         store,
         &mut stream,
         route.addr,
-        pipeline::IngestOptions::default(),
+        pipeline::IngestOptions {
+            bootstrap_token: None,
+            record_transport_target: false,
+        },
         None,
     )?;
     report.sent_events += stream_report.sent_events;

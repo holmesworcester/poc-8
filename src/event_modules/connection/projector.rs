@@ -12,13 +12,20 @@ pub struct Projection {
     pub connection_id: Option<ConnectionId>,
 }
 
-pub fn project_local_endpoint(endpoint: EndpointId) -> Projection {
+pub fn project_local_endpoint(endpoint: EndpointId, secret: [u8; 32]) -> Projection {
     Projection {
-        rows: vec![ModuleRow {
-            table: tables::LOCAL_ENDPOINT,
-            key: b"local".to_vec(),
-            value: endpoint.to_vec(),
-        }],
+        rows: vec![
+            ModuleRow {
+                table: tables::LOCAL_ENDPOINT,
+                key: b"local".to_vec(),
+                value: endpoint.to_vec(),
+            },
+            ModuleRow {
+                table: tables::LOCAL_ENDPOINT_SECRET,
+                key: b"local".to_vec(),
+                value: secret.to_vec(),
+            },
+        ],
         response: None,
         connection_id: None,
     }

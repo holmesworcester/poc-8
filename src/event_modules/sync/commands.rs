@@ -30,6 +30,7 @@ pub fn start(
 
 pub fn ingest_frame(
     store: &Store,
+    expected_connection_id: EventId,
     bytes: &[u8],
     mut emit: impl FnMut(Vec<u8>) -> Result<(), String>,
 ) -> Result<SyncReport, String> {
@@ -83,6 +84,9 @@ pub fn ingest_frame(
     let Some(connection_id) = frame_connection_id else {
         return Ok(SyncReport::default());
     };
+    if connection_id != expected_connection_id {
+        return Err("sync frame used a different connection id".to_string());
+    }
     let sent_events = emit_control_and_requested_data(
         store,
         connection_id,

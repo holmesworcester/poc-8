@@ -1,11 +1,25 @@
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::{net::SocketAddr, str::FromStr};
+
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+use hkdf::Hkdf;
+use rand_core::{OsRng, RngCore};
+use sha2::Sha256;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::store::{EventId, Store};
 
-use super::codec::{self, ConnectionEvent, ConnectionId, EndpointId};
+use super::codec::{
+    self, ConnectionEvent, ConnectionId, EndpointId, TransitEnvelope, TransitNonce,
+};
 use super::projector;
 use super::tables;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invite {
+    pub endpoint: EndpointId,
+    pub bootstrap_token: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundRequest {
@@ -20,27 +34,64 @@ pub struct InboundResult {
     pub connection_id: Option<ConnectionId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnwrappedTransit {
+    pub inner: Vec<u8>,
+    pub connection_id: Option<ConnectionId>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportRoute {
     pub connection_id: ConnectionId,
     pub addr: SocketAddr,
 }
 
-pub fn create_request(store: &Store, bootstrap_token: &str) -> Result<OutboundRequest, String> {
-    let local_endpoint = ensure_local_endpoint(store)?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EndpointKeypair {
+    endpoint: EndpointId,
+    secret: [u8; 32],
+}
+
+pub fn create_invite(store: &Store, bootstrap_token: &str) -> Result<String, String> {
+    let local = ensure_local_keypair(store)?;
+    Ok(format!(
+        "{}:{}",
+        encode_hex(&local.endpoint),
+        bootstrap_token
+    ))
+}
+
+pub fn create_request(store: &Store, invite: &str) -> Result<OutboundRequest, String> {
+    let invite = parse_invite(invite)?;
+    let local = ensure_local_keypair(store)?;
     let request = ConnectionEvent::Request {
-        from_endpoint: local_endpoint,
-        nonce: nonce(),
-        bootstrap_hash: codec::bootstrap_hash(bootstrap_token),
+        from_endpoint: local.endpoint,
+        nonce: nonce32(),
+        bootstrap_hash: codec::bootstrap_hash(&invite.bootstrap_token),
     };
-    let bytes = codec::encode(&request);
-    let request_id = codec::event_id(&bytes);
-    apply(store, projector::project_outbound_request(bytes.clone())?)?;
+    let inner = codec::encode(&request);
+    let request_id = codec::event_id(&inner);
+    apply(store, projector::project_outbound_request(inner.clone())?)?;
     Ok(OutboundRequest {
-        bytes,
+        bytes: encrypt_bootstrap(&local, invite.endpoint, &inner)?,
         request_id,
-        local_endpoint,
+        local_endpoint: local.endpoint,
     })
+}
+
+pub fn ingest_inner(
+    store: &Store,
+    bytes: Vec<u8>,
+    bootstrap_token: Option<&str>,
+) -> Result<InboundResult, String> {
+    match codec::decode(&bytes)? {
+        ConnectionEvent::Request { .. } => {
+            let bootstrap_token = bootstrap_token
+                .ok_or_else(|| "connection request requires bootstrap token".to_string())?;
+            accept_request(store, bytes, bootstrap_token)
+        }
+        ConnectionEvent::Ack { .. } => accept_ack(store, bytes),
+    }
 }
 
 pub fn accept_request(
@@ -48,13 +99,21 @@ pub fn accept_request(
     bytes: Vec<u8>,
     bootstrap_token: &str,
 ) -> Result<InboundResult, String> {
-    let local_endpoint = ensure_local_endpoint(store)?;
+    let local = ensure_local_keypair(store)?;
+    let request = codec::decode(&bytes)?;
+    let ConnectionEvent::Request { from_endpoint, .. } = request else {
+        return Err("expected connection request".to_string());
+    };
     let projection = projector::project_inbound_request(
         bytes,
-        local_endpoint,
+        local.endpoint,
         codec::bootstrap_hash(bootstrap_token),
     )?;
-    let response = projection.response.clone();
+    let response = projection
+        .response
+        .as_ref()
+        .map(|bytes| encrypt_bootstrap(&local, from_endpoint, bytes))
+        .transpose()?;
     let connection_id = projection.connection_id;
     apply(store, projection)?;
     Ok(InboundResult {
@@ -64,7 +123,7 @@ pub fn accept_request(
 }
 
 pub fn accept_ack(store: &Store, bytes: Vec<u8>) -> Result<InboundResult, String> {
-    let local_endpoint = ensure_local_endpoint(store)?;
+    let local = ensure_local_keypair(store)?;
     let event = codec::decode(&bytes)?;
     let ConnectionEvent::Ack { request_id, .. } = event else {
         return Err("expected connection ack".to_string());
@@ -77,11 +136,11 @@ pub fn accept_ack(store: &Store, bytes: Vec<u8>) -> Result<InboundResult, String
     let ConnectionEvent::Request { from_endpoint, .. } = request else {
         return Err("connection ack references a non-request event".to_string());
     };
-    if from_endpoint != local_endpoint {
+    if from_endpoint != local.endpoint {
         return Err("connection ack references another endpoint's request".to_string());
     }
 
-    let projection = projector::project_inbound_ack(bytes, local_endpoint, request_id)?;
+    let projection = projector::project_inbound_ack(bytes, local.endpoint, request_id)?;
     let connection_id = projection.connection_id;
     apply(store, projection)?;
     Ok(InboundResult {
@@ -91,21 +150,84 @@ pub fn accept_ack(store: &Store, bytes: Vec<u8>) -> Result<InboundResult, String
 }
 
 pub fn is_connection_event(bytes: &[u8]) -> bool {
-    codec::decode(bytes).is_ok()
+    codec::is_connection_event(bytes)
 }
 
-pub fn ingest(
+pub fn wrap_connection(
     store: &Store,
-    bytes: Vec<u8>,
-    bootstrap_token: Option<&str>,
-) -> Result<InboundResult, String> {
-    match codec::decode(&bytes)? {
-        ConnectionEvent::Request { .. } => {
-            let bootstrap_token = bootstrap_token
-                .ok_or_else(|| "connection request requires bootstrap token".to_string())?;
-            accept_request(store, bytes, bootstrap_token)
+    connection_id: ConnectionId,
+    inner: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    let local = ensure_local_keypair(store)?;
+    let remote = remote_endpoint(store, &connection_id)?;
+    encrypt_connection(&local, connection_id, remote, &inner)
+}
+
+pub fn unwrap_transit(store: &Store, bytes: &[u8]) -> Result<UnwrappedTransit, String> {
+    let local = ensure_local_keypair(store)?;
+    match codec::decode_transit(bytes)? {
+        TransitEnvelope::Bootstrap {
+            sender_endpoint,
+            recipient_endpoint,
+            nonce,
+            ciphertext,
+        } => {
+            if recipient_endpoint != local.endpoint {
+                return Err("bootstrap transit addressed to a different endpoint".to_string());
+            }
+            let envelope = TransitEnvelope::Bootstrap {
+                sender_endpoint,
+                recipient_endpoint,
+                nonce,
+                ciphertext: Vec::new(),
+            };
+            let inner = decrypt(
+                &local.secret,
+                &sender_endpoint,
+                b"topo-bootstrap-transit-v1",
+                &codec::transit_associated_data(&envelope),
+                &nonce,
+                &ciphertext,
+            )?;
+            Ok(UnwrappedTransit {
+                inner,
+                connection_id: None,
+            })
         }
-        ConnectionEvent::Ack { .. } => accept_ack(store, bytes),
+        TransitEnvelope::Connection {
+            connection_id,
+            sender_endpoint,
+            recipient_endpoint,
+            nonce,
+            ciphertext,
+        } => {
+            if recipient_endpoint != local.endpoint {
+                return Err("connection transit addressed to a different endpoint".to_string());
+            }
+            let remote = remote_endpoint(store, &connection_id)?;
+            if sender_endpoint != remote {
+                return Err("connection transit sender does not match connection".to_string());
+            }
+            let envelope = TransitEnvelope::Connection {
+                connection_id,
+                sender_endpoint,
+                recipient_endpoint,
+                nonce,
+                ciphertext: Vec::new(),
+            };
+            let inner = decrypt(
+                &local.secret,
+                &sender_endpoint,
+                b"topo-connection-transit-v1",
+                &codec::transit_associated_data(&envelope),
+                &nonce,
+                &ciphertext,
+            )?;
+            Ok(UnwrappedTransit {
+                inner,
+                connection_id: Some(connection_id),
+            })
+        }
     }
 }
 
@@ -151,17 +273,158 @@ pub fn transport_routes(store: &Store) -> Result<Vec<TransportRoute>, String> {
         .collect()
 }
 
-fn ensure_local_endpoint(store: &Store) -> Result<EndpointId, String> {
-    if let Some(bytes) = store
-        .module_row(tables::LOCAL_ENDPOINT, b"local")
-        .map_err(|err| format!("load local endpoint: {err}"))?
-    {
-        return bytes_to_id(&bytes);
-    }
+fn encrypt_bootstrap(
+    local: &EndpointKeypair,
+    recipient_endpoint: EndpointId,
+    inner: &[u8],
+) -> Result<Vec<u8>, String> {
+    let nonce = nonce24();
+    let envelope = TransitEnvelope::Bootstrap {
+        sender_endpoint: local.endpoint,
+        recipient_endpoint,
+        nonce,
+        ciphertext: Vec::new(),
+    };
+    let ciphertext = encrypt(
+        &local.secret,
+        &recipient_endpoint,
+        b"topo-bootstrap-transit-v1",
+        &codec::transit_associated_data(&envelope),
+        &nonce,
+        inner,
+    )?;
+    Ok(codec::encode_transit(&TransitEnvelope::Bootstrap {
+        sender_endpoint: local.endpoint,
+        recipient_endpoint,
+        nonce,
+        ciphertext,
+    }))
+}
 
-    let endpoint = codec::endpoint_id(&nonce());
-    apply(store, projector::project_local_endpoint(endpoint))?;
-    Ok(endpoint)
+fn encrypt_connection(
+    local: &EndpointKeypair,
+    connection_id: ConnectionId,
+    recipient_endpoint: EndpointId,
+    inner: &[u8],
+) -> Result<Vec<u8>, String> {
+    let nonce = nonce24();
+    let envelope = TransitEnvelope::Connection {
+        connection_id,
+        sender_endpoint: local.endpoint,
+        recipient_endpoint,
+        nonce,
+        ciphertext: Vec::new(),
+    };
+    let ciphertext = encrypt(
+        &local.secret,
+        &recipient_endpoint,
+        b"topo-connection-transit-v1",
+        &codec::transit_associated_data(&envelope),
+        &nonce,
+        inner,
+    )?;
+    Ok(codec::encode_transit(&TransitEnvelope::Connection {
+        connection_id,
+        sender_endpoint: local.endpoint,
+        recipient_endpoint,
+        nonce,
+        ciphertext,
+    }))
+}
+
+fn encrypt(
+    local_secret: &[u8; 32],
+    remote_endpoint: &EndpointId,
+    purpose: &[u8],
+    associated_data: &[u8],
+    nonce: &TransitNonce,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, String> {
+    let key = derive_key(local_secret, remote_endpoint, purpose)?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    cipher
+        .encrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: plaintext,
+                aad: associated_data,
+            },
+        )
+        .map_err(|_| "encrypt transit envelope".to_string())
+}
+
+fn decrypt(
+    local_secret: &[u8; 32],
+    remote_endpoint: &EndpointId,
+    purpose: &[u8],
+    associated_data: &[u8],
+    nonce: &TransitNonce,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, String> {
+    let key = derive_key(local_secret, remote_endpoint, purpose)?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    cipher
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: associated_data,
+            },
+        )
+        .map_err(|_| "decrypt transit envelope".to_string())
+}
+
+fn derive_key(
+    local_secret: &[u8; 32],
+    remote_endpoint: &EndpointId,
+    purpose: &[u8],
+) -> Result<[u8; 32], String> {
+    let secret = StaticSecret::from(*local_secret);
+    let remote = PublicKey::from(*remote_endpoint);
+    let shared = secret.diffie_hellman(&remote);
+    let hkdf = Hkdf::<Sha256>::new(Some(purpose), shared.as_bytes());
+    let mut key = [0; 32];
+    hkdf.expand(b"topo transit key", &mut key)
+        .map_err(|_| "derive transit key".to_string())?;
+    Ok(key)
+}
+
+fn ensure_local_keypair(store: &Store) -> Result<EndpointKeypair, String> {
+    let secret = store
+        .module_row(tables::LOCAL_ENDPOINT_SECRET, b"local")
+        .map_err(|err| format!("load local endpoint secret: {err}"))?;
+    let endpoint = store
+        .module_row(tables::LOCAL_ENDPOINT, b"local")
+        .map_err(|err| format!("load local endpoint: {err}"))?;
+
+    match (secret, endpoint) {
+        (Some(secret), Some(endpoint)) => {
+            let secret = bytes_to_id(&secret)?;
+            let endpoint = bytes_to_id(&endpoint)?;
+            let derived = PublicKey::from(&StaticSecret::from(secret)).to_bytes();
+            if derived != endpoint {
+                return Err("stored endpoint does not match local endpoint secret".to_string());
+            }
+            Ok(EndpointKeypair { endpoint, secret })
+        }
+        (None, None) => {
+            let secret = StaticSecret::random_from_rng(OsRng);
+            let endpoint = PublicKey::from(&secret).to_bytes();
+            let secret = secret.to_bytes();
+            apply(store, projector::project_local_endpoint(endpoint, secret))?;
+            Ok(EndpointKeypair { endpoint, secret })
+        }
+        (None, Some(_)) => Err("local endpoint secret is missing".to_string()),
+        (Some(_), None) => Err("local endpoint public key is missing".to_string()),
+    }
+}
+
+fn remote_endpoint(store: &Store, connection_id: &ConnectionId) -> Result<EndpointId, String> {
+    let bytes = store
+        .module_row(tables::CONNECTIONS, connection_id)
+        .map_err(|err| format!("load connection: {err}"))?
+        .ok_or_else(|| "unknown connection".to_string())?;
+    bytes_to_id(&bytes)
 }
 
 fn apply(store: &Store, projection: projector::Projection) -> Result<(), String> {
@@ -169,6 +432,50 @@ fn apply(store: &Store, projection: projector::Projection) -> Result<(), String>
         .insert_module_rows(projection.rows)
         .map(|_| ())
         .map_err(|err| format!("apply connection projection: {err}"))
+}
+
+fn parse_invite(value: &str) -> Result<Invite, String> {
+    let (endpoint, bootstrap_token) = value
+        .split_once(':')
+        .ok_or_else(|| "invite must be ENDPOINT_HEX:BOOTSTRAP_TOKEN".to_string())?;
+    if bootstrap_token.is_empty() {
+        return Err("invite bootstrap token is empty".to_string());
+    }
+    Ok(Invite {
+        endpoint: decode_hex_32(endpoint)?,
+        bootstrap_token: bootstrap_token.to_string(),
+    })
+}
+
+fn encode_hex(bytes: &[u8; 32]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn decode_hex_32(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64 {
+        return Err("endpoint public key must be 64 hex characters".to_string());
+    }
+    let mut out = [0; 32];
+    let bytes = value.as_bytes();
+    for idx in 0..32 {
+        out[idx] = (hex_value(bytes[idx * 2])? << 4) | hex_value(bytes[idx * 2 + 1])?;
+    }
+    Ok(out)
+}
+
+fn hex_value(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err("endpoint public key is not hex".to_string()),
+    }
 }
 
 fn bytes_to_id(bytes: &[u8]) -> Result<EndpointId, String> {
@@ -180,14 +487,14 @@ fn bytes_to_id(bytes: &[u8]) -> Result<EndpointId, String> {
     Ok(out)
 }
 
-fn nonce() -> [u8; 32] {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"topo-connection-nonce-v1");
-    hasher.update(&now.to_be_bytes());
-    hasher.update(&std::process::id().to_be_bytes());
-    *hasher.finalize().as_bytes()
+fn nonce24() -> TransitNonce {
+    let mut nonce = [0; 24];
+    OsRng.fill_bytes(&mut nonce);
+    nonce
+}
+
+fn nonce32() -> [u8; 32] {
+    let mut nonce = [0; 32];
+    OsRng.fill_bytes(&mut nonce);
+    nonce
 }

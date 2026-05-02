@@ -13,9 +13,10 @@ fn connect_handshake_does_not_create_durable_events() {
     let alice = temp_db(&tmp, "alice.db");
     let bob = temp_db(&tmp, "bob.db");
     let port = free_port();
+    let bob_invite = invite(&bob);
 
     let listener = start_listener(&bob, port, 1);
-    let connected = connect_with_retry(&alice, port);
+    let connected = connect_with_retry(&alice, port, &bob_invite);
     assert!(connected.contains("connected:"));
     let server_out = wait_success(listener, "connect listener");
     assert!(
@@ -41,9 +42,15 @@ fn connect_requires_matching_bootstrap_token() {
     let alice = temp_db(&tmp, "alice.db");
     let bob = temp_db(&tmp, "bob.db");
     let port = free_port();
+    let bob_invite = invite_with_token(&bob, BOOTSTRAP_TOKEN);
+    let wrong_invite = format!(
+        "{}:{}",
+        bob_invite.split_once(':').expect("invite delimiter").0,
+        "wrong-token"
+    );
 
     let listener = start_listener(&bob, port, 1);
-    let connected = connect_with_token_after_listener(&alice, port, "wrong-token");
+    let connected = connect_with_invite_after_listener(&alice, port, &wrong_invite);
     assert!(
         !connected.status.success(),
         "connect unexpectedly succeeded:\n{}",
@@ -63,7 +70,7 @@ fn connect_requires_matching_bootstrap_token() {
 }
 
 #[test]
-fn connect_rejects_ack_with_invalid_connection_id() {
+fn connect_rejects_plaintext_or_malformed_response() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -71,12 +78,12 @@ fn connect_rejects_ack_with_invalid_connection_id() {
 
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let request = read_frame(&mut stream);
-        let ack = invalid_connection_ack(&request);
-        write_frame(&mut stream, &ack);
+        let _request = read_frame(&mut stream);
+        write_frame(&mut stream, b"not a transit envelope");
     });
 
-    let connected = connect_with_token(&alice, port, BOOTSTRAP_TOKEN);
+    let bad_server_invite = invite(&alice);
+    let connected = connect_with_invite(&alice, port, &bad_server_invite);
     server.join().unwrap();
     assert!(
         !connected.status.success(),
@@ -84,33 +91,12 @@ fn connect_rejects_ack_with_invalid_connection_id() {
         stdout(&connected)
     );
     assert!(
-        stderr(&connected).contains("invalid connection id"),
+        stderr(&connected).contains("not a transit envelope"),
         "stderr:\n{}",
         stderr(&connected)
     );
     assert_eq!(count(&alice), 0);
     assert_eq!(connection_count(&alice), 0);
-}
-
-fn invalid_connection_ack(request: &[u8]) -> Vec<u8> {
-    const MAGIC: &[u8; 10] = b"TOPOCONN1\0";
-    assert!(request.starts_with(MAGIC));
-    assert_eq!(request[MAGIC.len()], 1);
-
-    let from_offset = MAGIC.len() + 1;
-    let requester_endpoint = &request[from_offset..from_offset + 32];
-    let request_id = *blake3::hash(request).as_bytes();
-    let responder_endpoint = [7u8; 32];
-    let invalid_connection_id = [9u8; 32];
-
-    let mut ack = Vec::with_capacity(MAGIC.len() + 1 + 32 * 4);
-    ack.extend_from_slice(MAGIC);
-    ack.push(2);
-    ack.extend_from_slice(&responder_endpoint);
-    ack.extend_from_slice(requester_endpoint);
-    ack.extend_from_slice(&request_id);
-    ack.extend_from_slice(&invalid_connection_id);
-    ack
 }
 
 fn read_frame(stream: &mut std::net::TcpStream) -> Vec<u8> {
