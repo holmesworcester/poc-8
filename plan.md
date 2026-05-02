@@ -15,8 +15,8 @@ UPDATED:
 - Canonical events have scopes: shared, local-only, endpoint-scoped, or connection-scoped. The normal event id is always `BLAKE3(canonical_event_bytes)`; connection-scoped events include `connection_id` in their canonical bytes so their ids are naturally connection-local.
 - Durable shared data events live in durable event storage. Connection-scoped protocol events may live in transient storage, but still use normal canonical bytes and event ids. `outbox` stores only `(connection_id, event_id)`.
 - Blocking uses `blocked_by_event(blocked_by_event_id, event_id)` pair rows and same-transaction unblocking.
-- Connection wrapping has two modes: endpoint-pubkey bootstrap/repair and connection-secret ordinary traffic.
-- Outgoing TCP flow has one send owner per connection: `outbox` is the deduped source, a bounded hot queue keeps bytes ready, and TCP writability is the backpressure signal.
+- Connection/transit modules create transit blobs. The kernel never creates transit blobs; it only packs module-produced bytes into TCP frames and writes them to transport targets.
+- Outgoing flow dedupes deterministic connection-scoped events before transit wrapping. TCP writability and socket backpressure are transport mechanics, not sync or connection semantics.
 - Event modules own their canonical `codec.rs`; "wire" means transit bytes, not canonical event bytes.
 - `state` materializes table definitions from event-module declarations; it owns storage mechanics, not domain schema meaning.
 - Sync is an event-module family, not a separate sync engine.
@@ -89,7 +89,7 @@ src/event_modules/
 
 This rule is in conscious tension with "let complexity earn length" in the documentation quality bar (see appendix): that rule applies to *prose* in docs, this rule applies to *code structure* in event modules. Both stand.
 
-**networking** All complex networking behavior including bootstrap, connection, and sync is also implemented in event modules: commands (run by jobs) initiate activity, projectors respond to activity, and transit encryption is unwrapped into contained events. Connections are between two endpoints (daemons) and sync all data in all workspaces those two endpoints share. Every workspace-scoped event carries its own `workspace_id`; endpoint-scoped events (connection, intro, observed_address, self_address, prekey events) carry endpoint identity instead. A daemon hosts at most one instance of any given workspace, so for workspace-scoped events `workspace_id` alone identifies the local processing scope and there is no separate "recorded_by". See **Event Scopes** below for the full taxonomy.
+**networking** All complex networking behavior including bootstrap, connection, transit, and sync is implemented in event modules: commands (run by jobs) initiate activity, projectors respond to activity, and connection/transit modules wrap and unwrap transit blobs. The kernel network layer only frames and moves bytes to concrete transport targets. Connections are between two endpoints (daemons) and sync all data in all workspaces those two endpoints share. Every workspace-scoped event carries its own `workspace_id`; endpoint-scoped events (connection, intro, observed_address, self_address, prekey events) carry endpoint identity instead. A daemon hosts at most one instance of any given workspace, so for workspace-scoped events `workspace_id` alone identifies the local processing scope and there is no separate "recorded_by". See **Event Scopes** below for the full taxonomy.
 
 **event_pipeline** uses `event_modules` to process all Events (whether received or locally-created) such that an Event set, processed in any order, results in the same State at a given time (some event types can expire).
 
@@ -97,7 +97,7 @@ This rule is in conscious tension with "let complexity earn length" in the docum
 
 **state** is the explicit table-shaped substrate that projectors and jobs observe. It is materialized from event-module table declarations and can be a database in production or an in-memory store in testing and simulation.
 
-**network** is a TCP-only network interface that `connection`-related jobs and bootstrap jobs can use to send transmission-safe frames: endpoint-pubkey bootstrap wraps and connection-secret wraps carrying inner events.
+**network** is a TCP-only byte interface. It accepts module-produced `TransportSend { target, bytes }` effects, packs `bytes` into length-prefixed TCP frames, writes sockets, and records inbound bytes with origin metadata. It does not create or interpret transit blobs.
 
 **jobs** is a set of event-module commands that run at a regular cadence; each can query state to decide whether it runs and what other commands it calls.  
 
@@ -107,7 +107,7 @@ The substrate pieces outside `event_modules` are deliberately narrow:
 control_loop/   // dispatch, transactions, bounded batches, effect execution
 state/          // catalog materialization, storage, migrations, snapshots
 network/        // TCP bytes and socket ownership
-sender/         // outbox -> connection wrap -> TCP write
+sender/         // TransportSend effects -> TCP frame/write
 ```
 
 If behavior is protocol semantics expressible as events/projectors/commands/tables, it belongs under `event_modules`. If it owns process execution, IO, storage mechanics, or scheduling, it belongs outside.
@@ -372,7 +372,7 @@ When event `D` becomes applied, the same transaction deletes `blocked_by_event_i
 
 Unblocking never recursively processes dependents in the same call. `events.status = ready` is the unblocked-events queue; the control loop later claims a bounded batch of ready events.
 
-`outbox` stores only event ids to send on a connection:
+`outbox` stores only deterministic event ids to process for a connection:
 
 ```
 outbox:
@@ -382,16 +382,16 @@ outbox:
   primary key(connection_id, event_id)
 ```
 
-`outbox` is memory by default and has no per-row claim, lease, or retry status. Each active connection has exactly one send owner:
+`outbox` is memory by default and has no per-row claim, lease, or retry status. Each active connection has exactly one connection/transit job owner:
 
 ```
-ConnectionSender:
+ConnectionTransitJob:
   connection_id
   hot_queue: bounded deque<event_id>
   present: set<event_id>
 ```
 
-`hot_queue` is bounded by estimated bytes, not only event count. When it drops below a low-water mark, the sender refills from pending `outbox` rows for that connection, skipping ids already in `present`. It batch-loads `events.canonical_event_bytes`, wraps with `connection.wrap_bootstrap` or `connection.wrap`, and writes complete frames to TCP. After a complete frame is accepted by the socket, it deletes the corresponding `outbox` rows and removes those ids from `present`. On send failure it removes ids from `present`, leaves `outbox` rows pending, and backs off. No database transaction is held while writing to the socket.
+`hot_queue` is bounded by estimated bytes, not only event count. When it drops below a low-water mark, the connection/transit job refills from pending `outbox` rows for that connection, skipping ids already in `present`. For each deterministic send event, the module loads the referenced canonical bytes, checks connection/workspace authority, resolves the current transport target, creates a transit blob, and returns `TransportSend { target, bytes }`. The kernel network effect runner packs those bytes into TCP frames and writes the socket. After the socket accepts a complete frame, the control loop deletes the corresponding `outbox` rows and removes those ids from `present`. On send failure it removes ids from `present`, leaves `outbox` rows pending, and backs off. No database transaction is held while writing to the socket.
 
 The control loop commits `StateUpdates` in one transaction, then runs `Effects`. Effects may write new rows but do not directly project events.
 
@@ -403,21 +403,21 @@ The control loop has no sync, bootstrap, auth, connection, dependency, or event-
 
 ## Network
 
-**transport** owns TCP byte I/O between endpoints (listener on the daemon's `endpoint_id`, socket cache, `[u32 length][bytes]` framing, addresses learned from invite/`observed_address`/incoming connections). `send(remote_endpoint_id, OutboundFrame)` is the only egress; inbound bytes land on the inbound-bytes buffer with origin (remote_endpoint_id, ip, port). *Invariant: transport produces and interprets no bytes; if you can call `send` you are holding an `OutboundFrame` minted by `connection.wrap_bootstrap` or `connection.wrap`.*
+**transport** owns TCP byte I/O between network routes (listeners, socket cache, `[u32 length][bytes]` framing, addresses learned from invite/`observed_address`/incoming connections). `TransportSend { target, bytes }` is the only egress, where `target` is a concrete route such as `(ip, port)` or an existing socket id, not a `connection_id`. Inbound bytes land on the inbound-bytes buffer with origin `(ip, port, socket_id, observed endpoint if known)`. *Invariant: transport produces and interprets no transit bytes; if it sends bytes, those bytes were produced by an event module.*
 
 **connection** is an event module. A connection event references two endpoints and carries `shared_workspaces`. Each workspace entry's authority is established by the connection event's own dependencies and signature: deps point at the capability events (workspace-membership grant, invite, peer_shared, etc.) that authorize the signer to bind that workspace to that connection, and the pipeline's standard signature/dep validation is what makes the entry trustworthy. Rotation, revocation, and expiry are further connection-related events with their own deps/sigs. The same module owns `connection_secrets`: globally-unique `connection_secret_id` → `(key, direction, connection_id, ttl)`, with separate inbound and outbound secrets per connection, each known only to the two endpoints.
 
-The connection module also owns the transit envelope as plain functions, not as an event type (mirroring poc-6's `crypto.wrap` / `crypto.unwrap_transit`):
+The connection module also owns the transit envelope as plain functions, not as a kernel concern (mirroring poc-6's `crypto.wrap` / `crypto.unwrap_transit`):
 
-- `connection.wrap_bootstrap(remote_endpoint_id, inner_events) -> OutboundFrame`: encrypts to the endpoint public key. Used for connection establishment and connection-secret repair.
-- `connection.wrap(connection_id, inner_events) -> OutboundFrame`: looks up the outbound secret for the connection, asserts every inner event's `workspace_id ∈ shared_workspaces(connection_id)`, pads to a size bucket, encrypts. Used for ordinary sync/control/event traffic.
+- `connection.wrap_bootstrap(remote_endpoint_id, inner_events) -> TransitBlob`: encrypts to the endpoint public key. Used for connection establishment and connection-secret repair.
+- `connection.wrap(connection_id, inner_events) -> TransitBlob`: looks up the outbound secret for the connection, asserts every inner event's `workspace_id ∈ shared_workspaces(connection_id)`, pads to a size bucket, encrypts. Used for ordinary sync/control/event traffic.
 - `connection.unwrap(bytes) -> Vec<CanonicalEventBytes>`: a parse-stage transform run by the pipeline on every inbound frame. Unwraps either endpoint-pubkey bootstrap frames or connection-secret frames. Connection-secret frames recover `connection_id`, drop any inner event whose `workspace_id ∉ shared_workspaces(connection_id)`, and pass the surviving canonical event bytes into canonical-event processing.
 
 Wrapped bytes are never canonical events. They have no event id, no dependencies, and no labels — they are an opaque transit form. Only inner canonical event bytes are ids in the event store.
 
 *Invariants: `shared_workspaces` is authoritative because the connection event's deps + signature have already been validated by the standard pipeline — the connection does not authorize itself, its dependencies do; a valid unwrap under one of our inbound secrets is by construction proof that the sender is the remote endpoint of that connection; every wrap is bound to exactly one connection; wrap and unwrap both enforce workspace ↔ connection alignment.*
 
-**Outbox.** No event module calls `transport.send` directly. A projector that wants to send something — e.g. `needid.project` responding to a request from connection C with the requested event E — writes `outbox(connection_id=C, event_id=E)`, and only after checking *at projection time* that C is the connection the inbound trigger arrived on and that E's workspace_id is in `shared_workspaces(C)`. One `ConnectionSender` per active connection keeps a bounded byte-sized hot queue full from that connection's `outbox` rows, calls `connection.wrap`, and hands complete `OutboundFrame`s to TCP. A slow peer fills only its own hot queue and pauses only its own refill; other connection senders continue. *Invariant: every ordinary byte on the wire is the product of two independent workspace-membership checks (projector outbox write + `connection.wrap`) plus a third symmetric check on the receiving side (`connection.unwrap`).*
+**Outbox.** No event module calls `transport.send` directly. A projector that wants to send a durable event — e.g. `needid.project` responding to a request from connection C with requested event E — emits deterministic `SendEvent(connection_id=C, inner_event_id=E)` and queues that send event id in `outbox`. The connection/transit module owns `SendEvent.project`: it checks that C is the triggering connection, verifies that E's `workspace_id` is in `shared_workspaces(C)`, resolves C to a current transport target, creates a transit blob, and returns `TransportSend { target, bytes }`. The kernel network effect runner packs those bytes into TCP frames and writes sockets. A slow route backs off its own target; other transport targets continue. *Invariant: every ordinary byte on the wire is the product of two independent workspace-membership checks (SendEvent projection + `connection.wrap`) plus a third symmetric check on the receiving side (`connection.unwrap`).*
 
 # Forking plan
 
@@ -534,9 +534,9 @@ compare.project:
   if remote_fingerprint == F_v:
     emit nothing
   else if v is splittable:
-    create endpoint-local compare events for each child and queue them in outbox
+    create connection-scoped compare events for each child and queue them in outbox
   else:
-    create endpoint-local have-id events for the ids in R_v and queue them in outbox
+    create connection-scoped have-id events for the ids in R_v and queue them in outbox
 ```
 
 There is no protocol session id required for correctness. Duplicate compares are harmless because the compare answer is a pure function of projected state. Jobs decide when to begin a root compare for a connection, and should avoid starting new compares while that connection has recent sync or bulk-transfer activity.
@@ -610,7 +610,8 @@ Projectors do not write to sockets. They create deterministic connection-scoped 
 Have(id)    -> connection_events(scope=connection), outbox(connection_id, event_id)
 Need(id)    -> connection_events(scope=connection), outbox(connection_id, event_id)
 Compare(v)  -> connection_events(scope=connection), outbox(connection_id, event_id)
-Send(id)    -> outbox(connection_id, durable_event_id)
+Send(id)    -> connection_events(SendEvent(connection_id, inner_event_id)),
+               outbox(connection_id, send_event_id)
 ```
 
 Duplicate projector output collapses because connection-scoped sync event bytes are deterministic and `outbox` is unique on `(connection_id, event_id)`.
@@ -623,7 +624,7 @@ connection_events(connection_id, event_id, canonical_event_bytes, expires_at)
 outbox(connection_id, event_id)
 ```
 
-The sender resolves an outbox `event_id` from durable storage or transient connection storage, wraps the canonical bytes with the connection module, and packs bytes into TCP frames. Sync modules do not batch ids into transport frames and do not create transit blobs.
+The connection/transit job resolves an outbox `event_id` from transient connection-event storage. For sync control events, it wraps their canonical bytes. For `SendEvent`, it loads the referenced durable event, checks authority, creates a transit blob, and emits `TransportSend { target, bytes }`. Sync modules do not batch ids into transport frames and do not create transit blobs.
 
 Outgoing dedupe belongs at the `outbox` boundary and the per-connection hot queue, not in every projector's context. Projectors should not need `recently_sent` sets. If suppression beyond pending-buffer dedupe is needed later, keep sent rows in `outbox` with a TTL.
 
@@ -656,14 +657,16 @@ Canonical-event processing only calls sync suppression after parse succeeds and 
 
 ## Transit wrapping
 
-Dedupe semantic work before transit wrapping.
+Dedupe deterministic send intent before transit wrapping.
 
 ```
-outbox(connection_id, event_id)
-  -> ConnectionSender.hot_queue
-  -> batch-load events.canonical_event_bytes
-  -> connection.wrap(connection_id, inner_events)
-  -> TCP write
+NeedId
+  -> SendEvent(connection_id, inner_event_id)
+  -> outbox(connection_id, send_event_id)
+  -> connection/transit job
+  -> connection.wrap(connection_id, inner_event)
+  -> TransportSend { target: ip/port or socket_id, bytes: transit_blob }
+  -> kernel TCP frame/write
   -> delete sent outbox rows
 ```
 

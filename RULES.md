@@ -145,7 +145,8 @@ Event modules may:
 
 - decode and encode canonical event bytes
 - declare dependencies
-- declare owned tables and indexes
+- declare owned tables, indexes, and storage class (`durable`, `memory`, or
+  `temp`)
 - query through a narrow read context
 - append events through a narrow writer from commands
 - return declarative projector output: rows, labels, outbox operations,
@@ -175,6 +176,7 @@ This includes:
 - connection metadata and observed/self addresses
 - key, invite, and bootstrap protocol events
 - sync compare/have/need events
+- deterministic connection-scoped send-intent events
 - dep-aware negentropy events and tree/cache maintenance
 - request/response behavior that can be represented as event emission
 
@@ -185,14 +187,17 @@ The kernel may:
 - check dependencies
 - apply pure projector output
 - enqueue outbox rows
-- receive framed event bytes
-- send framed event bytes
+- receive framed transit bytes
+- execute `TransportSend { target, bytes }` effects by packing
+  module-produced bytes into TCP frames and writing sockets
 - schedule bounded work
 
 The kernel must not:
 
 - contain a bespoke sync coordinator
 - contain connection protocol state machines
+- create transit blobs, choose transit encryption/padding/key rules, or decide
+  which events are authorized on a connection
 - inspect sync ranges or negentropy trees except through module-declared tables
 - contain negentropy, compare/have/need, or sync-range vocabulary in
   `pipeline.rs`, `control_loop.rs`, or `network.rs`
@@ -200,9 +205,28 @@ The kernel must not:
 - bypass event admission for protocol messages
 - use side-channel protocol messages when an event can express the fact
 
-The network layer owns only transport mechanics: framing, wrapping, sending,
-receiving, buffering, and backpressure. It does not own sync or connection
-semantics.
+The network layer owns only transport mechanics: TCP framing, sending,
+receiving, buffering, and backpressure to concrete targets such as `(ip, port)`
+or socket ids. It does not own sync, connection, transit wrapping, or
+authorization semantics.
+
+Connection-scoped protocol events are real canonical events. Their
+`connection_id` must be inside their canonical bytes, and their id is the normal
+`BLAKE3(canonical_event_bytes)`. They may be transient, but they still use the
+same codec/projector/outbox rules as other events.
+
+Durable data events are not pushed to peers on creation. Durable data transfer
+is queued only through deterministic connection-scoped send intent, e.g.
+`SendEvent(connection_id, inner_event_id)`, usually emitted in response to a
+`NeedId` event. The outbox dedupes this deterministic intent by
+`(connection_id, send_event_id)`. The connection/transit module projects that
+intent into a transit blob and returns a `TransportSend { target, bytes }`
+effect; the kernel only frames and writes those bytes.
+
+`TransportSend.target` is a transport route, not a semantic connection id. Use
+an address or socket target such as `(ip, port)` or `socket_id`. If a module
+starts from `connection_id`, it must resolve that connection to a transport
+target before emitting the effect.
 
 ## No Fake Or Placeholder Encryption
 
@@ -343,7 +367,7 @@ Keep the kernel boring:
   only.
 - `event_modules/content` owns content event construction, codec, and projection.
 - `event_modules/sync` owns all negentropy, compare/have/need/range decisions,
-  wire sync messages, and sync jobs.
+  connection-scoped sync events, and sync jobs.
 
 The kernel should be a pleasure to read: small files, direct control flow,
 plain names, and no hidden protocol cleverness. A reader should understand the
@@ -355,6 +379,10 @@ Do not put sync protocol vocabulary or decisions in core files. In particular,
 `store`, `network`, and CLI glue may not decide what a negentropy range means,
 when to split a range, which ids are needed, or which events satisfy a sync
 request. They may only call event-module functions and move returned bytes.
+
+Do not put transit wrapping in `network`, `store`, CLI glue, or sync modules.
+Connection/transit modules create transit blobs; the kernel creates only generic
+TCP frames around module-produced bytes.
 
 Event modules stay directory-shaped:
 
