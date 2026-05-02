@@ -4,8 +4,7 @@ use crate::event_modules::{connection, sync};
 use crate::store::Store;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct IngestOptions<'a> {
-    pub bootstrap_token: Option<&'a str>,
+pub struct IngestOptions {
     pub record_transport_target: bool,
 }
 
@@ -39,7 +38,7 @@ pub fn ingest_frame(
     store: &Store,
     origin: SocketAddr,
     bytes: Vec<u8>,
-    options: IngestOptions<'_>,
+    options: IngestOptions,
 ) -> Result<IngestResult, String> {
     let transit = connection::commands::unwrap_transit(store, &bytes)?;
     if connection::commands::is_connection_event(&transit.inner) {
@@ -55,10 +54,10 @@ fn ingest_connection_frame(
     store: &Store,
     origin: SocketAddr,
     bytes: Vec<u8>,
-    options: IngestOptions<'_>,
+    options: IngestOptions,
 ) -> Result<IngestResult, String> {
     let mut result = IngestResult::default();
-    let connection = connection::commands::ingest_inner(store, bytes, options.bootstrap_token)?;
+    let connection = connection::commands::ingest_inner(store, bytes)?;
     if let Some(bytes) = connection.response {
         result.outgoing.push(bytes);
     }

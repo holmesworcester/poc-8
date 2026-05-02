@@ -44,6 +44,18 @@ pub fn project_outbound_request(bytes: Vec<u8>) -> Result<Projection, String> {
     })
 }
 
+pub fn project_invite_secret(bootstrap_hash: [u8; 32], private_key: [u8; 32]) -> Projection {
+    Projection {
+        rows: vec![ModuleRow {
+            table: tables::INVITE_SECRETS,
+            key: bootstrap_hash.to_vec(),
+            value: private_key.to_vec(),
+        }],
+        response: None,
+        connection_id: None,
+    }
+}
+
 pub fn project_inbound_request(
     bytes: Vec<u8>,
     local_endpoint: EndpointId,
@@ -59,7 +71,7 @@ pub fn project_inbound_request(
         return Err("expected connection request".to_string());
     };
     if bootstrap_hash != expected_bootstrap_hash {
-        return Err("bootstrap token rejected".to_string());
+        return Err("bootstrap hash rejected".to_string());
     }
 
     let request_id = codec::event_id(&bytes);

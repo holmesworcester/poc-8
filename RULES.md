@@ -374,7 +374,8 @@ The fresh rewrite starts from `plan.md` and `RULES.md` only. Add code back only
 when it serves the minimal black-box path:
 
 ```text
-topo --db PATH connect IP PORT
+topo --db PATH invite --public-addr ADDR
+topo --db PATH connect INVITE_LINK
 topo --db PATH generate NUM_EVENTS EVENT_SIZE_BYTES
 topo --db PATH sync
 ```

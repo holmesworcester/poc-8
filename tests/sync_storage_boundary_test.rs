@@ -13,10 +13,10 @@ fn connect_handshake_does_not_create_durable_events() {
     let alice = temp_db(&tmp, "alice.db");
     let bob = temp_db(&tmp, "bob.db");
     let port = free_port();
-    let bob_invite = invite(&bob);
+    let bob_invite = invite(&bob, port);
 
     let listener = start_listener(&bob, port, 1);
-    let connected = connect_with_retry(&alice, port, &bob_invite);
+    let connected = connect_with_retry(&alice, &bob_invite);
     assert!(connected.contains("connected:"));
     let server_out = wait_success(listener, "connect listener");
     assert!(
@@ -37,20 +37,16 @@ fn connect_handshake_does_not_create_durable_events() {
 }
 
 #[test]
-fn connect_requires_matching_bootstrap_token() {
+fn connect_requires_matching_invite_private_key() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
     let bob = temp_db(&tmp, "bob.db");
     let port = free_port();
-    let bob_invite = invite_with_token(&bob, BOOTSTRAP_TOKEN);
-    let wrong_invite = format!(
-        "{}:{}",
-        bob_invite.split_once(':').expect("invite delimiter").0,
-        "wrong-token"
-    );
+    let bob_invite = invite(&bob, port);
+    let wrong_invite = replace_invite_private_key(&bob_invite, &"00".repeat(32));
 
     let listener = start_listener(&bob, port, 1);
-    let connected = connect_with_invite_after_listener(&alice, port, &wrong_invite);
+    let connected = connect_with_invite_after_listener(&alice, &wrong_invite);
     assert!(
         !connected.status.success(),
         "connect unexpectedly succeeded:\n{}",
@@ -59,7 +55,7 @@ fn connect_requires_matching_bootstrap_token() {
     let server = listener.wait_with_output().expect("wait for listener");
     assert!(
         !server.status.success(),
-        "listener unexpectedly accepted bad bootstrap:\n{}",
+        "listener unexpectedly accepted bad invite private key:\n{}",
         stdout(&server)
     );
 
@@ -82,8 +78,9 @@ fn connect_rejects_plaintext_or_malformed_response() {
         write_frame(&mut stream, b"not a transit envelope");
     });
 
-    let bad_server_invite = invite(&alice);
-    let connected = connect_with_invite(&alice, port, &bad_server_invite);
+    let bad_server_invite =
+        rewrite_invite_address(&invite(&alice, free_port()), &format!("127.0.0.1:{port}"));
+    let connected = connect_with_invite(&alice, &bad_server_invite);
     server.join().unwrap();
     assert!(
         !connected.status.success(),

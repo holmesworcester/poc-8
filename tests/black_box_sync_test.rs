@@ -10,10 +10,10 @@ fn sync_converges_over_real_tcp() {
     let alice = temp_db(&tmp, "alice.db");
     let bob = temp_db(&tmp, "bob.db");
     let port = free_port();
-    let bob_invite = invite(&bob);
+    let bob_invite = invite(&bob, port);
 
     let listener = start_listener(&bob, port, 2);
-    let connected = connect_with_retry(&alice, port, &bob_invite);
+    let connected = connect_with_retry(&alice, &bob_invite);
     assert!(connected.contains("connected:"));
 
     let event_count = 128usize;
@@ -48,10 +48,10 @@ fn sync_perf_reports_10k_event_rate_from_sync_start_to_all_counted() {
     let alice = temp_db(&tmp, "alice.db");
     let bob = temp_db(&tmp, "bob.db");
     let port = free_port();
-    let bob_invite = invite(&bob);
+    let bob_invite = invite(&bob, port);
 
     let listener = start_listener(&bob, port, 2);
-    connect_with_retry(&alice, port, &bob_invite);
+    connect_with_retry(&alice, &bob_invite);
 
     let event_count = 10_000usize;
     let event_size = 512usize;
@@ -83,10 +83,10 @@ fn sync_splits_large_payloads_into_transport_sized_frames() {
     let alice = temp_db(&tmp, "alice.db");
     let bob = temp_db(&tmp, "bob.db");
     let port = free_port();
-    let bob_invite = invite(&bob);
+    let bob_invite = invite(&bob, port);
 
     let listener = start_listener(&bob, port, 2);
-    connect_with_retry(&alice, port, &bob_invite);
+    connect_with_retry(&alice, &bob_invite);
 
     let event_count = 600usize;
     let event_size = 256 * 1024usize;
@@ -120,24 +120,23 @@ fn invited_alice_bob_and_carol_sync_but_uninvited_mallory_cannot_connect() {
     let carol = temp_db(&tmp, "carol.db");
     let mallory = temp_db(&tmp, "mallory.db");
 
-    let alice_invite = invite(&alice);
-    let bob_invite = invite(&bob);
-    let carol_invite = invite(&carol);
-    let mallory_invite = invite(&mallory);
-
     let alice_port = free_port();
     let bob_port = free_port();
     let carol_port = free_port();
+    let alice_invite = invite(&alice, alice_port);
+    let bob_invite = invite(&bob, bob_port);
+    let carol_invite = invite(&carol, carol_port);
+
     let alice_listener = start_listener(&alice, alice_port, 4);
     let bob_listener = start_listener(&bob, bob_port, 4);
     let carol_listener = start_listener(&carol, carol_port, 4);
 
-    connect_with_retry(&alice, bob_port, &bob_invite);
-    connect_with_retry(&alice, carol_port, &carol_invite);
-    connect_with_retry(&bob, alice_port, &alice_invite);
-    connect_with_retry(&bob, carol_port, &carol_invite);
-    connect_with_retry(&carol, alice_port, &alice_invite);
-    connect_with_retry(&carol, bob_port, &bob_invite);
+    connect_with_retry(&alice, &bob_invite);
+    connect_with_retry(&alice, &carol_invite);
+    connect_with_retry(&bob, &alice_invite);
+    connect_with_retry(&bob, &carol_invite);
+    connect_with_retry(&carol, &alice_invite);
+    connect_with_retry(&carol, &bob_invite);
 
     let events_per_node = 24usize;
     let alice_event_size = 256usize;
@@ -175,20 +174,22 @@ fn invited_alice_bob_and_carol_sync_but_uninvited_mallory_cannot_connect() {
         elapsed.as_millis()
     );
 
-    let no_invite_connect = topo(&mallory, &["connect", "127.0.0.1", &bob_port.to_string()]);
+    let no_invite_connect = topo(&mallory, &["connect", &format!("127.0.0.1:{bob_port}")]);
     assert!(
         !no_invite_connect.status.success(),
         "mallory unexpectedly connected with port only:\n{}",
         stdout(&no_invite_connect)
     );
     assert!(
-        stderr(&no_invite_connect).contains("connect requires --invite"),
+        stderr(&no_invite_connect).contains("invite must start with topo://invite/"),
         "stderr:\n{}",
         stderr(&no_invite_connect)
     );
 
+    let wrong_private_key = "00".repeat(32);
+    let wrong_bob_invite = replace_invite_private_key(&bob_invite, &wrong_private_key);
     let mallory_listener = start_listener(&bob, bob_port, 1);
-    let mallory_connect = connect_with_invite_after_listener(&mallory, bob_port, &mallory_invite);
+    let mallory_connect = connect_with_invite_after_listener(&mallory, &wrong_bob_invite);
     assert!(
         !mallory_connect.status.success(),
         "mallory unexpectedly connected:\n{}",

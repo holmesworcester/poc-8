@@ -7,8 +7,6 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub const BOOTSTRAP_TOKEN: &str = "test-bootstrap-token";
-
 pub fn topo(db: &str, args: &[&str]) -> Output {
     Command::new(topo_bin())
         .arg("--db")
@@ -98,25 +96,26 @@ pub fn start_listener(db: &str, port: u16, accept: usize) -> Child {
             &port.to_string(),
             "--accept",
             &accept.to_string(),
-            "--bootstrap",
-            BOOTSTRAP_TOKEN,
         ],
     )
 }
 
-pub fn invite(db: &str) -> String {
-    invite_with_token(db, BOOTSTRAP_TOKEN)
+pub fn invite(db: &str, port: u16) -> String {
+    invite_with_addr(db, &format!("127.0.0.1:{port}"))
 }
 
-pub fn invite_with_token(db: &str, token: &str) -> String {
-    let out = assert_success(topo(db, &["invite", "--bootstrap", token]));
-    line_value(&out, "invite")
+pub fn invite_with_addr(db: &str, addr: &str) -> String {
+    let out = assert_success(topo(db, &["invite", "--public-addr", addr]));
+    out.lines()
+        .find(|line| line.starts_with("topo://invite/"))
+        .unwrap_or_else(|| panic!("missing invite link in output:\n{out}"))
+        .to_string()
 }
 
-pub fn connect_with_retry(db: &str, port: u16, invite: &str) -> String {
+pub fn connect_with_retry(db: &str, invite: &str) -> String {
     let mut last = String::new();
     for _ in 0..50 {
-        let output = connect_with_invite(db, port, invite);
+        let output = connect_with_invite(db, invite);
         if output.status.success() {
             return stdout(&output);
         }
@@ -126,23 +125,14 @@ pub fn connect_with_retry(db: &str, port: u16, invite: &str) -> String {
     panic!("connect never succeeded: {last}");
 }
 
-pub fn connect_with_invite(db: &str, port: u16, invite: &str) -> Output {
-    topo(
-        db,
-        &[
-            "connect",
-            "127.0.0.1",
-            &port.to_string(),
-            "--invite",
-            invite,
-        ],
-    )
+pub fn connect_with_invite(db: &str, invite: &str) -> Output {
+    topo(db, &["connect", invite])
 }
 
-pub fn connect_with_invite_after_listener(db: &str, port: u16, invite: &str) -> Output {
+pub fn connect_with_invite_after_listener(db: &str, invite: &str) -> Output {
     let mut last = None;
     for _ in 0..50 {
-        let output = connect_with_invite(db, port, invite);
+        let output = connect_with_invite(db, invite);
         if output.status.success() || !stderr(&output).contains("open tcp stream") {
             return output;
         }
@@ -150,6 +140,28 @@ pub fn connect_with_invite_after_listener(db: &str, port: u16, invite: &str) -> 
         thread::sleep(Duration::from_millis(50));
     }
     last.expect("connect attempted")
+}
+
+pub fn replace_invite_private_key(link: &str, private_key_hex: &str) -> String {
+    replace_invite_part(link, "INVITE_PRIVKEY", private_key_hex)
+}
+
+pub fn rewrite_invite_address(link: &str, addr: &str) -> String {
+    replace_invite_part(link, "ADDRESS", &addr.replace(':', "_"))
+}
+
+fn replace_invite_part(link: &str, label: &str, value: &str) -> String {
+    let prefix = format!("{label}.");
+    link.split('/')
+        .map(|part| {
+            if part.starts_with(&prefix) {
+                format!("{prefix}{value}")
+            } else {
+                part.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 pub fn generate(db: &str, count: usize, size: usize) -> String {
