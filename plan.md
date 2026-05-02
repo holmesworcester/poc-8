@@ -181,8 +181,10 @@ For locally created events:
 E
   -> encode(E)
   -> EncodedEvent
-  -> insert/project/outbox
+  -> insert/project
 ```
+
+Local creation does not enqueue durable data for peers. Durable data transfer is driven by negentropy: compare events discover differences, have/need events identify missing ids, and only a `NeedId` response queues the requested durable event id to `outbox`.
 
 For inbound events:
 
@@ -393,7 +395,7 @@ ConnectionSender:
 
 The control loop commits `StateUpdates` in one transaction, then runs `Effects`. Effects may write new rows but do not directly project events.
 
-The first implementation has one process-wide control-loop writer. Failed claim/retry work remains in its table with status, attempts, and last_error until its owning module marks it pending, rejected, blocked, expired, or dead. Send failure is connection-level backoff: `outbox` rows stay present. On startup, transient statuses are reset: `events.processing -> ready` and `inbound_bytes.processing -> pending`. Memory `outbox` starts empty; sync and jobs recreate missing send work.
+The first implementation has one process-wide control-loop writer. Failed claim/retry work remains in its table with status, attempts, and last_error until its owning module marks it pending, rejected, blocked, expired, or dead. Send failure is connection-level backoff: `outbox` rows stay present. On startup, transient statuses are reset: `events.processing -> ready` and `inbound_bytes.processing -> pending`. Memory `outbox` starts empty; sync jobs recreate root compare work, and any durable data sends are recreated only by later `NeedId` responses.
 
 Modules may run pure helper transforms inline until they reach a queue, state, or effect boundary. Modules do not recursively drain queues and do not perform transport IO inline.
 
