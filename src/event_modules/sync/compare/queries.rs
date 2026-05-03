@@ -2,8 +2,6 @@ use negentropy::{Id, NegentropyStorageVector};
 
 use crate::store::{EventId, Store};
 
-use super::super::negentropy as sync_index;
-
 pub trait ReadContext {
     fn storage(&self) -> Result<NegentropyStorageVector, String>;
     fn has_event(&self, event_id: &EventId) -> Result<bool, String>;
@@ -26,7 +24,10 @@ impl ReadContext for Store {
 
 pub fn storage(store: &Store) -> Result<NegentropyStorageVector, String> {
     let mut storage = NegentropyStorageVector::new();
-    for entry in sync_index::queries::indexed_entries(store)? {
+    for entry in store
+        .applied_shared_entries_after(0, i64::MAX as usize)
+        .map_err(|err| format!("load applied events for negentropy: {err}"))?
+    {
         storage
             .insert(entry.apply_seq, Id::from_byte_array(entry.event_id))
             .map_err(|err| format!("insert sync index item: {err:?}"))?;
@@ -38,7 +39,9 @@ pub fn storage(store: &Store) -> Result<NegentropyStorageVector, String> {
 }
 
 pub fn has_event(store: &Store, event_id: &EventId) -> Result<bool, String> {
-    sync_index::queries::has_event(store, event_id)
+    store
+        .has_shared_event(event_id)
+        .map_err(|err| format!("check event presence: {err}"))
 }
 
 pub fn event_byte(store: &Store, id: &EventId) -> Result<Option<Vec<u8>>, String> {

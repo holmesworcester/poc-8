@@ -6,9 +6,7 @@ pub mod test_events;
 
 use std::net::SocketAddr;
 
-use crate::store::{
-    CommandOutput, EventRecord, ModuleJobOutput, ProjectionOutput, Store, TableRow, WorkRecord,
-};
+use crate::store::{CommandOutput, EventRecord, ProjectionOutput, Store};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Modules;
@@ -22,8 +20,6 @@ struct FrameMetadata {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModuleFrameReport {
     pub events: Vec<EventRecord>,
-    pub rows: Vec<TableRow>,
-    pub work: Vec<WorkRecord>,
     pub outgoing: Vec<Vec<u8>>,
     pub queued_route: Option<connection::connection_record::types::ConnectionId>,
     pub established_routes: usize,
@@ -209,14 +205,19 @@ impl Modules {
         if routes.is_empty() {
             return Ok(CommandOutput::new(SyncStartReport::default()));
         }
-        let required_index_seq = store
-            .max_applied_shared_seq()
-            .map_err(|err| format!("load sync frontier: {err}"))?;
-        let work = routes
-            .into_iter()
-            .map(|route| sync::jobs::queue_start(route.connection_id, required_index_seq))
-            .collect::<Vec<_>>();
-        Ok(CommandOutput::with_work(SyncStartReport::default(), work))
+        let mut events = Vec::new();
+        let mut sent_events = 0;
+        for route in routes {
+            let report = sync::compare::commands::start(store, route.connection_id, |bytes| {
+                events.push(sync::frame::codec::record_from_bytes(bytes)?);
+                Ok(())
+            })?;
+            sent_events += report.sent_events;
+        }
+        Ok(CommandOutput::with_events(
+            SyncStartReport { sent_events },
+            events,
+        ))
     }
 
     pub fn drain_outbox_routes(&self, store: &Store) -> Result<Vec<OutboundSync>, String> {
@@ -288,59 +289,17 @@ impl Modules {
         bytes: &[u8],
     ) -> Result<ModuleFrameReport, String> {
         let mut result = ModuleFrameReport::default();
-        let frame_connection_id = sync::frame::codec::connection_id(bytes)?;
-        if frame_connection_id != connection_id {
-            return Err("sync frame used a different connection id".to_string());
-        }
-        let required_index_seq = store
-            .max_applied_shared_seq()
-            .map_err(|err| format!("load sync frontier: {err}"))?;
-        result.work.push(sync::jobs::queue_inbound_frame(
-            connection_id,
-            required_index_seq,
-            bytes.to_vec(),
-        ));
+        let report = sync::compare::commands::ingest_frame(store, connection_id, bytes, |bytes| {
+            result
+                .events
+                .push(sync::frame::codec::record_from_bytes(bytes)?);
+            Ok(())
+        })?;
         result.queued_route = Some(connection_id);
+        result.sent_events += report.sent_events;
+        result.received_events += report.received_events;
+        result.received_event_bytes = report.received_event_bytes;
         Ok(result)
-    }
-
-    pub fn next_job(&self, store: &Store) -> Result<Option<ModuleJobOutput>, String> {
-        if let Some(output) = sync::jobs::catch_up_index(store)? {
-            return self.sync_job_output(output).map(Some);
-        }
-
-        let Some(claim) = store
-            .claim_next_work_in_tx()
-            .map_err(|err| format!("claim work: {err}"))?
-        else {
-            return Ok(None);
-        };
-        if claim.lane != sync::jobs::types::LANE {
-            return Err(format!("unknown work lane {}", claim.lane));
-        }
-        let output = sync::jobs::run_claim(store, &claim)?;
-        store
-            .complete_work_in_tx(&claim.work_id)
-            .map_err(|err| format!("complete work: {err}"))?;
-        self.sync_job_output(output).map(Some)
-    }
-
-    fn sync_job_output(
-        &self,
-        output: sync::jobs::types::SyncJobOutput,
-    ) -> Result<ModuleJobOutput, String> {
-        let mut events = Vec::with_capacity(output.received_event_bytes.len());
-        for bytes in output.received_event_bytes {
-            events.push(record_from_bytes(bytes)?);
-        }
-        Ok(ModuleJobOutput {
-            rows: output.rows,
-            deleted_rows: output.deleted_rows,
-            work: output.work,
-            events,
-            sent_events: output.sent_events,
-            received_events: output.received_events,
-        })
     }
 
     fn local_keypair(

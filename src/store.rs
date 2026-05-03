@@ -3,7 +3,6 @@ use std::io;
 use std::path::Path;
 
 pub type EventId = [u8; 32];
-pub type WorkId = [u8; 32];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableRow {
@@ -16,23 +15,6 @@ pub struct TableRow {
 pub struct TableRowDeletion {
     pub table: &'static str,
     pub key: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkRecord {
-    pub lane: &'static str,
-    pub kind: &'static str,
-    pub dedupe_key: Vec<u8>,
-    pub payload: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkClaim {
-    pub work_id: WorkId,
-    pub lane: String,
-    pub kind: String,
-    pub payload: Vec<u8>,
-    pub attempts: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +47,6 @@ impl EventScope {
 pub struct ProjectionOutput {
     pub rows: Vec<TableRow>,
     pub deleted_rows: Vec<TableRowDeletion>,
-    pub work: Vec<WorkRecord>,
 }
 
 impl ProjectionOutput {
@@ -73,40 +54,19 @@ impl ProjectionOutput {
         Self {
             rows,
             deleted_rows: Vec::new(),
-            work: Vec::new(),
-        }
-    }
-
-    pub fn work(work: Vec<WorkRecord>) -> Self {
-        Self {
-            rows: Vec::new(),
-            deleted_rows: Vec::new(),
-            work,
         }
     }
 
     pub fn append(&mut self, mut other: Self) {
         self.rows.append(&mut other.rows);
         self.deleted_rows.append(&mut other.deleted_rows);
-        self.work.append(&mut other.work);
     }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ModuleJobOutput {
-    pub rows: Vec<TableRow>,
-    pub deleted_rows: Vec<TableRowDeletion>,
-    pub work: Vec<WorkRecord>,
-    pub events: Vec<EventRecord>,
-    pub sent_events: usize,
-    pub received_events: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput<T> {
     pub value: T,
     pub events: Vec<EventRecord>,
-    pub work: Vec<WorkRecord>,
 }
 
 impl<T> CommandOutput<T> {
@@ -114,24 +74,11 @@ impl<T> CommandOutput<T> {
         Self {
             value,
             events: Vec::new(),
-            work: Vec::new(),
         }
     }
 
     pub fn with_events(value: T, events: Vec<EventRecord>) -> Self {
-        Self {
-            value,
-            events,
-            work: Vec::new(),
-        }
-    }
-
-    pub fn with_work(value: T, work: Vec<WorkRecord>) -> Self {
-        Self {
-            value,
-            events: Vec::new(),
-            work,
-        }
+        Self { value, events }
     }
 }
 
@@ -174,23 +121,6 @@ impl EventStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkStatus {
-    Ready,
-    Running,
-    Failed,
-}
-
-impl WorkStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ready => "ready",
-            Self::Running => "running",
-            Self::Failed => "failed",
-        }
-    }
-}
-
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
@@ -214,106 +144,6 @@ impl Store {
             )?;
         }
         Ok(inserted)
-    }
-
-    pub fn insert_work_in_tx(&self, work: Vec<WorkRecord>) -> rusqlite::Result<usize> {
-        let mut inserted = 0;
-        for record in work {
-            let work_id = work_id(&record);
-            inserted += self.conn.execute(
-                "INSERT OR IGNORE INTO work_queue
-                    (work_id, lane, kind, dedupe_key, payload, status, attempts)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
-                params![
-                    work_id.to_vec(),
-                    record.lane,
-                    record.kind,
-                    record.dedupe_key,
-                    record.payload,
-                    WorkStatus::Ready.as_str(),
-                ],
-            )?;
-        }
-        Ok(inserted)
-    }
-
-    pub fn claim_next_work_in_tx(&self) -> rusqlite::Result<Option<WorkClaim>> {
-        let claim = self
-            .conn
-            .query_row(
-                "SELECT work_id, lane, kind, payload, attempts
-                 FROM work_queue
-                 WHERE status = ?1
-                 ORDER BY created_seq
-                 LIMIT 1",
-                params![WorkStatus::Ready.as_str()],
-                |row| {
-                    let id: Vec<u8> = row.get(0)?;
-                    Ok(WorkClaim {
-                        work_id: vec_to_id(id)?,
-                        lane: row.get(1)?,
-                        kind: row.get(2)?,
-                        payload: row.get(3)?,
-                        attempts: row.get::<_, i64>(4)? as u32,
-                    })
-                },
-            )
-            .optional()?;
-
-        let Some(claim) = claim else {
-            return Ok(None);
-        };
-        let changed = self.conn.execute(
-            "UPDATE work_queue
-             SET status = ?2, attempts = attempts + 1
-             WHERE work_id = ?1 AND status = ?3",
-            params![
-                claim.work_id.to_vec(),
-                WorkStatus::Running.as_str(),
-                WorkStatus::Ready.as_str(),
-            ],
-        )?;
-        if changed == 0 {
-            return Ok(None);
-        }
-        Ok(Some(WorkClaim {
-            attempts: claim.attempts.saturating_add(1),
-            ..claim
-        }))
-    }
-
-    pub fn complete_work_in_tx(&self, work_id: &WorkId) -> rusqlite::Result<bool> {
-        self.conn
-            .execute(
-                "DELETE FROM work_queue
-                 WHERE work_id = ?1 AND status = ?2",
-                params![work_id.to_vec(), WorkStatus::Running.as_str()],
-            )
-            .map(|changed| changed > 0)
-    }
-
-    pub fn fail_work_in_tx(&self, work_id: &WorkId, error: &str) -> rusqlite::Result<bool> {
-        self.conn
-            .execute(
-                "UPDATE work_queue
-                 SET status = ?2, last_error = ?3
-                 WHERE work_id = ?1 AND status = ?4",
-                params![
-                    work_id.to_vec(),
-                    WorkStatus::Failed.as_str(),
-                    error,
-                    WorkStatus::Running.as_str(),
-                ],
-            )
-            .map(|changed| changed > 0)
-    }
-
-    pub fn work_count(&self) -> rusqlite::Result<usize> {
-        self.conn
-            .query_row("SELECT COUNT(*) FROM work_queue", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .map(|count| count as usize)
     }
 
     pub fn delete_table_rows_in_tx(
@@ -707,20 +537,6 @@ impl Store {
                 row_value BLOB NOT NULL,
                 PRIMARY KEY (table_name, row_key)
             );
-
-            CREATE TABLE IF NOT EXISTS work_queue (
-                created_seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                work_id BLOB UNIQUE NOT NULL,
-                lane TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                dedupe_key BLOB NOT NULL,
-                payload BLOB NOT NULL,
-                status TEXT NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_work_queue_ready
-                ON work_queue(status, created_seq);
             ",
         )?;
         self.ensure_event_scope_column()?;
@@ -755,19 +571,6 @@ impl Store {
 
 pub fn event_id(bytes: &[u8]) -> EventId {
     *blake3::hash(bytes).as_bytes()
-}
-
-pub fn work_id(record: &WorkRecord) -> WorkId {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"topo-work-v1");
-    hasher.update(record.lane.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(record.kind.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(&record.dedupe_key);
-    hasher.update(&[0]);
-    hasher.update(&record.payload);
-    *hasher.finalize().as_bytes()
 }
 
 fn vec_to_id(bytes: Vec<u8>) -> rusqlite::Result<EventId> {
