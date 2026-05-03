@@ -1,10 +1,9 @@
-pub mod queries;
 pub mod tables;
 pub mod types;
 
 use crate::store::{EventId, Store};
 
-use self::types::{SyncJobOutput, SyncWork};
+use self::types::{QueuedSyncWork, SyncJobOutput, SyncWork};
 
 const INDEX_BATCH: usize = 4096;
 
@@ -32,7 +31,7 @@ pub fn next(store: &Store) -> Result<Option<SyncJobOutput>, String> {
         return Ok(Some(output));
     }
 
-    let Some(queued) = queries::next_work(store)? else {
+    let Some(queued) = next_work(store)? else {
         return Ok(None);
     };
     let cursor = super::negentropy::queries::cursor(store)?;
@@ -111,4 +110,16 @@ fn ingest_frame(
         received_event_bytes: report.received_event_bytes,
         ..SyncJobOutput::default()
     })
+}
+
+fn next_work(store: &Store) -> Result<Option<QueuedSyncWork>, String> {
+    let Some((key, value)) = store
+        .table_rows(tables::WORK)
+        .map_err(|err| format!("load sync work: {err}"))?
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    types::decode(key, &value).map(Some)
 }

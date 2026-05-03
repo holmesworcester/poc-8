@@ -45,15 +45,11 @@ pub struct JobDrainReport {
     pub received_events: usize,
 }
 
-pub fn apply_changes(
-    store: &Store,
-    modules: &Modules,
-    changes: ProjectionOutput,
-) -> Result<AdmitReport, String> {
+pub fn apply_changes(store: &Store, changes: ProjectionOutput) -> Result<AdmitReport, String> {
     store
         .write_transaction(|store| {
             let mut report = AdmitReport::default();
-            apply_changes_in_tx(store, modules, changes, &mut report)?;
+            apply_changes_in_tx(store, changes, &mut report)?;
             Ok(report)
         })
         .map_err(|err| format!("apply state changes: {err}"))
@@ -86,7 +82,6 @@ pub fn apply_event_records(
 
 fn apply_changes_in_tx(
     store: &Store,
-    _modules: &Modules,
     changes: ProjectionOutput,
     _report: &mut AdmitReport,
 ) -> rusqlite::Result<()> {
@@ -110,7 +105,7 @@ fn admit_and_apply_record_in_tx(
         let changes = modules
             .project_record(store, record)
             .map_err(module_error)?;
-        apply_changes_in_tx(store, modules, changes, report)?;
+        apply_changes_in_tx(store, changes, report)?;
         report.applied_events += 1;
         return Ok(());
     }
@@ -175,7 +170,7 @@ pub fn apply_ready_event_in_tx(
             .project_record(store, &record)
             .map_err(module_error)?;
         let mut admitted = AdmitReport::default();
-        apply_changes_in_tx(store, modules, changes, &mut admitted)?;
+        apply_changes_in_tx(store, changes, &mut admitted)?;
         report.applied_events = 1;
         report.unblocked_events = blocking::unblock_dependents(store, event_id)?;
     }
@@ -234,19 +229,13 @@ pub fn ingest_frame(
     metadata: FrameMetadata,
     bytes: Vec<u8>,
 ) -> Result<IngestResult, String> {
-    let mut report =
-        modules.ingest_frame(store, metadata.origin, metadata.remember_origin, bytes)?;
-    report.events.extend(received_event_records(
-        modules,
-        report.received_event_bytes,
-    )?);
+    let report = modules.ingest_frame(store, metadata.origin, metadata.remember_origin, bytes)?;
     let queued_route = report.queued_route;
     let _admitted = store
         .write_transaction(|store| {
             let mut admitted = AdmitReport::default();
             apply_changes_in_tx(
                 store,
-                modules,
                 ProjectionOutput {
                     rows: report.rows,
                     deleted_rows: Vec::new(),
@@ -267,20 +256,6 @@ pub fn ingest_frame(
         sent_events: report.sent_events,
         received_events: report.received_events,
     })
-}
-
-fn received_event_records(
-    modules: &Modules,
-    events: Vec<Vec<u8>>,
-) -> Result<Vec<EventRecord>, String> {
-    if events.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut records = Vec::with_capacity(events.len());
-    for bytes in events {
-        records.push(modules.record_from_bytes(bytes)?);
-    }
-    Ok(records)
 }
 
 fn module_error(err: String) -> rusqlite::Error {

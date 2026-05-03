@@ -28,7 +28,6 @@ pub struct ModuleFrameReport {
     pub established_routes: usize,
     pub sent_events: usize,
     pub received_events: usize,
-    pub received_event_bytes: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,7 +197,7 @@ impl Modules {
         }
     }
 
-    pub fn start_sync(&self, store: &Store) -> Result<ProjectionOutput, String> {
+    pub fn queue_sync_routes(&self, store: &Store) -> Result<ProjectionOutput, String> {
         let routes = connection::transport_target::queries::routes(store)?;
         if routes.is_empty() {
             return Ok(ProjectionOutput::default());

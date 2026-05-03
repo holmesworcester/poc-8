@@ -45,8 +45,6 @@ pub fn encode(work: SyncWork) -> TableRow {
         } => {
             key.push(START);
             key.extend_from_slice(&connection_id);
-            value.u8(START);
-            value.id(&connection_id);
             value.u64(required_index_seq);
         }
         SyncWork::InboundFrame {
@@ -57,8 +55,6 @@ pub fn encode(work: SyncWork) -> TableRow {
             key.push(INBOUND_FRAME);
             key.extend_from_slice(&connection_id);
             key.extend_from_slice(&crate::store::event_id(&frame_bytes));
-            value.u8(INBOUND_FRAME);
-            value.id(&connection_id);
             value.u64(required_index_seq);
             value.sized_bytes(&frame_bytes);
         }
@@ -71,21 +67,26 @@ pub fn encode(work: SyncWork) -> TableRow {
 }
 
 pub fn decode(key: Vec<u8>, value: &[u8]) -> Result<QueuedSyncWork, String> {
+    let (tag, connection_id) = decode_key(&key)?;
     let mut reader = Reader::new(value, "sync work");
-    let tag = reader.u8()?;
-    let connection_id = reader.id()?;
     let required_index_seq = reader.u64()?;
-    validate_key(&key, tag, &connection_id)?;
     let work = match tag {
         START => SyncWork::Start {
             connection_id,
             required_index_seq,
         },
-        INBOUND_FRAME => SyncWork::InboundFrame {
-            connection_id,
-            required_index_seq,
-            frame_bytes: reader.sized_bytes()?,
-        },
+        INBOUND_FRAME => {
+            let frame_bytes = reader.sized_bytes()?;
+            let frame_id = crate::store::event_id(&frame_bytes);
+            if key[33..65] != frame_id[..] {
+                return Err("sync work key does not match frame bytes".to_string());
+            }
+            SyncWork::InboundFrame {
+                connection_id,
+                required_index_seq,
+                frame_bytes,
+            }
+        }
         other => return Err(format!("unknown sync work kind {other}")),
     };
     reader.finish()?;
@@ -105,7 +106,11 @@ impl SyncWork {
     }
 }
 
-fn validate_key(key: &[u8], tag: u8, connection_id: &EventId) -> Result<(), String> {
+fn decode_key(key: &[u8]) -> Result<(u8, EventId), String> {
+    if key.len() != 33 && key.len() != 65 {
+        return Err("sync work key must be 33 or 65 bytes".to_string());
+    }
+    let tag = key[0];
     let expected_len = match tag {
         START => 33,
         INBOUND_FRAME => 65,
@@ -114,8 +119,7 @@ fn validate_key(key: &[u8], tag: u8, connection_id: &EventId) -> Result<(), Stri
     if key.len() != expected_len {
         return Err(format!("sync work key must be {expected_len} bytes"));
     }
-    if key[0] != tag || &key[1..33] != connection_id {
-        return Err("sync work key does not match payload".to_string());
-    }
-    Ok(())
+    let mut connection_id = [0; 32];
+    connection_id.copy_from_slice(&key[1..33]);
+    Ok((tag, connection_id))
 }

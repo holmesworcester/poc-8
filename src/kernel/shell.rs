@@ -398,11 +398,11 @@ impl<'a> RealShell<'a> {
                 )
                 .map_err(|err| format!("drain ready events before sync: {err}"))?;
 
-                let start = self
+                let queued = self
                     .modules
-                    .start_sync(self.store)
-                    .map_err(|err| format!("start sync: {err}"))?;
-                pipeline::apply_changes(self.store, self.modules, start)
+                    .queue_sync_routes(self.store)
+                    .map_err(|err| format!("queue sync: {err}"))?;
+                pipeline::apply_changes(self.store, queued)
                     .map_err(|err| format!("record sync work: {err}"))?;
                 let drained = control_loop::drain_until_idle(
                     self.store,
