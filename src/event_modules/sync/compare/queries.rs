@@ -24,10 +24,7 @@ impl ReadContext for Store {
 
 pub fn storage(store: &Store) -> Result<NegentropyStorageVector, String> {
     let mut storage = NegentropyStorageVector::new();
-    for entry in store
-        .applied_shared_entries_after(0, i64::MAX as usize)
-        .map_err(|err| format!("load applied events for negentropy: {err}"))?
-    {
+    for entry in super::super::negentropy::queries::indexed_entries(store)? {
         storage
             .insert(entry.apply_seq, Id::from_byte_array(entry.event_id))
             .map_err(|err| format!("insert sync index item: {err:?}"))?;

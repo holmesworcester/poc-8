@@ -1,7 +1,8 @@
 use crate::blocking;
 use crate::event_modules::Modules;
 use crate::store::{
-    event_id, CommandOutput, EventId, EventRecord, EventScope, EventStatus, ProjectionOutput, Store,
+    event_id, CommandOutput, EventId, EventRecord, EventScope, EventStatus, ModuleJobOutput,
+    ProjectionOutput, Store,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +34,15 @@ pub struct AdmitReport {
 pub struct ApplyReadyReport {
     pub applied_events: usize,
     pub unblocked_events: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JobDrainReport {
+    pub jobs_run: usize,
+    pub inserted_events: usize,
+    pub applied_events: usize,
+    pub sent_events: usize,
+    pub received_events: usize,
 }
 
 pub fn apply_changes(
@@ -172,6 +182,52 @@ pub fn apply_ready_event_in_tx(
     Ok(report)
 }
 
+pub fn drain_module_jobs(
+    store: &Store,
+    modules: &Modules,
+    limit: usize,
+) -> Result<JobDrainReport, String> {
+    store
+        .write_transaction(|store| drain_module_jobs_in_tx(store, modules, limit))
+        .map_err(|err| format!("drain module jobs: {err}"))
+}
+
+pub fn drain_module_jobs_in_tx(
+    store: &Store,
+    modules: &Modules,
+    limit: usize,
+) -> rusqlite::Result<JobDrainReport> {
+    let mut total = JobDrainReport::default();
+    while total.jobs_run < limit {
+        let Some(output) = modules.next_job(store).map_err(module_error)? else {
+            break;
+        };
+        apply_job_output_in_tx(store, modules, output, &mut total)?;
+    }
+    Ok(total)
+}
+
+fn apply_job_output_in_tx(
+    store: &Store,
+    modules: &Modules,
+    output: ModuleJobOutput,
+    total: &mut JobDrainReport,
+) -> rusqlite::Result<()> {
+    store.delete_table_rows_in_tx(output.deleted_rows)?;
+    store.insert_table_rows_in_tx(output.rows)?;
+    total.jobs_run += 1;
+    total.sent_events += output.sent_events;
+    total.received_events += output.received_events;
+
+    let mut admitted = AdmitReport::default();
+    for record in output.events {
+        admit_and_apply_record_in_tx(store, modules, &record, &mut admitted)?;
+    }
+    total.inserted_events += admitted.inserted_events;
+    total.applied_events += admitted.applied_events;
+    Ok(())
+}
+
 pub fn ingest_frame(
     store: &Store,
     modules: &Modules,
@@ -188,6 +244,15 @@ pub fn ingest_frame(
     let _admitted = store
         .write_transaction(|store| {
             let mut admitted = AdmitReport::default();
+            apply_changes_in_tx(
+                store,
+                modules,
+                ProjectionOutput {
+                    rows: report.rows,
+                    deleted_rows: Vec::new(),
+                },
+                &mut admitted,
+            )?;
             for record in report.events {
                 admit_and_apply_record_in_tx(store, modules, &record, &mut admitted)?;
             }

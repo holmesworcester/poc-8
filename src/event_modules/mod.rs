@@ -6,7 +6,9 @@ pub mod test_events;
 
 use std::net::SocketAddr;
 
-use crate::store::{CommandOutput, EventRecord, ProjectionOutput, Store};
+use crate::store::{
+    CommandOutput, EventRecord, ModuleJobOutput, ProjectionOutput, Store, TableRow,
+};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Modules;
@@ -20,6 +22,7 @@ struct FrameMetadata {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModuleFrameReport {
     pub events: Vec<EventRecord>,
+    pub rows: Vec<TableRow>,
     pub outgoing: Vec<Vec<u8>>,
     pub queued_route: Option<connection::connection_record::types::ConnectionId>,
     pub established_routes: usize,
@@ -40,11 +43,6 @@ pub struct OutboundSync {
 pub struct DrainedOutbox {
     pub outgoing: Vec<Vec<u8>>,
     pub sent_outbox: Vec<Vec<u8>>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SyncStartReport {
-    pub sent_events: usize,
 }
 
 impl Modules {
@@ -200,23 +198,19 @@ impl Modules {
         }
     }
 
-    pub fn start_sync(&self, store: &Store) -> Result<CommandOutput<SyncStartReport>, String> {
+    pub fn start_sync(&self, store: &Store) -> Result<ProjectionOutput, String> {
         let routes = connection::transport_target::queries::routes(store)?;
         if routes.is_empty() {
-            return Ok(CommandOutput::new(SyncStartReport::default()));
+            return Ok(ProjectionOutput::default());
         }
-        let mut events = Vec::new();
-        let mut sent_events = 0;
-        for route in routes {
-            let report = sync::compare::commands::start(store, route.connection_id, |bytes| {
-                events.push(sync::frame::codec::record_from_bytes(bytes)?);
-                Ok(())
-            })?;
-            sent_events += report.sent_events;
-        }
-        Ok(CommandOutput::with_events(
-            SyncStartReport { sent_events },
-            events,
+        let required_index_seq = store
+            .max_applied_shared_seq()
+            .map_err(|err| format!("load sync frontier: {err}"))?;
+        Ok(ProjectionOutput::rows(
+            routes
+                .into_iter()
+                .map(|route| sync::jobs::queue_start(route.connection_id, required_index_seq))
+                .collect(),
         ))
     }
 
@@ -289,17 +283,37 @@ impl Modules {
         bytes: &[u8],
     ) -> Result<ModuleFrameReport, String> {
         let mut result = ModuleFrameReport::default();
-        let report = sync::compare::commands::ingest_frame(store, connection_id, bytes, |bytes| {
-            result
-                .events
-                .push(sync::frame::codec::record_from_bytes(bytes)?);
-            Ok(())
-        })?;
+        let frame_connection_id = sync::frame::codec::connection_id(bytes)?;
+        if frame_connection_id != connection_id {
+            return Err("sync frame used a different connection id".to_string());
+        }
+        let required_index_seq = store
+            .max_applied_shared_seq()
+            .map_err(|err| format!("load sync frontier: {err}"))?;
+        result.rows.push(sync::jobs::queue_inbound_frame(
+            connection_id,
+            required_index_seq,
+            bytes.to_vec(),
+        ));
         result.queued_route = Some(connection_id);
-        result.sent_events += report.sent_events;
-        result.received_events += report.received_events;
-        result.received_event_bytes = report.received_event_bytes;
         Ok(result)
+    }
+
+    pub fn next_job(&self, store: &Store) -> Result<Option<ModuleJobOutput>, String> {
+        let Some(output) = sync::jobs::next(store)? else {
+            return Ok(None);
+        };
+        let mut events = output.events;
+        for bytes in output.received_event_bytes {
+            events.push(record_from_bytes(bytes)?);
+        }
+        Ok(Some(ModuleJobOutput {
+            rows: output.rows,
+            deleted_rows: output.deleted_rows,
+            events,
+            sent_events: output.sent_events,
+            received_events: output.received_events,
+        }))
     }
 
     fn local_keypair(

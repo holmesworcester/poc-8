@@ -261,6 +261,10 @@ impl<'a> RealShell<'a> {
                     self.modules,
                     control_loop::DEFAULT_READY_BATCH,
                 )
+                .map(|drain| {
+                    result.sent_events += drain.sent_events;
+                    result.received_events += drain.received_events;
+                })
                 .map_err(|err| format!("drain ready events after frame: {err}"))?;
                 if let Some(connection_id) = result.queued_route {
                     let drained = self
@@ -398,8 +402,14 @@ impl<'a> RealShell<'a> {
                     .modules
                     .start_sync(self.store)
                     .map_err(|err| format!("start sync: {err}"))?;
-                let (started, _) = pipeline::run_command(self.store, self.modules, start)
-                    .map_err(|err| format!("record sync frames: {err}"))?;
+                pipeline::apply_changes(self.store, self.modules, start)
+                    .map_err(|err| format!("record sync work: {err}"))?;
+                let drained = control_loop::drain_until_idle(
+                    self.store,
+                    self.modules,
+                    control_loop::DEFAULT_READY_BATCH,
+                )
+                .map_err(|err| format!("drain sync work: {err}"))?;
                 let outbound = self
                     .modules
                     .drain_outbox_routes(self.store)
@@ -414,7 +424,7 @@ impl<'a> RealShell<'a> {
                     .collect();
                 Ok(StoreReply::SyncStarted(SyncRoutesStart {
                     outbound,
-                    sent_events: started.sent_events,
+                    sent_events: drained.sent_events,
                 }))
             }
             StoreOp::CountStatus => {

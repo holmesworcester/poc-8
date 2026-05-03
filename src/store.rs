@@ -63,6 +63,15 @@ impl ProjectionOutput {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModuleJobOutput {
+    pub rows: Vec<TableRow>,
+    pub deleted_rows: Vec<TableRowDeletion>,
+    pub events: Vec<EventRecord>,
+    pub sent_events: usize,
+    pub received_events: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput<T> {
     pub value: T,
