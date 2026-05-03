@@ -1,21 +1,18 @@
+use negentropy::{Id, NegentropyStorageVector};
+
 use crate::store::{EventId, Store};
 
-use super::types::{BucketSummary, BUCKETS};
+use super::super::negentropy as sync_index;
 
 pub trait ReadContext {
-    fn summary(&self) -> Result<[BucketSummary; BUCKETS], String>;
-    fn ids_in_bucket(&self, bucket: u8) -> Result<Vec<EventId>, String>;
+    fn storage(&self) -> Result<NegentropyStorageVector, String>;
     fn has_event(&self, event_id: &EventId) -> Result<bool, String>;
     fn event_byte(&self, id: &EventId) -> Result<Option<Vec<u8>>, String>;
 }
 
 impl ReadContext for Store {
-    fn summary(&self) -> Result<[BucketSummary; BUCKETS], String> {
-        summary(self)
-    }
-
-    fn ids_in_bucket(&self, bucket: u8) -> Result<Vec<EventId>, String> {
-        ids_in_bucket(self, bucket)
+    fn storage(&self) -> Result<NegentropyStorageVector, String> {
+        storage(self)
     }
 
     fn has_event(&self, event_id: &EventId) -> Result<bool, String> {
@@ -27,46 +24,25 @@ impl ReadContext for Store {
     }
 }
 
-pub fn summary(store: &Store) -> Result<[BucketSummary; BUCKETS], String> {
-    let mut summary = [BucketSummary::default(); BUCKETS];
-    for header in store
-        .event_index_entries()
-        .map_err(|err| format!("load event headers: {err}"))?
-    {
-        let bucket = &mut summary[usize::from(header.partition)];
-        bucket.count += 1;
-        xor_into(&mut bucket.fingerprint, &fingerprint_id(&header.event_id));
+pub fn storage(store: &Store) -> Result<NegentropyStorageVector, String> {
+    let mut storage = NegentropyStorageVector::new();
+    for entry in sync_index::queries::indexed_entries(store)? {
+        storage
+            .insert(entry.apply_seq, Id::from_byte_array(entry.event_id))
+            .map_err(|err| format!("insert sync index item: {err:?}"))?;
     }
-    Ok(summary)
-}
-
-pub fn ids_in_bucket(store: &Store, bucket: u8) -> Result<Vec<EventId>, String> {
-    store
-        .event_ids_in_partition(bucket)
-        .map_err(|err| format!("load bucket ids: {err}"))
+    storage
+        .seal()
+        .map_err(|err| format!("seal sync index: {err:?}"))?;
+    Ok(storage)
 }
 
 pub fn has_event(store: &Store, event_id: &EventId) -> Result<bool, String> {
-    store
-        .has_shared_event(event_id)
-        .map_err(|err| format!("check event presence: {err}"))
+    sync_index::queries::has_event(store, event_id)
 }
 
 pub fn event_byte(store: &Store, id: &EventId) -> Result<Option<Vec<u8>>, String> {
     store
         .shared_event_bytes(id)
         .map_err(|err| format!("load event bytes: {err}"))
-}
-
-fn fingerprint_id(id: &EventId) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"sync-event-id:");
-    hasher.update(id);
-    *hasher.finalize().as_bytes()
-}
-
-fn xor_into(target: &mut [u8; 32], value: &[u8; 32]) {
-    for (left, right) in target.iter_mut().zip(value.iter()) {
-        *left ^= *right;
-    }
 }

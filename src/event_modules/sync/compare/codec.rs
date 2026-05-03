@@ -1,27 +1,18 @@
 use crate::wire::{Reader, Writer};
 
-use super::types::{BucketSummary, CompareEvent, BUCKETS};
+use super::types::CompareEvent;
 
 pub const TAG: u8 = 1;
 
 pub fn encode(event: &CompareEvent, out: &mut Writer) {
     out.u8(TAG);
     out.id(&event.connection_id);
-    for bucket in &event.summary {
-        out.u64(bucket.count);
-        out.id(&bucket.fingerprint);
-    }
+    out.sized_bytes(&event.message);
 }
 
 pub fn decode(reader: &mut Reader<'_>) -> Result<CompareEvent, String> {
-    let connection_id = reader.id()?;
-    let mut summary = [BucketSummary::default(); BUCKETS];
-    for bucket in &mut summary {
-        bucket.count = reader.u64()?;
-        bucket.fingerprint = reader.id()?;
-    }
     Ok(CompareEvent {
-        connection_id,
-        summary,
+        connection_id: reader.id()?,
+        message: reader.sized_bytes()?,
     })
 }

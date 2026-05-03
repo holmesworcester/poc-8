@@ -247,7 +247,7 @@ impl<'a> RealShell<'a> {
                 remember_origin,
                 bytes,
             } => {
-                let result = pipeline::ingest_frame(
+                let mut result = pipeline::ingest_frame(
                     self.store,
                     self.modules,
                     pipeline::FrameMetadata {
@@ -256,6 +256,22 @@ impl<'a> RealShell<'a> {
                     },
                     bytes,
                 )?;
+                let drain = control_loop::drain_until_idle(
+                    self.store,
+                    self.modules,
+                    control_loop::DEFAULT_READY_BATCH,
+                )
+                .map_err(|err| format!("run frame jobs: {err}"))?;
+                result.sent_events += drain.sent_events;
+                result.received_events += drain.received_events;
+                if let Some(connection_id) = result.queued_route {
+                    let drained = self
+                        .modules
+                        .drain_outbox_for_route(self.store, connection_id)
+                        .map_err(|err| format!("drain frame outbox: {err}"))?;
+                    result.outgoing.extend(drained.outgoing);
+                    result.sent_outbox.extend(drained.sent_outbox);
+                }
                 Ok(StoreReply::FrameIngested(FrameIngest {
                     outgoing: result.outgoing,
                     sent_outbox: result.sent_outbox,
@@ -386,6 +402,12 @@ impl<'a> RealShell<'a> {
                     .map_err(|err| format!("start sync: {err}"))?;
                 let (started, _) = pipeline::run_command(self.store, self.modules, start)
                     .map_err(|err| format!("record sync frames: {err}"))?;
+                let drain = control_loop::drain_until_idle(
+                    self.store,
+                    self.modules,
+                    control_loop::DEFAULT_READY_BATCH,
+                )
+                .map_err(|err| format!("run sync jobs: {err}"))?;
                 let outbound = self
                     .modules
                     .drain_outbox_routes(self.store)
@@ -400,7 +422,7 @@ impl<'a> RealShell<'a> {
                     .collect();
                 Ok(StoreReply::SyncStarted(SyncRoutesStart {
                     outbound,
-                    sent_events: started.sent_events,
+                    sent_events: started.sent_events + drain.sent_events,
                 }))
             }
             StoreOp::CountStatus => {
