@@ -1,8 +1,0 @@
-[package]
-name = "module_deciders_crux_poc"
-version = "0.1.0"
-edition = "2021"
-publish = false
-
-[dependencies]
-crux_core = "0.17.0"

@@ -1,6 +1,25 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-fn rust_files(root: &Path) -> Vec<std::path::PathBuf> {
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn event_modules_root(root: &Path) -> PathBuf {
+    root.join("src/protocol/event_modules")
+}
+
+fn core_root(root: &Path) -> PathBuf {
+    root.join("src/core")
+}
+
+fn relative(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn rust_files(root: &Path) -> Vec<PathBuf> {
     let mut pending = vec![root.to_path_buf()];
     let mut files = Vec::new();
     while let Some(dir) = pending.pop() {
@@ -16,11 +35,14 @@ fn rust_files(root: &Path) -> Vec<std::path::PathBuf> {
     files
 }
 
-fn file_contains_violations(
-    root: &Path,
-    files: &[std::path::PathBuf],
-    forbidden: &[&str],
-) -> Vec<String> {
+fn rust_files_named(root: &Path, file_name: &str) -> Vec<PathBuf> {
+    rust_files(root)
+        .into_iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == file_name))
+        .collect()
+}
+
+fn file_contains_violations(root: &Path, files: &[PathBuf], forbidden: &[&str]) -> Vec<String> {
     let mut violations = Vec::new();
     for path in files {
         let text = std::fs::read_to_string(path).expect("read rust file");
@@ -32,6 +54,34 @@ fn file_contains_violations(
         }
     }
     violations
+}
+
+struct ForbiddenRule {
+    name: &'static str,
+    files: Vec<PathBuf>,
+    forbidden: Vec<&'static str>,
+    message: &'static str,
+}
+
+fn repo_paths(root: &Path, files: &[&str]) -> Vec<PathBuf> {
+    files.iter().map(|file| root.join(file)).collect()
+}
+
+fn assert_forbidden_rule(root: &Path, rule: ForbiddenRule) {
+    let violations = file_contains_violations(root, &rule.files, &rule.forbidden);
+    assert!(
+        violations.is_empty(),
+        "rule `{}` failed: {}\n{}",
+        rule.name,
+        rule.message,
+        violations.join("\n")
+    );
+}
+
+fn assert_forbidden_rules(root: &Path, rules: Vec<ForbiddenRule>) {
+    for rule in rules {
+        assert_forbidden_rule(root, rule);
+    }
 }
 
 fn source_text(path: &Path) -> String {
@@ -345,23 +395,6 @@ fn worker_files_export_only_run_as_public_entrypoint() {
 }
 
 #[test]
-fn codec_files_do_not_define_public_types() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let event_root = root.join("src/protocol/event_modules");
-    let files = rust_files(&event_root)
-        .into_iter()
-        .filter(|path| path.file_name().is_some_and(|name| name == "codec.rs"))
-        .collect::<Vec<_>>();
-    let forbidden = ["pub struct ", "pub enum ", "pub type "];
-    let violations = file_contains_violations(root, &files, &forbidden);
-    assert!(
-        violations.is_empty(),
-        "event module semantic types belong in types.rs; codec.rs is encode/decode only:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
 fn codec_files_use_shared_binary_helpers_and_finish_reads() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let event_root = root.join("src/protocol/event_modules");
@@ -419,14 +452,358 @@ fn codec_modules_have_type_files() {
 }
 
 #[test]
+fn forbidden_vocabulary_boundaries_hold() {
+    let root = repo_root();
+    let event_root = event_modules_root(&root);
+    let core_root = core_root(&root);
+    let this_file = root
+        .join("tests/rules_boundary_test.rs")
+        .canonicalize()
+        .ok();
+
+    assert_forbidden_rules(
+        &root,
+        vec![
+            ForbiddenRule {
+                name: "codec_files_do_not_define_public_types",
+                files: rust_files_named(&event_root, "codec.rs"),
+                forbidden: vec!["pub struct ", "pub enum ", "pub type "],
+                message: "event module semantic types belong in types.rs; codec.rs is encode/decode only",
+            },
+            ForbiddenRule {
+                name: "cli_harness_is_process_only",
+                files: repo_paths(&root, &["tests/cli_harness/mod.rs"]),
+                forbidden: vec![
+                    "--db",
+                    "\"invite\"",
+                    "\"connect\"",
+                    "\"generate\"",
+                    "\"sync\"",
+                    "\"count\"",
+                    "topo://",
+                    "start_listener",
+                    "connect_with_",
+                    "replace_invite",
+                    "assert_eventually_count",
+                    "connection_count",
+                    "connection_event_count",
+                ],
+                message: "tests/cli_harness must stay process-only; scenario files own command params, retries, invite syntax, output keys, and expected results",
+            },
+            ForbiddenRule {
+                name: "core_does_not_import_protocol",
+                files: rust_files(&core_root),
+                forbidden: vec!["crate::protocol"],
+                message: "core must be protocol-agnostic; concrete protocols live under src/protocol",
+            },
+            ForbiddenRule {
+                name: "event_modules_worker_has_no_domain_branching_vocabulary",
+                files: repo_paths(&root, &["src/protocol/event_modules/worker.rs"]),
+                forbidden: vec![
+                    "connection",
+                    "sync",
+                    "transit",
+                    "response",
+                    "record_transport",
+                    "is_connection_event",
+                    "ingest_sync",
+                ],
+                message: "event_modules/worker.rs owns common admission/apply, but concrete branching belongs in event_modules::Modules or domain workers",
+            },
+            ForbiddenRule {
+                name: "core_has_no_protocol_io_vocabulary",
+                files: rust_files(&core_root),
+                forbidden: vec!["TransportSend", "outbox", "connection_id", "transit"],
+                message: "protocol-specific IO vocabulary belongs under src/protocol/event_modules, not src/core",
+            },
+            ForbiddenRule {
+                name: "core_has_no_domain_vocabulary",
+                files: rust_files(&core_root),
+                forbidden: vec![
+                    "workspace",
+                    "content",
+                    "endpoint",
+                    "identity",
+                    "invite",
+                    "bootstrap",
+                    "negentropy",
+                    "message",
+                    "reaction",
+                    "file_transfer",
+                ],
+                message: "domain vocabulary belongs under src/protocol/event_modules, not src/core",
+            },
+            ForbiddenRule {
+                name: "store_uses_generic_storage_vocabulary",
+                files: repo_paths(&root, &["src/core/store.rs"]),
+                forbidden: vec![
+                    "bucket",
+                    "EventLabel",
+                    "event_labels",
+                    "module_rows",
+                    "payload_len",
+                    "Network",
+                    "Tcp",
+                    "SocketAddr",
+                ],
+                message: "store owns generic mechanics, not sync buckets, module-row escape hatches, payload semantics, or network queue semantics",
+            },
+            ForbiddenRule {
+                name: "core_network_queues_are_opaque_byte_rows",
+                files: repo_paths(&root, &["src/core/network_queues.rs"]),
+                forbidden: vec![
+                    "EventRecord",
+                    "canonical",
+                    "event_id",
+                    "connection_id",
+                    "workspace",
+                    "transit",
+                    "invite",
+                    "sync",
+                    "bootstrap",
+                    "outbox",
+                ],
+                message: "core/network_queues.rs owns opaque byte rows only, not protocol meaning",
+            },
+            ForbiddenRule {
+                name: "core_tcp_is_opaque_frame_transport",
+                files: repo_paths(&root, &["src/core/tcp.rs"]),
+                forbidden: vec![
+                    "EventRecord",
+                    "canonical",
+                    "event_id",
+                    "connection_id",
+                    "workspace",
+                    "transit",
+                    "invite",
+                    "sync",
+                    "bootstrap",
+                    "outbox",
+                ],
+                message: "core/tcp.rs owns length-prefixed opaque frames only, not protocol meaning",
+            },
+            ForbiddenRule {
+                name: "sync_event_module_does_not_own_transport_or_frame_io",
+                files: rust_files(&event_root.join("sync")),
+                forbidden: vec![
+                    "TcpStream",
+                    "TcpListener",
+                    "crate::protocol::network",
+                    "read_frame",
+                    "write_frame",
+                ],
+                message: "sync event modules must not own TCP transport or frame IO",
+            },
+            ForbiddenRule {
+                name: "event_module_commands_do_not_mutate_storage_directly",
+                files: rust_files_named(&event_root, "commands.rs"),
+                forbidden: vec![
+                    "use crate::core::store::Store",
+                    "&Store",
+                    "Store,",
+                    "Store)",
+                    "ProjectionOutput",
+                    "TableRow",
+                    "with_changes",
+                    ".rows",
+                    "write_transaction",
+                    "insert_table_rows",
+                    "insert_event(",
+                    "set_event_status",
+                    "delete_dependency_wait",
+                    "insert_blocked_event_missing_dep",
+                    "delete_blocked_events_by_missing_dep",
+                    "drain_until_idle",
+                    "rusqlite",
+                ],
+                message: "commands receive explicit context and return CommandOutput events only; projectors/workers/store own rows and writes",
+            },
+            ForbiddenRule {
+                name: "event_modules_do_not_import_runtime_worker_or_transport",
+                files: rust_files(&event_root)
+                    .into_iter()
+                    .filter(|path| path != &event_root.join("mod.rs"))
+                    .filter(|path| path.file_name().is_none_or(|name| name != "worker.rs"))
+                    .collect(),
+                forbidden: vec![
+                    "crate::runtime",
+                    "crate::state",
+                    "crate::core::worker",
+                    "crate::core::control_loop",
+                    "crate::core::wire",
+                    "PipelineActor",
+                    "drain_until_idle",
+                    "protocol::network",
+                    "TcpStream",
+                    "TcpListener",
+                    "read_frame",
+                    "write_frame",
+                    "NetworkOp",
+                    "StoreOp",
+                    "ProtocolEffect",
+                    "TransportSend",
+                ],
+                message: "event modules own protocol semantics, not runtime loops or transport implementation",
+            },
+            ForbiddenRule {
+                name: "event_module_projectors_do_not_query_storage_directly",
+                files: rust_files_named(&event_root, "projector.rs"),
+                forbidden: vec![
+                    "use crate::core::store::Store",
+                    "&Store",
+                    "Store,",
+                    "Store)",
+                    "table_row",
+                    "event_bytes",
+                    "has_event",
+                    "write_transaction",
+                    "rusqlite",
+                ],
+                message: "projectors are pure transforms over event plus explicit context; queries belong outside projector.rs",
+            },
+            ForbiddenRule {
+                name: "event_module_queries_are_read_only",
+                files: rust_files_named(&event_root, "queries.rs"),
+                forbidden: vec![
+                    "delete_table_rows",
+                    "insert_table_rows",
+                    "write_transaction",
+                    "insert_event",
+                    "set_event_status",
+                    "delete_dependency_wait",
+                    "insert_blocked_event_missing_dep",
+                    "delete_blocked_events_by_missing_dep",
+                ],
+                message: "queries.rs is read-only; mutations belong in workers or core write paths",
+            },
+            ForbiddenRule {
+                name: "event_module_projectors_do_not_do_transit_or_crypto_work",
+                files: rust_files_named(&event_root, "projector.rs"),
+                forbidden: vec!["transit", "crypto", "encrypt", "decrypt", "unwrap("],
+                message: "projectors write rows; transit wrapping/unwrapping and crypto belong in commands/workers/helpers",
+            },
+            ForbiddenRule {
+                name: "event_module_projectors_are_row_only_boundaries",
+                files: rust_files_named(&event_root, "projector.rs"),
+                forbidden: vec![
+                    "CommandOutput",
+                    "ProposedEvent",
+                    "EventRecord {",
+                    "ProtocolEffect",
+                    "NetworkOp",
+                    "StoreOp",
+                    "TransportSend",
+                    "TcpStream",
+                    "TcpListener",
+                    "create_connection(",
+                    "create_bootstrap(",
+                ],
+                message: "projectors are row-only; emitting events/effects or doing transit work belongs in commands/workers",
+            },
+            ForbiddenRule {
+                name: "event_module_types_do_not_store_encoded_event_artifacts",
+                files: rust_files_named(&event_root, "types.rs")
+                    .into_iter()
+                    .filter(|path| path != &event_root.join("types.rs"))
+                    .collect(),
+                forbidden: vec!["canonical_bytes", "encoded_event", "wire_event"],
+                message: "types.rs should define semantic shapes; canonical bytes live at codec/boundary layers",
+            },
+            ForbiddenRule {
+                name: "sync_event_module_does_not_use_session_message_vocabulary",
+                files: rust_files(&event_root.join("sync")),
+                forbidden: vec!["Hello", "HelloAck", "Done", "Events"],
+                message: "sync protocol items must be connection-scoped events, not session messages",
+            },
+            ForbiddenRule {
+                name: "core_files_do_not_contain_sync_protocol_logic",
+                files: repo_paths(
+                    &root,
+                    &[
+                        "src/main.rs",
+                        "src/core/store.rs",
+                        "src/core/network_queues.rs",
+                        "src/core/tcp.rs",
+                        "src/protocol/event_modules/worker.rs",
+                    ],
+                ),
+                forbidden: vec!["negentropy", "Compare", "Have", "Need", "differing_buckets"],
+                message: "sync protocol logic belongs in protocol/event_modules/sync",
+            },
+            ForbiddenRule {
+                name: "protocol_cli_does_not_use_socket_primitives",
+                files: repo_paths(&root, &["src/protocol/cli.rs"]),
+                forbidden: vec![
+                    "TcpStream",
+                    "TcpListener",
+                    "Shutdown",
+                    "read_frame",
+                    "write_frame",
+                    "connect_timeout",
+                    ".accept()",
+                    ".read_exact(",
+                    ".write_all(",
+                ],
+                message: "protocol/cli.rs may invoke core TCP runtime helpers, but must not own socket/frame mechanics",
+            },
+            ForbiddenRule {
+                name: "crux_core_is_isolated_to_core",
+                files: rust_files(&root.join("src"))
+                    .into_iter()
+                    .filter(|path| !path.starts_with(&core_root))
+                    .collect(),
+                forbidden: vec!["crux_core", "ProtocolApp"],
+                message: "Crux is a core runner detail; protocol code should not define Crux app/model/effect layers",
+            },
+            ForbiddenRule {
+                name: "source_does_not_contain_fake_crypto_claims",
+                files: rust_files(&root.join("src"))
+                    .into_iter()
+                    .chain(rust_files(&root.join("tests")))
+                    .filter(|path| path.canonicalize().ok() != this_file)
+                    .collect(),
+                forbidden: vec![
+                    "fake crypto",
+                    "fake encryption",
+                    "pass-through encryption",
+                    "identity cipher",
+                    "encrypted in name only",
+                    "toy encryption",
+                ],
+                message: "do not name fake or placeholder crypto as real protection",
+            },
+            ForbiddenRule {
+                name: "core_storage_and_transport_do_not_own_connection_or_bootstrap_schema",
+                files: repo_paths(
+                    &root,
+                    &[
+                        "src/core/store.rs",
+                        "src/core/network_queues.rs",
+                        "src/core/tcp.rs",
+                    ],
+                ),
+                forbidden: vec![
+                    "peer",
+                    "bootstrap",
+                    "connection_id",
+                    "connection_events",
+                    "connection.",
+                ],
+                message: "connection/bootstrap storage belongs in protocol/event_modules/connection",
+            },
+        ],
+    );
+}
+
+#[test]
 fn commands_files_live_only_in_event_modules() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let event_root = root.join("src/protocol/event_modules");
+    let root = repo_root();
+    let event_root = event_modules_root(&root);
     let offenders = rust_files(&root.join("src"))
         .into_iter()
         .filter(|path| path.file_name().is_some_and(|name| name == "commands.rs"))
         .filter(|path| !path.starts_with(&event_root))
-        .map(|path| path.strip_prefix(root).unwrap().display().to_string())
+        .map(|path| relative(&root, &path))
         .collect::<Vec<_>>();
 
     assert!(
@@ -438,77 +815,20 @@ fn commands_files_live_only_in_event_modules() {
 
 #[test]
 fn cli_files_live_with_event_modules_or_the_protocol_shell() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let event_root = root.join("src/protocol/event_modules");
+    let root = repo_root();
+    let event_root = event_modules_root(&root);
     let protocol_cli = root.join("src/protocol/cli.rs");
     let offenders = rust_files(&root.join("src"))
         .into_iter()
         .filter(|path| path.file_name().is_some_and(|name| name == "cli.rs"))
         .filter(|path| !path.starts_with(&event_root) && path != &protocol_cli)
-        .map(|path| path.strip_prefix(root).unwrap().display().to_string())
+        .map(|path| relative(&root, &path))
         .collect::<Vec<_>>();
 
     assert!(
         offenders.is_empty(),
         "CLI adapters belong beside event modules; only src/protocol/cli.rs may compose the protocol CLI:\n{}",
         offenders.join("\n")
-    );
-}
-
-#[test]
-fn cli_harness_is_process_only() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let text = source_text(&root.join("tests/cli_harness/mod.rs"));
-    let forbidden = [
-        "--db",
-        "\"invite\"",
-        "\"connect\"",
-        "\"generate\"",
-        "\"sync\"",
-        "\"count\"",
-        "topo://",
-        "start_listener",
-        "connect_with_",
-        "replace_invite",
-        "assert_eventually_count",
-        "connection_count",
-        "connection_event_count",
-    ];
-    let violations = forbidden
-        .into_iter()
-        .filter(|needle| text.contains(needle))
-        .collect::<Vec<_>>();
-
-    assert!(
-        violations.is_empty(),
-        "tests/cli_harness must stay process-only; scenario files own command params, retries, invite syntax, output keys, and expected results:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
-fn core_does_not_import_protocol() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let core_files = rust_files(&root.join("src/core"));
-    let mut violations = Vec::new();
-
-    for file in core_files {
-        let text = std::fs::read_to_string(&file).expect("read core file");
-        for (line_idx, line) in text.lines().enumerate() {
-            if line.contains("crate::protocol") {
-                violations.push(format!(
-                    "{}:{}: {line}",
-                    file.strip_prefix(root).unwrap().display(),
-                    line_idx + 1
-                ));
-            }
-        }
-    }
-
-    assert!(
-        violations.is_empty(),
-        "core must be protocol-agnostic; concrete protocols live under src/protocol:\n{}",
-        violations.join("\n")
     );
 }
 
@@ -525,112 +845,6 @@ fn core_does_not_own_protocol_worker_or_wire_codec() {
         offenders.is_empty(),
         "core maintains queues/storage only; protocol workers and wire codec helpers live under src/protocol/event_modules or src/protocol:\n{}",
         offenders.join("\n")
-    );
-}
-
-#[test]
-fn event_modules_worker_has_no_domain_branching_vocabulary() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let files = [root.join("src/protocol/event_modules/worker.rs")];
-    let forbidden = [
-        "connection",
-        "sync",
-        "transit",
-        "response",
-        "record_transport",
-        "is_connection_event",
-        "ingest_sync",
-    ];
-    let violations = file_contains_violations(root, &files, &forbidden);
-    assert!(
-        violations.is_empty(),
-        "event_modules/worker.rs owns common admission/apply, but concrete branching belongs in event_modules::Modules or domain workers:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
-fn core_has_no_protocol_io_vocabulary() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let core_root = root.join("src/core");
-    let files = rust_files(&core_root);
-    let forbidden = ["TransportSend", "outbox", "connection_id", "transit"];
-    let violations = file_contains_violations(root, &files, &forbidden);
-    assert!(
-        violations.is_empty(),
-        "protocol-specific IO vocabulary belongs under src/protocol/event_modules, not src/core:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
-fn core_has_no_domain_vocabulary() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let core_root = root.join("src/core");
-    let files = rust_files(&core_root);
-    let forbidden = [
-        "workspace",
-        "content",
-        "endpoint",
-        "identity",
-        "invite",
-        "bootstrap",
-        "negentropy",
-        "message",
-        "reaction",
-        "file_transfer",
-    ];
-    let violations = file_contains_violations(root, &files, &forbidden);
-    assert!(
-        violations.is_empty(),
-        "domain vocabulary belongs under src/protocol/event_modules, not src/core:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
-fn store_uses_generic_storage_vocabulary() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let files = [root.join("src/core/store.rs")];
-    let forbidden = [
-        "bucket",
-        "EventLabel",
-        "event_labels",
-        "module_rows",
-        "payload_len",
-        "Network",
-        "Tcp",
-        "SocketAddr",
-    ];
-    let violations = file_contains_violations(root, &files, &forbidden);
-    assert!(
-        violations.is_empty(),
-        "store owns generic mechanics, not sync buckets, module-row escape hatches, payload semantics, or network queue semantics:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
-fn core_network_queues_are_opaque_byte_rows() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let files = [root.join("src/core/network_queues.rs")];
-    let forbidden = [
-        "EventRecord",
-        "canonical",
-        "event_id",
-        "connection_id",
-        "workspace",
-        "transit",
-        "invite",
-        "sync",
-        "bootstrap",
-        "outbox",
-    ];
-    let violations = file_contains_violations(root, &files, &forbidden);
-    assert!(
-        violations.is_empty(),
-        "core/network_queues.rs owns opaque byte rows only, not protocol meaning:\n{}",
-        violations.join("\n")
     );
 }
 
@@ -773,237 +987,6 @@ fn tcp_uses_network_queue_helpers_not_table_names() {
             "core/tcp.rs should not manage queue schema or row encoding directly: contains {forbidden}"
         );
     }
-}
-
-#[test]
-fn core_tcp_is_opaque_frame_transport() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let files = [root.join("src/core/tcp.rs")];
-    let forbidden = [
-        "EventRecord",
-        "canonical",
-        "event_id",
-        "connection_id",
-        "workspace",
-        "transit",
-        "invite",
-        "sync",
-        "bootstrap",
-        "outbox",
-    ];
-    let violations = file_contains_violations(root, &files, &forbidden);
-    assert!(
-        violations.is_empty(),
-        "core/tcp.rs owns length-prefixed opaque frames only, not protocol meaning:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
-fn sync_event_module_does_not_own_transport_or_frame_io() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let sync_root = root.join("src/protocol/event_modules/sync");
-    let files = rust_files(&sync_root);
-    let forbidden = [
-        "TcpStream",
-        "TcpListener",
-        "crate::protocol::network",
-        "read_frame",
-        "write_frame",
-    ];
-    let violations = file_contains_violations(root, &files, &forbidden);
-    assert!(
-        violations.is_empty(),
-        "sync event modules must not own TCP transport or frame IO:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
-fn event_module_commands_do_not_mutate_storage_directly() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let event_root = root.join("src/protocol/event_modules");
-    let files = rust_files(&event_root)
-        .into_iter()
-        .filter(|path| path.file_name().is_some_and(|name| name == "commands.rs"))
-        .collect::<Vec<_>>();
-    let forbidden = [
-        "use crate::core::store::Store",
-        "&Store",
-        "Store,",
-        "Store)",
-        "ProjectionOutput",
-        "TableRow",
-        "with_changes",
-        ".rows",
-        "write_transaction",
-        "insert_table_rows",
-        "insert_event(",
-        "set_event_status",
-        "delete_dependency_wait",
-        "insert_blocked_event_missing_dep",
-        "delete_blocked_events_by_missing_dep",
-        "drain_until_idle",
-        "rusqlite",
-    ];
-    let violations = file_contains_violations(root, &files, &forbidden);
-    assert!(
-        violations.is_empty(),
-        "commands receive explicit context and return CommandOutput events only; projectors/workers/store own rows and writes:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
-fn event_modules_do_not_import_runtime_worker_or_transport() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let event_root = root.join("src/protocol/event_modules");
-    let files = rust_files(&event_root)
-        .into_iter()
-        .filter(|path| path != &event_root.join("mod.rs"))
-        .filter(|path| path.file_name().is_none_or(|name| name != "worker.rs"))
-        .collect::<Vec<_>>();
-    let forbidden = [
-        "crate::runtime",
-        "crate::state",
-        "crate::core::worker",
-        "crate::core::control_loop",
-        "crate::core::wire",
-        "PipelineActor",
-        "drain_until_idle",
-        "protocol::network",
-        "TcpStream",
-        "TcpListener",
-        "read_frame",
-        "write_frame",
-        "NetworkOp",
-        "StoreOp",
-        "ProtocolEffect",
-        "TransportSend",
-    ];
-    let violations = file_contains_violations(root, &files, &forbidden);
-    assert!(
-        violations.is_empty(),
-        "event modules own protocol semantics, not runtime loops or transport implementation:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
-fn event_module_projectors_do_not_query_storage_directly() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let event_root = root.join("src/protocol/event_modules");
-    let files = rust_files(&event_root)
-        .into_iter()
-        .filter(|path| path.file_name().is_some_and(|name| name == "projector.rs"))
-        .collect::<Vec<_>>();
-    let forbidden = [
-        "use crate::core::store::Store",
-        "&Store",
-        "Store,",
-        "Store)",
-        "table_row",
-        "event_bytes",
-        "has_event",
-        "write_transaction",
-        "rusqlite",
-    ];
-    let violations = file_contains_violations(root, &files, &forbidden);
-    assert!(
-        violations.is_empty(),
-        "projectors are pure transforms over event plus explicit context; queries belong outside projector.rs:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
-fn event_module_queries_are_read_only() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let event_root = root.join("src/protocol/event_modules");
-    let files = rust_files(&event_root)
-        .into_iter()
-        .filter(|path| path.file_name().is_some_and(|name| name == "queries.rs"))
-        .collect::<Vec<_>>();
-    let forbidden = [
-        "delete_table_rows",
-        "insert_table_rows",
-        "write_transaction",
-        "insert_event",
-        "set_event_status",
-        "delete_dependency_wait",
-        "insert_blocked_event_missing_dep",
-        "delete_blocked_events_by_missing_dep",
-    ];
-    let violations = file_contains_violations(root, &files, &forbidden);
-    assert!(
-        violations.is_empty(),
-        "queries.rs is read-only; mutations belong in workers or core write paths:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
-fn event_module_projectors_do_not_do_transit_or_crypto_work() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let event_root = root.join("src/protocol/event_modules");
-    let files = rust_files(&event_root)
-        .into_iter()
-        .filter(|path| path.file_name().is_some_and(|name| name == "projector.rs"))
-        .collect::<Vec<_>>();
-    let forbidden = ["transit", "crypto", "encrypt", "decrypt", "unwrap("];
-    let violations = file_contains_violations(root, &files, &forbidden);
-    assert!(
-        violations.is_empty(),
-        "projectors write rows; transit wrapping/unwrapping and crypto belong in commands/workers/helpers:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
-fn event_module_projectors_are_row_only_boundaries() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let event_root = root.join("src/protocol/event_modules");
-    let files = rust_files(&event_root)
-        .into_iter()
-        .filter(|path| path.file_name().is_some_and(|name| name == "projector.rs"))
-        .collect::<Vec<_>>();
-    let forbidden = [
-        "CommandOutput",
-        "ProposedEvent",
-        "EventRecord {",
-        "ProtocolEffect",
-        "NetworkOp",
-        "StoreOp",
-        "TransportSend",
-        "TcpStream",
-        "TcpListener",
-        "create_connection(",
-        "create_bootstrap(",
-    ];
-    let violations = file_contains_violations(root, &files, &forbidden);
-    assert!(
-        violations.is_empty(),
-        "projectors are row-only; emitting events/effects or doing transit work belongs in commands/workers:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
-fn event_module_types_do_not_store_encoded_event_artifacts() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let event_root = root.join("src/protocol/event_modules");
-    let files = rust_files(&event_root)
-        .into_iter()
-        .filter(|path| path.file_name().is_some_and(|name| name == "types.rs"))
-        .filter(|path| path != &event_root.join("types.rs"))
-        .collect::<Vec<_>>();
-    let forbidden = ["canonical_bytes", "encoded_event", "wire_event"];
-    let violations = file_contains_violations(root, &files, &forbidden);
-    assert!(
-        violations.is_empty(),
-        "types.rs should define semantic shapes; canonical bytes live at codec/boundary layers:\n{}",
-        violations.join("\n")
-    );
 }
 
 #[test]
@@ -1170,149 +1153,10 @@ fn projection_output_contains_rows_and_labels_not_events() {
 }
 
 #[test]
-fn sync_event_module_does_not_use_session_message_vocabulary() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let sync_root = root.join("src/protocol/event_modules/sync");
-    let files = rust_files(&sync_root);
-    let forbidden = ["Hello", "HelloAck", "Done", "Events"];
-    let violations = file_contains_violations(root, &files, &forbidden);
-    assert!(
-        violations.is_empty(),
-        "sync protocol items must be connection-scoped events, not session messages:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
-fn core_files_do_not_contain_sync_protocol_logic() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let files = [
-        "src/main.rs",
-        "src/core/store.rs",
-        "src/core/network_queues.rs",
-        "src/core/tcp.rs",
-        "src/protocol/event_modules/worker.rs",
-    ];
-    let forbidden = ["negentropy", "Compare", "Have", "Need", "differing_buckets"];
-    let mut violations = Vec::new();
-    for file in files {
-        let text = std::fs::read_to_string(root.join(file)).expect("read file");
-        for needle in forbidden {
-            if text.contains(needle) {
-                violations.push(format!("{file} contains {needle}"));
-            }
-        }
-    }
-    assert!(
-        violations.is_empty(),
-        "sync protocol logic belongs in protocol/event_modules/sync:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
 fn protocol_network_module_does_not_exist() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     assert!(
         !root.join("src/protocol/network.rs").exists(),
         "protocol/network.rs is forbidden; raw TCP mechanics live in core/tcp.rs and protocol meaning lives in event modules"
-    );
-}
-
-#[test]
-fn protocol_cli_does_not_use_socket_primitives() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let files = [root.join("src/protocol/cli.rs")];
-    let forbidden = [
-        "TcpStream",
-        "TcpListener",
-        "Shutdown",
-        "read_frame",
-        "write_frame",
-        "connect_timeout",
-        ".accept()",
-        ".read_exact(",
-        ".write_all(",
-    ];
-    let violations = file_contains_violations(root, &files, &forbidden);
-    assert!(
-        violations.is_empty(),
-        "protocol/cli.rs may invoke core TCP runtime helpers, but must not own socket/frame mechanics:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
-fn crux_core_is_isolated_to_core() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let core_root = root.join("src/core");
-    let files = rust_files(&root.join("src"))
-        .into_iter()
-        .filter(|path| !path.starts_with(&core_root))
-        .collect::<Vec<_>>();
-    let violations = file_contains_violations(root, &files, &["crux_core", "ProtocolApp"]);
-    assert!(
-        violations.is_empty(),
-        "Crux is a core runner detail; protocol code should not define Crux app/model/effect layers:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
-fn source_does_not_contain_fake_crypto_claims() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let this_file = root
-        .join("tests/rules_boundary_test.rs")
-        .canonicalize()
-        .ok();
-    let files = rust_files(&root.join("src"))
-        .into_iter()
-        .chain(rust_files(&root.join("tests")))
-        .filter(|path| path.canonicalize().ok() != this_file)
-        .collect::<Vec<_>>();
-    let forbidden = [
-        "fake crypto",
-        "fake encryption",
-        "pass-through encryption",
-        "identity cipher",
-        "encrypted in name only",
-        "toy encryption",
-    ];
-    let violations = file_contains_violations(root, &files, &forbidden);
-    assert!(
-        violations.is_empty(),
-        "do not name fake or placeholder crypto as real protection:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
-fn core_storage_and_transport_do_not_own_connection_or_bootstrap_schema() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let files = [
-        "src/core/store.rs",
-        "src/core/network_queues.rs",
-        "src/core/tcp.rs",
-    ];
-    let forbidden = [
-        "peer",
-        "bootstrap",
-        "connection_id",
-        "connection_events",
-        "connection.",
-    ];
-    let mut violations = Vec::new();
-    for file in files {
-        let text = std::fs::read_to_string(root.join(file)).expect("read file");
-        for needle in forbidden {
-            if text.contains(needle) {
-                violations.push(format!("{file} contains {needle}"));
-            }
-        }
-    }
-    assert!(
-        violations.is_empty(),
-        "connection/bootstrap storage belongs in protocol/event_modules/connection:\n{}",
-        violations.join("\n")
     );
 }
