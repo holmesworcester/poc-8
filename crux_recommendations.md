@@ -211,8 +211,9 @@ Crux Event::SchedulerWake
 
 ## What The Prototypes Showed
 
-All six experiments are standalone Cargo crates under `crux_experiments/`.
-They compile against `crux_core 0.17.x` and have passing tests.
+Six standalone Crux prototypes were used to compare shapes. Their throwaway
+crates have been removed; the durable output is this summary plus the real
+`poc-8` implementation and tests.
 
 | Experiment | Result | What it proves | Main limitation |
 | --- | --- | --- | --- |
@@ -222,17 +223,6 @@ They compile against `crux_core 0.17.x` and have passing tests.
 | `04_effect_shell` | `2 passed` | Explicit Store/TCP/RNG/Clock/Stdout operations can be interpreted by a fake shell with transcript tests. | Adds boilerplate for operation/reply enums and `From<Request<_>>` implementations. |
 | `05_sync_state_machine` | `2 passed` | Crux can orchestrate protocol messages while a pure connection/sync state machine owns transitions. | The prototype is single-peer and omits retries, backoff, and backpressure. |
 | `06_test_harness_guardrails` | `4 passed` | Fake shell transcript tests and dependency-drain invariants can constrain LLM edits. | Runtime invariant checks are not full formal proofs. |
-
-Verified locally with:
-
-```sh
-cargo test # in crux_experiments/01_facade_wrap_pipeline
-cargo test --manifest-path Cargo.toml # in crux_experiments/02_pure_planner_effects
-cargo test # in crux_experiments/03_module_deciders
-cargo test # in crux_experiments/04_effect_shell
-cargo test --manifest-path Cargo.toml # in crux_experiments/05_sync_state_machine
-cargo test # in crux_experiments/06_test_harness_guardrails
-```
 
 ## Recommended Architecture
 
