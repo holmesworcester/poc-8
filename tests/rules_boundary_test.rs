@@ -1529,13 +1529,16 @@ fn projector_files_are_not_empty_placeholders() {
         .filter(|path| path.file_name().is_some_and(|name| name == "projector.rs"))
     {
         let text = source_text(&path);
-        if !text.contains("ProjectionOutput::rows") && !text.contains("ProjectionOutput::with") {
+        if !text.contains("ProjectionOutput::rows")
+            && !text.contains("ProjectionOutput::deletes")
+            && !text.contains("ProjectionOutput::with")
+        {
             violations.push(path.strip_prefix(root).unwrap().display().to_string());
         }
     }
     assert!(
         violations.is_empty(),
-        "omit projector.rs when a module has no row/label projection; projector files must write real projection output:\n{}",
+        "omit projector.rs when a module has no row/label/delete projection; projector files must write real projection output:\n{}",
         violations.join("\n")
     );
 }
@@ -1667,7 +1670,7 @@ fn proposed_event_carries_deterministic_id_and_record() {
 }
 
 #[test]
-fn projection_output_contains_rows_and_labels_not_events() {
+fn projection_output_contains_rows_deletes_and_labels_not_events() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(root.join("src/protocol/event_modules/worker.rs"))
         .expect("read worker");
@@ -1677,10 +1680,11 @@ fn projection_output_contains_rows_and_labels_not_events() {
     let body = &text[start..text[start..].find("impl ProjectionOutput").unwrap() + start];
     assert!(
         body.contains("pub rows: Vec<TableRow>")
+            && body.contains("pub deletes: Vec<TableDelete>")
             && body.contains("pub labels: Vec<schema::EventLabel>")
             && !body.contains("EventRecord")
             && !body.contains("events"),
-        "ProjectionOutput is projector-facing and must carry rows/labels only, not events"
+        "ProjectionOutput is projector-facing and must carry rows/labels/deletes only, not events"
     );
 }
 

@@ -97,7 +97,8 @@ The following rules should stay mechanically enforced where practical:
   effects, or storage writes. `ProposedEvent` is constructed from an
   `EventRecord` and carries both the deterministic `event_id` and that
   canonical record.
-- Projectors return `ProjectionOutput` with `Vec<TableRow>`, not events.
+- Projectors return `ProjectionOutput` with rows, exact row deletes, and labels,
+  not events.
 - `commands.rs` is reserved for event modules. CLI adapters live in
   module-local or domain-local `cli.rs`; `src/protocol/cli.rs` only aggregates
   scoped command specs, and `src/core/cli.rs` only dispatches generic command
@@ -237,12 +238,13 @@ not return rows or effects. The API that runs a command is responsible for
 admitting those proposed events through the worker; admission returns the
 event ids for chaining.
 
-Projectors return `ProjectionOutput` with table rows and generic event labels
-only. They cannot emit events. If projection discovers follow-on work, it writes
-a module-owned queue row; a module worker reads that queue, queries context,
-runs a command, and sends the command's proposed events back through the worker.
-Generic event labels are protocol event-module state declared under
-`protocol/event_modules/schema.rs`; they are not a core store concept.
+Projectors return `ProjectionOutput` with table rows, exact row deletes, and
+generic event labels only. They cannot emit events. If projection discovers
+follow-on work, it writes a module-owned queue row; a module worker reads that
+queue, queries context, runs a command, and sends the command's proposed events
+back through the worker. Generic event labels are protocol event-module state
+declared under `protocol/event_modules/schema.rs`; they are not a core store
+concept.
 
 Module workers are the active boundary. A `worker.rs` file exports exactly one
 public free function, `run`; work/output types may be public, and all helper

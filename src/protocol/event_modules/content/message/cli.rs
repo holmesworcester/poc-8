@@ -60,16 +60,14 @@ pub struct MessageDisplay {
     pub text: String,
     pub reactions: Vec<String>,
     pub files: Vec<String>,
-    pub deleted: bool,
 }
 
 impl MessageDisplay {
     pub fn lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
-        let suffix = if self.deleted { " (deleted)" } else { "" };
         lines.push(format!(
-            "{}. [{}] {}{}: {}",
-            self.index, self.created_at_ms, self.author_username, suffix, self.text
+            "{}. [{}] {}: {}",
+            self.index, self.created_at_ms, self.author_username, self.text
         ));
         if !self.reactions.is_empty() {
             lines.push(format!("   reactions: {}", self.reactions.join(" ")));
@@ -137,8 +135,7 @@ fn run_messages_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliO
     };
 
     let messages = list_for_display(&context.store, workspace_id, limit)?;
-    let visible_count = messages.iter().filter(|message| !message.deleted).count();
-    let mut lines = vec![format!("messages: {}", visible_count)];
+    let mut lines = vec![format!("messages: {}", messages.len())];
     for message in &messages {
         lines.extend(message.lines());
     }
@@ -150,7 +147,7 @@ pub fn list_for_display(
     workspace_id: EventId,
     limit: usize,
 ) -> Result<Vec<MessageDisplay>, String> {
-    let mut messages = schema::list_for_workspace(store, workspace_id)?;
+    let mut messages = visible_message_rows(store, workspace_id)?;
     let total = messages.len();
     let take = if limit == 0 || limit >= total {
         total
@@ -165,7 +162,6 @@ pub fn list_for_display(
     let mut display = Vec::with_capacity(messages.len());
     for (idx, row) in messages.into_iter().enumerate() {
         let author_username = user_name(store, workspace_id, row.author_user_id)?;
-        let deleted = is_deleted_by_author(store, &row.message_id, &row.author_user_id)?;
         let reactions_for = reactions.get(&row.message_id).cloned().unwrap_or_default();
         let files_for = files
             .get(&row.message_id)
@@ -182,7 +178,6 @@ pub fn list_for_display(
             text: row.text,
             reactions: reactions_for,
             files: files_for,
-            deleted,
         });
     }
     Ok(display)
@@ -190,10 +185,10 @@ pub fn list_for_display(
 
 /// True iff the target message id has a deletion label authored by `author_user_id`.
 ///
-/// Read-time filter for the delete-after-create case: the message row was
-/// projected before the deletion arrived, so it sits in storage but display
-/// queries hide it. The projector handles the delete-before-create case at
-/// project time.
+/// Projectors now purge message rows for both message-before-tombstone and
+/// tombstone-before-message orders. The read-side check remains as a defensive
+/// compatibility filter for rows written by older code or interrupted test
+/// fixtures; it should not be the primary deletion mechanism.
 pub(crate) fn is_deleted_by_author(
     store: &Store,
     message_id: &EventId,
@@ -208,6 +203,22 @@ pub(crate) fn is_deleted_by_author(
     }))
 }
 
+fn visible_message_rows(
+    store: &Store,
+    workspace_id: EventId,
+) -> Result<Vec<super::types::MessageRow>, String> {
+    schema::list_for_workspace(store, workspace_id)?
+        .into_iter()
+        .filter_map(
+            |row| match is_deleted_by_author(store, &row.message_id, &row.author_user_id) {
+                Ok(false) => Some(Ok(row)),
+                Ok(true) => None,
+                Err(err) => Some(Err(err)),
+            },
+        )
+        .collect()
+}
+
 pub fn resolve_selector(
     store: &Store,
     workspace_id: EventId,
@@ -220,7 +231,7 @@ pub fn resolve_selector(
         if number == 0 {
             return Err(format!("invalid message selector: {selector}"));
         }
-        let messages = schema::list_for_workspace(store, workspace_id)?;
+        let messages = visible_message_rows(store, workspace_id)?;
         let row = messages
             .get(number - 1)
             .ok_or_else(|| format!("message #{number} does not exist"))?;

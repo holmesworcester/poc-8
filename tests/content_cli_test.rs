@@ -55,7 +55,7 @@ fn cli_react_appears_in_messages_listing() {
 }
 
 #[test]
-fn cli_delete_message_marks_target_in_listing() {
+fn cli_delete_message_purges_target_from_listing() {
     let tmp = tempfile::tempdir().unwrap();
     let db = temp_db(&tmp, "alice.db");
     let workspace_id = create_workspace(&db, "Content", "alice", "alice-laptop");
@@ -70,8 +70,9 @@ fn cli_delete_message_marks_target_in_listing() {
     assert!(deleted.contains("event_id:"), "{deleted}");
 
     let after = assert_success(topo(&["--db", &db, "messages", &workspace_id]));
-    assert!(after.contains("(deleted)"), "{after}");
     assert_eq!(line_value(&after, "messages"), "0");
+    assert!(!after.contains("(deleted)"), "{after}");
+    assert!(!after.contains("regret"), "{after}");
 }
 
 #[test]
@@ -95,6 +96,7 @@ fn cli_send_file_then_save_file_round_trips_bytes_through_real_binary() {
     ]));
     assert!(sent.contains("filename: input.bin"), "{sent}");
     assert_eq!(line_value(&sent, "blob_bytes"), "8192");
+    let file_event_id = line_value(&sent, "file_event_id");
 
     let files = assert_success(topo(&["--db", &db, "files", &workspace_id]));
     assert_eq!(line_value(&files, "files"), "1");
@@ -120,6 +122,27 @@ fn cli_send_file_then_save_file_round_trips_bytes_through_real_binary() {
 
     let read_back = fs::read(&out_path).expect("read output");
     assert_eq!(read_back, payload);
+
+    assert_success(topo(&["--db", &db, "delete-message", &workspace_id, "#1"]));
+    let messages_after_delete = assert_success(topo(&["--db", &db, "messages", &workspace_id]));
+    assert_eq!(line_value(&messages_after_delete, "messages"), "0");
+    let files_after_delete = assert_success(topo(&["--db", &db, "files", &workspace_id]));
+    assert_eq!(line_value(&files_after_delete, "files"), "0");
+
+    let hidden_save = topo(&[
+        "--db",
+        &db,
+        "save-file",
+        &workspace_id,
+        &file_event_id,
+        out_path.to_str().expect("path utf-8"),
+    ]);
+    assert!(
+        !hidden_save.status.success(),
+        "deleted parent message must hide direct file saves\nstdout={}\nstderr={}",
+        stdout(&hidden_save),
+        stderr(&hidden_save)
+    );
 }
 
 #[test]

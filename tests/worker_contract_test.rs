@@ -1,12 +1,12 @@
 use std::cell::Cell;
 
-use topo::core::store::Store;
-use topo::protocol::event_modules::content::content_event;
+use topo::core::store::{Store, TableRow};
+use topo::protocol::event_modules::content::{content_event, message};
 use topo::protocol::event_modules::identity::{endpoint, endpoint_shared};
 use topo::protocol::event_modules::schema::{self as event_schema, EventLabel};
 use topo::protocol::event_modules::types::{event_id, EventId, EventRecord, EventScope};
 use topo::protocol::event_modules::worker::{
-    self, CommandOutput, EventRegistry, EventWithContext, ProjectionOutput,
+    self, CommandOutput, EventRegistry, EventWithContext, ProjectionOutput, TableDelete,
 };
 use topo::protocol::event_modules::Modules;
 use topo::protocol::Protocol;
@@ -186,6 +186,40 @@ fn drain_ready_batch_applies_only_one_batch() {
 }
 
 #[test]
+fn projector_output_deletes_exact_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Protocol::open_store(tmp.path().join("delete-row.db")).unwrap();
+    let workspace_id = [7; 32];
+    let message_id = [8; 32];
+    let row_key = message::schema::message_key(workspace_id, message_id);
+    store
+        .insert_table_rows(vec![TableRow {
+            table: message::schema::MESSAGES,
+            key: row_key.clone(),
+            value: b"legacy projected message row".to_vec(),
+        }])
+        .expect("seed projected row");
+
+    let registry = DeleteRowRegistry {
+        bytes: b"delete-row".to_vec(),
+        delete_key: row_key.clone(),
+    };
+    let event = registry.record_for(registry.bytes.clone()).unwrap();
+    let (_, report) = worker::run(
+        &store,
+        &registry,
+        CommandOutput::with_events((), vec![event]),
+    )
+    .unwrap();
+
+    assert_eq!(report.applied_events, 1);
+    assert!(store
+        .table_row(message::schema::MESSAGES, &row_key)
+        .expect("read projected row")
+        .is_none());
+}
+
+#[test]
 fn worker_never_surfaces_failed_projection_as_dependency_context() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Protocol::open_store(tmp.path().join("invalid-context.db")).unwrap();
@@ -316,6 +350,27 @@ struct ValidDependencyContextRegistry {
     bad_dep_bytes: Vec<u8>,
     child_bytes: Vec<u8>,
     child_saw_context: Cell<bool>,
+}
+
+struct DeleteRowRegistry {
+    bytes: Vec<u8>,
+    delete_key: Vec<u8>,
+}
+
+impl DeleteRowRegistry {
+    fn record_for(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
+        if bytes != self.bytes {
+            return Err("unknown delete-row test event".to_string());
+        }
+        Ok(EventRecord {
+            timestamp: 1,
+            body_len: bytes.len(),
+            canonical_bytes: bytes,
+            dependencies: Vec::new(),
+            workspace_id: Some([7; 32]),
+            scope: EventScope::Shared,
+        })
+    }
 }
 
 impl ContextRegistry {
@@ -465,5 +520,22 @@ impl EventRegistry for ValidDependencyContextRegistry {
             panic!("child must remain blocked until bad dependency is applied");
         }
         Err("unknown projection".to_string())
+    }
+}
+
+impl EventRegistry for DeleteRowRegistry {
+    fn record_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
+        self.record_for(bytes)
+    }
+
+    fn project_record(
+        &self,
+        _store: &Store,
+        _event: &EventWithContext<'_>,
+    ) -> Result<ProjectionOutput, String> {
+        Ok(ProjectionOutput::deletes(vec![TableDelete {
+            table: message::schema::MESSAGES,
+            key: self.delete_key.clone(),
+        }]))
     }
 }

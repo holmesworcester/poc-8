@@ -8,7 +8,7 @@
 
 use crate::protocol::event_modules::content::message_deletion::types::deletion_label_author;
 use crate::protocol::event_modules::identity::{endpoint_shared, signed, user};
-use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput};
+use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput, TableDelete};
 
 use super::{codec, schema};
 
@@ -56,16 +56,18 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
     }
 
     // Purge-on-project: a deletion event labels its target message id with
-    // `content.deleted:<author_user_id>`. If any deletion label authored by
-    // this same user exists, the message is treated as already deleted and we
-    // emit no row. Labels are loaded into `event.context` for this event id.
+    // `content.deleted:<author_user_id>`. If the tombstone arrived first, the
+    // message is valid but must not leave a visible row behind.
     let is_deleted_by_author = event.context.labels.iter().any(|label| {
         deletion_label_author(label)
             .map(|author| author == message.author_user_id)
             .unwrap_or(false)
     });
     if is_deleted_by_author {
-        return Ok(ProjectionOutput::default());
+        return Ok(ProjectionOutput::deletes(vec![TableDelete {
+            table: schema::MESSAGES,
+            key: schema::message_key(message.workspace_id, event.context.event_id),
+        }]));
     }
 
     Ok(ProjectionOutput::rows(vec![schema::message_row(
@@ -338,6 +340,12 @@ mod tests {
         let output = project(&event).expect("project deleted message");
         assert!(output.rows.is_empty());
         assert!(output.labels.is_empty());
+        assert_eq!(output.deletes.len(), 1);
+        assert_eq!(output.deletes[0].table, schema::MESSAGES);
+        assert_eq!(
+            output.deletes[0].key,
+            schema::message_key(workspace_id, message_id)
+        );
     }
 
     #[test]
@@ -365,6 +373,7 @@ mod tests {
 
         let output = project(&event).expect("project not-by-author label");
         assert_eq!(output.rows.len(), 1);
+        assert!(output.deletes.is_empty());
     }
 
     #[test]

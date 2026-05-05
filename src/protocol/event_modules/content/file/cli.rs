@@ -46,18 +46,15 @@ pub struct FileSummary {
     pub total_slices: u32,
     pub slices_received: u32,
     pub bytes_received: u64,
-    pub deleted: bool,
 }
 
 impl FileSummary {
     pub fn lines(&self) -> Vec<String> {
         let mut out = Vec::new();
-        let suffix = if self.deleted { " (deleted)" } else { "" };
         out.push(format!(
-            "{}. {}{} ({}/{} slices, {} of {} bytes)",
+            "{}. {} ({}/{} slices, {} of {} bytes)",
             self.index,
             self.filename,
-            suffix,
             self.slices_received,
             self.total_slices,
             self.bytes_received,
@@ -113,6 +110,9 @@ fn run_save_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
 
     let row = schema::file_row_by_id(&context.store, workspace_id, file_event_id)?
         .ok_or_else(|| "file does not exist".to_string())?;
+    if message::cli::is_deleted_by_author(&context.store, &row.message_id, &row.author_user_id)? {
+        return Err("file does not exist".to_string());
+    }
     let slices = file_slice::schema::list_for_file(&context.store, workspace_id, row.file_id)?;
     if slices.len() < row.total_slices as usize {
         return Err(format!(
@@ -149,7 +149,7 @@ pub fn list_summaries(
     workspace_id: EventId,
     limit: usize,
 ) -> Result<Vec<FileSummary>, String> {
-    let mut rows = schema::list_for_workspace(store, workspace_id)?;
+    let mut rows = visible_file_rows(store, workspace_id)?;
     let total = rows.len();
     let take = if limit == 0 || limit >= total {
         total
@@ -163,8 +163,6 @@ pub fn list_summaries(
         let slices = file_slice::schema::list_for_file(store, workspace_id, row.file_id)?;
         let slices_received = u32::try_from(slices.len()).unwrap_or(u32::MAX);
         let bytes_received: u64 = slices.iter().map(|slice| slice.data.len() as u64).sum();
-        let deleted =
-            message::cli::is_deleted_by_author(store, &row.message_id, &row.author_user_id)?;
         summaries.push(FileSummary {
             index: start + idx + 1,
             file_event_id: row.file_event_id,
@@ -176,10 +174,25 @@ pub fn list_summaries(
             total_slices: row.total_slices,
             slices_received,
             bytes_received,
-            deleted,
         });
     }
     Ok(summaries)
+}
+
+fn visible_file_rows(
+    store: &Store,
+    workspace_id: EventId,
+) -> Result<Vec<super::types::FileRow>, String> {
+    schema::list_for_workspace(store, workspace_id)?
+        .into_iter()
+        .filter_map(|row| {
+            match message::cli::is_deleted_by_author(store, &row.message_id, &row.author_user_id) {
+                Ok(false) => Some(Ok(row)),
+                Ok(true) => None,
+                Err(err) => Some(Err(err)),
+            }
+        })
+        .collect()
 }
 
 fn resolve_file_selector(
@@ -194,7 +207,7 @@ fn resolve_file_selector(
         if number == 0 {
             return Err(format!("invalid file selector: {selector}"));
         }
-        let rows = schema::list_for_workspace(store, workspace_id)?;
+        let rows = visible_file_rows(store, workspace_id)?;
         let row = rows
             .get(number - 1)
             .ok_or_else(|| format!("file #{number} does not exist"))?;

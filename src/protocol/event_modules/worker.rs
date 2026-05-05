@@ -52,7 +52,7 @@
 //! suspicious change adds a second path that stores, projects, unblocks, or sends
 //! around this path.
 
-use crate::core::store::{Store, TableRow};
+use crate::core::store::{Store, TableName, TableRow};
 use crate::protocol::event_modules::types::{
     event_id, EventId, EventRecord, EventStatus, ReceiveMetadata,
 };
@@ -121,16 +121,28 @@ impl From<EventRecord> for ProposedEvent {
     }
 }
 
+/// One exact row deletion requested by a projector.
+///
+/// This is still row-shaped output, not an imperative storage escape hatch.
+/// Projectors choose keys from event bytes and context; the common worker owns
+/// actually applying the delete in the same transaction as row/label writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableDelete {
+    pub table: TableName,
+    pub key: Vec<u8>,
+}
+
 /// Declarative output of a projector.
 ///
 /// A projector may only return rows in protocol-owned state: ordinary table rows
-/// and generic event labels. It may not emit more events, call a worker, send
-/// bytes, or query broad state. If projection appears to need one of those
-/// powers, the event module should write a queue row and let its domain worker
-/// perform the active step later.
+/// exact row deletes, and generic event labels. It may not emit more events,
+/// call a worker, send bytes, or query broad state. If projection appears to
+/// need one of those powers, the event module should write a queue row and let
+/// its domain worker perform the active step later.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectionOutput {
     pub rows: Vec<TableRow>,
+    pub deletes: Vec<TableDelete>,
     pub labels: Vec<schema::EventLabel>,
 }
 
@@ -138,6 +150,15 @@ impl ProjectionOutput {
     pub fn rows(rows: Vec<TableRow>) -> Self {
         Self {
             rows,
+            deletes: Vec::new(),
+            labels: Vec::new(),
+        }
+    }
+
+    pub fn deletes(deletes: Vec<TableDelete>) -> Self {
+        Self {
+            rows: Vec::new(),
+            deletes,
             labels: Vec::new(),
         }
     }
@@ -145,16 +166,30 @@ impl ProjectionOutput {
     pub fn labels(labels: Vec<schema::EventLabel>) -> Self {
         Self {
             rows: Vec::new(),
+            deletes: Vec::new(),
             labels,
         }
     }
 
     pub fn rows_and_labels(rows: Vec<TableRow>, labels: Vec<schema::EventLabel>) -> Self {
-        Self { rows, labels }
+        Self {
+            rows,
+            deletes: Vec::new(),
+            labels,
+        }
+    }
+
+    pub fn deletes_and_labels(deletes: Vec<TableDelete>, labels: Vec<schema::EventLabel>) -> Self {
+        Self {
+            rows: Vec::new(),
+            deletes,
+            labels,
+        }
     }
 
     pub fn append(&mut self, mut other: Self) {
         self.rows.append(&mut other.rows);
+        self.deletes.append(&mut other.deletes);
         self.labels.append(&mut other.labels);
     }
 }
@@ -734,7 +769,11 @@ fn write_projection_output_in_tx(
 ) -> rusqlite::Result<usize> {
     let rows = store.insert_table_rows_in_tx(changes.rows)?;
     let labels = store.insert_table_rows_in_tx(schema::event_label_rows(changes.labels))?;
-    Ok(rows + labels)
+    let mut deletes = 0;
+    for delete in changes.deletes {
+        deletes += store.delete_table_rows_in_tx(delete.table, vec![delete.key])?;
+    }
+    Ok(rows + labels + deletes)
 }
 
 fn drain_ready(

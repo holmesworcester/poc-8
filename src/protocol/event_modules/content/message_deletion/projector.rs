@@ -1,14 +1,16 @@
 //! Projector for signed message deletions.
 //!
-//! Deletion is projected as a single generic event label attached to the
-//! target message id. The label payload encodes the deletion's `author_user_id`
-//! so the message projector can purge-on-project iff the deleting user equals
-//! the message's own author. The deletion event does not depend on the target
-//! message; admission and projection are convergent under any arrival order.
+//! Deletion is projected as a generic event label attached to the target
+//! message id plus an exact delete for the message projection row. The label
+//! handles tombstone-before-message order; the delete handles
+//! message-before-tombstone order. The deletion event does not depend on the
+//! target message, so admission and projection are convergent under either
+//! arrival order.
 
+use crate::protocol::event_modules::content::message;
 use crate::protocol::event_modules::identity::{endpoint_shared, signed, user};
 use crate::protocol::event_modules::schema::EventLabel;
-use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput};
+use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput, TableDelete};
 
 use super::codec;
 use super::types::deletion_label;
@@ -58,8 +60,11 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
         return Err("deletion author workspace does not match deletion".to_string());
     }
 
-    Ok(ProjectionOutput::rows_and_labels(
-        Vec::new(),
+    Ok(ProjectionOutput::deletes_and_labels(
+        vec![TableDelete {
+            table: message::schema::MESSAGES,
+            key: message::schema::message_key(deletion.workspace_id, deletion.target_message_id),
+        }],
         vec![EventLabel {
             event_id: deletion.target_message_id,
             label: deletion_label(&deletion.author_user_id),
@@ -176,6 +181,12 @@ mod tests {
         let output = project(&event).expect("project deletion");
 
         assert!(output.rows.is_empty());
+        assert_eq!(output.deletes.len(), 1);
+        assert_eq!(output.deletes[0].table, message::schema::MESSAGES);
+        assert_eq!(
+            output.deletes[0].key,
+            message::schema::message_key(workspace_id, target_id)
+        );
         assert_eq!(output.labels.len(), 1);
         assert_eq!(output.labels[0].event_id, target_id);
         assert_eq!(output.labels[0].label, deletion_label(&author_id));
