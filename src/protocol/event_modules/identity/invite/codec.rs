@@ -12,10 +12,12 @@ use super::types::InviteSecretEvent;
 pub const TYPE_INVITE_SECRET: u8 = 129;
 
 pub fn encode(event: &InviteSecretEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(1 + 32 + 32);
+    let mut out = Writer::with_capacity(1 + 32 + 32 + 32 + 32);
     out.u8(TYPE_INVITE_SECRET);
     out.id(&event.bootstrap_hash);
     out.id(&event.bootstrap_secret);
+    out.id(&event.workspace_id.unwrap_or([0; 32]));
+    out.id(&event.invite_event_id.unwrap_or([0; 32]));
     out.finish()
 }
 
@@ -28,6 +30,8 @@ pub fn decode(bytes: &[u8]) -> Result<InviteSecretEvent, String> {
     let event = InviteSecretEvent {
         bootstrap_hash: reader.id()?,
         bootstrap_secret: reader.id()?,
+        workspace_id: optional_id(reader.id()?),
+        invite_event_id: optional_id(reader.id()?),
     };
     reader.finish()?;
     event.validate()
@@ -45,6 +49,14 @@ pub fn record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
     })
 }
 
+fn optional_id(id: [u8; 32]) -> Option<[u8; 32]> {
+    if id.iter().all(|byte| *byte == 0) {
+        None
+    } else {
+        Some(id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::protocol::event_modules::types::EventScope;
@@ -57,6 +69,8 @@ mod tests {
         let event = InviteSecretEvent {
             bootstrap_hash: [9; 32],
             bootstrap_secret: [7; 32],
+            workspace_id: None,
+            invite_event_id: None,
         };
 
         let err = decode(&encode(&event)).expect_err("mismatched hash must fail");
@@ -72,6 +86,18 @@ mod tests {
         let err = decode(&bytes).expect_err("trailing byte must fail");
 
         assert!(err.starts_with("trailing "), "{err}");
+    }
+
+    #[test]
+    fn decode_rejects_incomplete_scope() {
+        let event = InviteSecretEvent {
+            workspace_id: Some([1; 32]),
+            ..InviteSecretEvent::new([7; 32])
+        };
+
+        let err = decode(&encode(&event)).expect_err("incomplete scope must fail");
+
+        assert_eq!(err, "invite secret scope is incomplete");
     }
 
     #[test]

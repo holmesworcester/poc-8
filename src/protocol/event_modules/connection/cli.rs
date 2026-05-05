@@ -26,12 +26,6 @@ pub fn commands() -> Vec<CliCommand<Context>> {
             run: run_connect_command,
         },
         CliCommand {
-            name: "accept",
-            usage: "accept INVITE_LINK",
-            help: "Accept an invite over real TCP.",
-            run: run_connect_command,
-        },
-        CliCommand {
             name: "daemon",
             usage: DAEMON_USAGE,
             help: "Run a bounded or long-lived TCP sync daemon.",

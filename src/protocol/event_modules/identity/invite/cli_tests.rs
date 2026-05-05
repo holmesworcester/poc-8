@@ -48,5 +48,10 @@ fn invite_cli_creates_local_endpoint_and_local_invite_secret() {
 
     assert_eq!(endpoint_row, invite.endpoint);
     assert_eq!(endpoint_secret_row.len(), 32);
-    assert_eq!(invite_secret_row, invite.bootstrap_secret);
+    assert_eq!(
+        schema::decode_invite_secret_row(&invite_secret_row)
+            .expect("decode invite secret row")
+            .bootstrap_secret,
+        invite.bootstrap_secret
+    );
 }

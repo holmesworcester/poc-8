@@ -8,6 +8,93 @@ use crate::protocol::event_modules::worker::{self, CommandOutput};
 use crate::protocol::Protocol;
 
 #[test]
+fn identity_cli_create_workspace_builds_creator_graph_and_read_surfaces() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = tmp.path().join("identity.db");
+
+    let created = run_protocol_cli(
+        &db,
+        &[
+            "create-workspace",
+            "Alpha",
+            "--username",
+            "alice",
+            "--devicename",
+            "alice-laptop",
+        ],
+    );
+    let workspace_id = line_value(&created, "workspace_id");
+    let user_id = line_value(&created, "user_id");
+    assert!(!line_value(&created, "admin_id").is_empty());
+
+    let workspaces = run_protocol_cli(&db, &["workspaces"]);
+    assert!(workspaces.contains("Alpha"), "{workspaces}");
+    assert!(workspaces.contains(&workspace_id), "{workspaces}");
+
+    let users = run_protocol_cli(&db, &["users", &workspace_id]);
+    assert!(users.contains("alice"), "{users}");
+    assert!(users.contains(&user_id), "{users}");
+
+    let peers = run_protocol_cli(&db, &["peers", &workspace_id]);
+    assert!(peers.contains("alice-laptop"), "{peers}");
+    assert!(peers.contains(&format!("user_id={user_id}")), "{peers}");
+
+    let identity = run_protocol_cli(&db, &["identity"]);
+    assert!(identity.contains("endpoint_id:"), "{identity}");
+    assert!(identity.contains(&workspace_id), "{identity}");
+    assert!(identity.contains(&user_id), "{identity}");
+}
+
+#[test]
+fn identity_cli_workspace_invite_and_link_create_scoped_real_invite_events() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = tmp.path().join("identity.db");
+
+    let created = run_protocol_cli(
+        &db,
+        &[
+            "create-workspace",
+            "Alpha",
+            "--username",
+            "alice",
+            "--devicename",
+            "alice-laptop",
+        ],
+    );
+    let workspace_id = line_value(&created, "workspace_id");
+
+    let user_invite_link = run_protocol_cli(
+        &db,
+        &[
+            "invite",
+            "--workspace",
+            &workspace_id,
+            "--public-addr",
+            "127.0.0.1:41000",
+        ],
+    );
+    let parsed = super::invite::commands::parse(user_invite_link.trim()).expect("parse invite");
+    assert_eq!(
+        super::invite::commands::encode_hex(&parsed.workspace_id),
+        workspace_id
+    );
+
+    let device_link = run_protocol_cli(
+        &db,
+        &["link", &workspace_id, "--public-addr", "127.0.0.1:41001"],
+    );
+    let parsed_link = super::invite::commands::parse(device_link.trim()).expect("parse link");
+    assert_eq!(
+        super::invite::commands::encode_hex(&parsed_link.workspace_id),
+        workspace_id
+    );
+
+    let store = Protocol::open_store(&db).expect("open store");
+    assert_eq!(row_count(&store, user_invite::schema::USER_INVITES), 2);
+    assert_eq!(row_count(&store, device_invite::schema::DEVICE_INVITES), 2);
+}
+
+#[test]
 fn unknown_signed_identity_payloads_are_rejected_at_admission() {
     let signed = signed::commands::sign_payload([1; 32], &[2; 32], vec![250, 1, 2, 3])
         .expect("sign unknown payload");
@@ -18,6 +105,27 @@ fn unknown_signed_identity_payloads_are_rejected_at_admission() {
     .expect_err("unknown signed payload must not be admitted");
 
     assert_eq!(err, "signed envelope inner type 250 has no identity record");
+}
+
+fn run_protocol_cli(db: &std::path::Path, args: &[&str]) -> String {
+    let mut context = crate::protocol::cli::Context::open(db).expect("open cli context");
+    let command_args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    let output = crate::core::cli::run(
+        &crate::protocol::cli::commands(),
+        &mut context,
+        &command_args,
+    )
+    .unwrap_or_else(|err| panic!("cli failed for {args:?}: {err}"));
+    output.lines.join("\n")
+}
+
+fn line_value(output: &str, key: &str) -> String {
+    let prefix = format!("{key}: ");
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("missing `{key}:` in output:\n{output}"))
+        .to_string()
 }
 
 #[test]

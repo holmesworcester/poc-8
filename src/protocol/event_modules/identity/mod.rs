@@ -6,6 +6,7 @@
 //! history.
 
 pub mod admin;
+pub mod cli;
 pub mod device_invite;
 pub mod endpoint;
 pub mod endpoint_shared;

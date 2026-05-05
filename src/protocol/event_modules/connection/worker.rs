@@ -35,10 +35,12 @@ use std::{
 use crate::core::network_queues::{self, InboundNetworkRow, NetworkTarget, OutboundNetworkRow};
 use crate::core::store::Store;
 use crate::core::tcp;
-use crate::protocol::event_modules::identity::{endpoint, endpoint_shared, invite};
+use crate::protocol::event_modules::identity::{
+    admin, device_invite, endpoint, endpoint_shared, invite, signed, user, user_invite, workspace,
+};
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::sync;
-use crate::protocol::event_modules::types::{EventRecord, ReceiveMetadata};
+use crate::protocol::event_modules::types::{EventId, EventRecord, ReceiveMetadata};
 use crate::protocol::event_modules::worker::{
     self, AdmitReceivedRecords, AdmitRecords, CommandOutput, EventRegistry, ProposedEvent,
     ReceivedRecord,
@@ -80,6 +82,10 @@ pub enum Work {
     ConnectInvite {
         invite: String,
     },
+    ConnectInviteWithInitialEvents {
+        invite: String,
+        records: Vec<EventRecord>,
+    },
     Serve {
         listen: SocketAddr,
         accept_count: usize,
@@ -91,6 +97,12 @@ pub enum Work {
     RunDaemon {
         options: types::DaemonOptions,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BootstrapScope {
+    workspace_id: [u8; 32],
+    authorized_endpoint: endpoint::types::EndpointId,
 }
 
 /// Result of a connection worker action.
@@ -105,6 +117,8 @@ pub enum Output {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct StreamExchangeReport {
+    bootstrap_scope: Option<BootstrapScope>,
+    pending_bootstrap_outgoing: Vec<Vec<u8>>,
     established_routes: usize,
     sent_events: usize,
     received_events: usize,
@@ -127,6 +141,7 @@ struct OutboundSync {
 struct NetworkIngestResult {
     outgoing: Vec<OutboundNetworkRow>,
     sent_outbox: Vec<Vec<Vec<u8>>>,
+    bootstrap_scope: Option<BootstrapScope>,
     established_routes: usize,
     sent_events: usize,
     received_events: usize,
@@ -148,6 +163,12 @@ enum InboundFrame {
         inner: Vec<u8>,
     },
     DurableEvent {
+        connection_id: types::ConnectionId,
+        sender_endpoint: endpoint::types::EndpointId,
+        inner: Vec<u8>,
+    },
+    BootstrapDurableEvent {
+        workspace_id: [u8; 32],
         sender_endpoint: endpoint::types::EndpointId,
         inner: Vec<u8>,
     },
@@ -162,6 +183,7 @@ enum InboundFrame {
 struct ConnectionFrameReport {
     pub records: Vec<ReceivedRecord>,
     pub outgoing: Vec<Vec<u8>>,
+    pub bootstrap_scope: Option<BootstrapScope>,
     pub established_routes: usize,
 }
 
@@ -215,7 +237,10 @@ where
 {
     match work {
         Work::ConnectInvite { invite } => {
-            run_connect(store, registry, invite).map(Output::Connected)
+            run_connect(store, registry, invite, Vec::new()).map(Output::Connected)
+        }
+        Work::ConnectInviteWithInitialEvents { invite, records } => {
+            run_connect(store, registry, invite, records).map(Output::Connected)
         }
         Work::Serve {
             listen,
@@ -235,10 +260,19 @@ fn run_connect<R>(
     store: &Store,
     registry: &R,
     invite: String,
+    initial_records: Vec<EventRecord>,
 ) -> Result<types::ConnectReport, String>
 where
     R: ConnectionRegistry,
 {
+    let parsed_invite = invite::commands::parse(&invite)?;
+    if !parsed_invite.identity_scope && !initial_records.is_empty() {
+        return Err("initial invite events require an identity-scoped invite".to_string());
+    }
+    let invite_scope = parsed_invite.identity_scope.then_some(BootstrapScope {
+        workspace_id: parsed_invite.workspace_id,
+        authorized_endpoint: parsed_invite.endpoint,
+    });
     let output = connection_request::commands::create_with_local(store, &invite)
         .map_err(|err| format!("create connection request: {err}"))?;
     let addr = output.value.addr;
@@ -247,13 +281,41 @@ where
         .0;
 
     let target = NetworkTarget::new(addr);
+    let initial_outbound = vec![OutboundNetworkRow::new(target, request.bytes)];
+    let initial_event_bytes =
+        initial_invite_event_bytes(parsed_invite.workspace_id, initial_records)?;
+    let mut pending_bootstrap_outgoing = Vec::with_capacity(initial_event_bytes.len());
+    if !initial_event_bytes.is_empty() {
+        let local = local_endpoint(store)?;
+        for bytes in initial_event_bytes {
+            pending_bootstrap_outgoing.push(transit::commands::create_bootstrap(
+                &local,
+                parsed_invite.endpoint,
+                &bytes,
+            )?);
+        }
+    }
     let sent_outbox = RefCell::new(HashMap::new());
     let summary = tcp::connect_exchange(
         store,
         target,
-        vec![OutboundNetworkRow::new(target, request.bytes)],
-        StreamExchangeReport::default(),
-        |inbound, summary| handle_inbound(store, registry, inbound, true, summary, &sent_outbox),
+        initial_outbound,
+        StreamExchangeReport {
+            pending_bootstrap_outgoing,
+            ..StreamExchangeReport::default()
+        },
+        |inbound, summary| {
+            handle_inbound(
+                store,
+                registry,
+                inbound,
+                true,
+                invite_scope,
+                summary,
+                &sent_outbox,
+                None,
+            )
+        },
         |rows, _| mark_sent_network_rows(store, rows, &sent_outbox),
     )?;
     if summary.established_routes == 0 {
@@ -263,6 +325,23 @@ where
         addr,
         established_routes: summary.established_routes,
     })
+}
+
+fn initial_invite_event_bytes(
+    workspace_id: EventId,
+    records: Vec<EventRecord>,
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut out = Vec::with_capacity(records.len());
+    for record in records {
+        if !record.scope.is_shared() {
+            return Err("initial invite events must be shared events".to_string());
+        }
+        if record.workspace_id != Some(workspace_id) {
+            return Err("initial invite event is outside invite workspace".to_string());
+        }
+        out.push(record.canonical_bytes);
+    }
+    Ok(out)
 }
 
 fn run_serve<R>(
@@ -275,6 +354,7 @@ where
     R: ConnectionRegistry,
 {
     let sent_outbox = RefCell::new(HashMap::new());
+    let bootstrap_scopes = RefCell::new(HashMap::new());
     let report = tcp::serve(
         store,
         listen,
@@ -287,8 +367,10 @@ where
                 registry,
                 inbound,
                 false,
+                None,
                 &mut one_stream,
                 &sent_outbox,
+                Some(&bootstrap_scopes),
             )?;
             summary.received_events += one_stream.received_events;
             Ok(outgoing)
@@ -311,6 +393,7 @@ where
 {
     let listener = tcp::listen(options.listen)?;
     let sent_outbox = RefCell::new(HashMap::new());
+    let bootstrap_scopes = RefCell::new(HashMap::new());
     let mut summary = types::DaemonReport {
         local_addr: Some(listener.local_addr()),
         ..types::DaemonReport::default()
@@ -328,8 +411,10 @@ where
                     registry,
                     inbound,
                     false,
+                    None,
                     &mut one_stream,
                     &sent_outbox,
+                    Some(&bootstrap_scopes),
                 )?;
                 stream_summary.received_events += one_stream.received_events;
                 Ok(outgoing)
@@ -447,7 +532,18 @@ where
         outbound.target,
         outbound.outgoing,
         StreamExchangeReport::default(),
-        |inbound, summary| handle_inbound(store, registry, inbound, false, summary, &sent_outbox),
+        |inbound, summary| {
+            handle_inbound(
+                store,
+                registry,
+                inbound,
+                false,
+                None,
+                summary,
+                &sent_outbox,
+                None,
+            )
+        },
         |rows, _| mark_sent_network_rows(store, rows, &sent_outbox),
     )
 }
@@ -466,6 +562,7 @@ fn ingest_network<R>(
     registry: &R,
     inbound: InboundNetworkRow,
     remember_origin: bool,
+    bootstrap_scope: Option<BootstrapScope>,
 ) -> Result<NetworkIngestResult, String>
 where
     R: ConnectionRegistry,
@@ -476,7 +573,7 @@ where
         origin,
         remember_origin,
     };
-    let frames = unwrap_transit_bytes(store, local, metadata, inbound.bytes)?;
+    let frames = unwrap_transit_bytes(store, local, metadata, inbound.bytes, bootstrap_scope)?;
     let mut report = NetworkFrameReport::default();
     for frame in frames {
         // Transit unwrap tells us who sent the bytes and, for established
@@ -489,6 +586,7 @@ where
             InboundFrame::Connection(report) => NetworkFrameReport {
                 received_records: report.records,
                 outgoing: report.outgoing,
+                bootstrap_scope: report.bootstrap_scope,
                 established_routes: report.established_routes,
                 ..NetworkFrameReport::default()
             },
@@ -497,9 +595,28 @@ where
                 inner,
             } => ingest_connection_scoped_sync_event(connection_id, inner)?,
             InboundFrame::DurableEvent {
+                connection_id,
                 sender_endpoint,
                 inner,
-            } => ingest_durable_event(store, registry, local.endpoint, sender_endpoint, inner)?,
+            } => ingest_durable_event(
+                store,
+                registry,
+                local.endpoint,
+                connection_id,
+                sender_endpoint,
+                inner,
+            )?,
+            InboundFrame::BootstrapDurableEvent {
+                workspace_id,
+                sender_endpoint,
+                inner,
+            } => ingest_bootstrap_durable_event(
+                store,
+                registry,
+                workspace_id,
+                sender_endpoint,
+                inner,
+            )?,
         };
         report.merge(next);
     }
@@ -535,6 +652,7 @@ where
     Ok(NetworkIngestResult {
         outgoing,
         sent_outbox,
+        bootstrap_scope: report.bootstrap_scope,
         established_routes: report.established_routes,
         sent_events: report.sent_events,
         received_events: report.received_events,
@@ -548,6 +666,7 @@ struct NetworkFrameReport {
     outgoing: Vec<Vec<u8>>,
     drain_sync_for: Option<types::ConnectionId>,
     drain_outbox_for: Option<types::ConnectionId>,
+    bootstrap_scope: Option<BootstrapScope>,
     established_routes: usize,
     sent_events: usize,
     received_events: usize,
@@ -560,6 +679,7 @@ impl NetworkFrameReport {
         self.outgoing.extend(other.outgoing);
         self.drain_sync_for = self.drain_sync_for.or(other.drain_sync_for);
         self.drain_outbox_for = self.drain_outbox_for.or(other.drain_outbox_for);
+        self.bootstrap_scope = self.bootstrap_scope.or(other.bootstrap_scope);
         self.established_routes += other.established_routes;
         self.sent_events += other.sent_events;
         self.received_events += other.received_events;
@@ -604,9 +724,11 @@ fn ingest_durable_event(
     store: &Store,
     registry: &impl EventRegistry,
     local_endpoint: endpoint::types::EndpointId,
+    connection_id: types::ConnectionId,
     sender_endpoint: endpoint::types::EndpointId,
     inner: Vec<u8>,
 ) -> Result<NetworkFrameReport, String> {
+    let is_join_bootstrap = is_join_bootstrap_event(&inner)?;
     let record = registry.record_from_bytes(inner)?;
     if !record.scope.is_shared() {
         return Err("connection durable ingress only accepts shared events".to_string());
@@ -626,9 +748,39 @@ fn ingest_durable_event(
         .iter()
         .any(|allowed| allowed == &workspace_id)
     {
+        let bootstrap_workspace = schema::bootstrap_workspace_id(store, connection_id)?;
+        if bootstrap_workspace != Some(workspace_id) || !is_join_bootstrap {
+            return Err(
+                "connection durable ingress rejected event outside sender workspace".to_string(),
+            );
+        }
+    }
+    Ok(NetworkFrameReport {
+        events: vec![record],
+        received_events: 1,
+        ..NetworkFrameReport::default()
+    })
+}
+
+fn ingest_bootstrap_durable_event(
+    _store: &Store,
+    registry: &impl EventRegistry,
+    workspace_id: [u8; 32],
+    _sender_endpoint: endpoint::types::EndpointId,
+    inner: Vec<u8>,
+) -> Result<NetworkFrameReport, String> {
+    let is_identity_bootstrap = is_identity_bootstrap_event(&inner)?;
+    let record = registry.record_from_bytes(inner)?;
+    if !record.scope.is_shared() {
+        return Err("bootstrap durable ingress only accepts shared events".to_string());
+    }
+    if record.workspace_id != Some(workspace_id) {
         return Err(
-            "connection durable ingress rejected event outside sender workspace".to_string(),
+            "bootstrap durable ingress rejected event outside invite workspace".to_string(),
         );
+    }
+    if !is_identity_bootstrap {
+        return Err("bootstrap durable ingress only accepts identity bootstrap events".to_string());
     }
     Ok(NetworkFrameReport {
         events: vec![record],
@@ -671,6 +823,7 @@ fn unwrap_transit_bytes(
     local: endpoint::types::EndpointKeypair,
     metadata: FrameMetadata,
     bytes: Vec<u8>,
+    bootstrap_scope: Option<BootstrapScope>,
 ) -> Result<Vec<InboundFrame>, String> {
     // Transit unwrap is the only place inbound bytes become meaningful. A
     // bootstrap frame has no connection id yet; an ordinary connection transit
@@ -694,9 +847,22 @@ fn unwrap_transit_bytes(
             )?));
             continue;
         }
-        let connection_id = transit
-            .connection_id
-            .ok_or_else(|| "connection-scoped frame requires connection transit".to_string())?;
+        let Some(connection_id) = transit.connection_id else {
+            let Some(scope) = bootstrap_scope else {
+                return Err("connection-scoped frame requires connection transit".to_string());
+            };
+            if transit.sender_endpoint != scope.authorized_endpoint {
+                return Err(
+                    "bootstrap durable sender does not match authorized endpoint".to_string(),
+                );
+            }
+            frames.push(InboundFrame::BootstrapDurableEvent {
+                workspace_id: scope.workspace_id,
+                sender_endpoint: transit.sender_endpoint,
+                inner,
+            });
+            continue;
+        };
         if sync::is_connection_scoped_event(&inner) {
             frames.push(InboundFrame::SyncEvent {
                 connection_id,
@@ -704,6 +870,7 @@ fn unwrap_transit_bytes(
             });
         } else {
             frames.push(InboundFrame::DurableEvent {
+                connection_id,
                 sender_endpoint: transit.sender_endpoint,
                 inner,
             });
@@ -808,16 +975,42 @@ fn handle_inbound<R>(
     registry: &R,
     inbound: InboundNetworkRow,
     remember_origin: bool,
+    bootstrap_scope: Option<BootstrapScope>,
     summary: &mut StreamExchangeReport,
     sent_outbox: &RefCell<HashMap<Vec<u8>, Vec<Vec<u8>>>>,
+    stream_scopes: Option<&RefCell<HashMap<SocketAddr, BootstrapScope>>>,
 ) -> Result<Vec<OutboundNetworkRow>, String>
 where
     R: ConnectionRegistry,
 {
-    let ingest = ingest_network(store, registry, inbound, remember_origin)?;
+    let origin = inbound.source.addr();
+    let remembered_scope = stream_scopes.and_then(|scopes| scopes.borrow().get(&origin).copied());
+    let active_bootstrap_scope = bootstrap_scope
+        .or(summary.bootstrap_scope)
+        .or(remembered_scope);
+    let mut ingest = ingest_network(
+        store,
+        registry,
+        inbound,
+        remember_origin,
+        active_bootstrap_scope,
+    )?;
+    summary.bootstrap_scope = summary.bootstrap_scope.or(ingest.bootstrap_scope);
+    if let (Some(scopes), Some(scope)) = (stream_scopes, ingest.bootstrap_scope) {
+        scopes.borrow_mut().insert(origin, scope);
+    }
     summary.established_routes += ingest.established_routes;
     summary.sent_events += ingest.sent_events;
     summary.received_events += ingest.received_events;
+    if !summary.pending_bootstrap_outgoing.is_empty()
+        && (ingest.established_routes > 0 || active_bootstrap_scope.is_some())
+    {
+        let target = network_queues::NetworkTarget::new(origin);
+        ingest.outgoing.extend(network_queues::outbound_rows(
+            target,
+            std::mem::take(&mut summary.pending_bootstrap_outgoing),
+        ));
+    }
 
     worker::run(
         store,
@@ -970,23 +1163,35 @@ fn decode_outbox_key(bytes: &[u8]) -> Result<types::OutboxKey, String> {
     })
 }
 
-fn authorized_invite_secret_event_id(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuthorizedInvite {
+    invite_secret_event_id: [u8; 32],
+    workspace_id: Option<[u8; 32]>,
+    invite_event_id: Option<[u8; 32]>,
+}
+
+fn authorized_invite(
     store: &Store,
     bootstrap_hash: &[u8; 32],
-) -> Result<Option<[u8; 32]>, String> {
-    let Some(secret) = store
+) -> Result<Option<AuthorizedInvite>, String> {
+    let Some(value) = store
         .table_row(invite::schema::INVITE_SECRETS, bootstrap_hash)
         .map_err(|err| format!("load invite secret: {err}"))?
     else {
         return Ok(None);
     };
-    if secret.len() != 32 {
-        return Err("stored invite secret is malformed".to_string());
-    }
-    let mut bootstrap_secret = [0; 32];
-    bootstrap_secret.copy_from_slice(&secret);
-    let bytes = invite::codec::encode(&invite::types::InviteSecretEvent::new(bootstrap_secret));
-    Ok(Some(types::event_id(&bytes)))
+    let row = invite::schema::decode_invite_secret_row(&value)?;
+    let bytes = invite::codec::encode(&invite::types::InviteSecretEvent {
+        bootstrap_hash: *bootstrap_hash,
+        bootstrap_secret: row.bootstrap_secret,
+        workspace_id: row.workspace_id,
+        invite_event_id: row.invite_event_id,
+    });
+    Ok(Some(AuthorizedInvite {
+        invite_secret_event_id: types::event_id(&bytes),
+        workspace_id: row.workspace_id,
+        invite_event_id: row.invite_event_id,
+    }))
 }
 
 fn endpoint_id_from_bytes(bytes: &[u8]) -> Result<endpoint::types::EndpointId, String> {
@@ -1011,19 +1216,31 @@ fn ingest_connection_frame(
         // connection projector can atomically write the connection row and the
         // route learned from receive metadata.
         let event = connection_request::codec::decode(&bytes)?;
-        let invite_secret_event_id =
-            authorized_invite_secret_event_id(store, &event.bootstrap_hash)?
-                .ok_or_else(|| "invite private key rejected".to_string())?;
+        let authorized = authorized_invite(store, &event.bootstrap_hash)?
+            .ok_or_else(|| "invite private key rejected".to_string())?;
         let mut record = connection_request::codec::record_from_bytes(bytes.clone())?;
-        record.dependencies.push(invite_secret_event_id);
+        record.dependencies.push(authorized.invite_secret_event_id);
         result.records.push(record_with_bootstrap_receive_metadata(
             record,
             metadata,
             local.endpoint,
-            invite_secret_event_id,
+            authorized.invite_secret_event_id,
+            authorized.workspace_id,
         ));
+        result.bootstrap_scope = authorized.workspace_id.map(|workspace_id| BootstrapScope {
+            workspace_id,
+            authorized_endpoint: event.from_endpoint,
+        });
         let connection = connection_request::commands::accept(local, true, bytes)?;
         apply_connection_result(connection, &mut result);
+        if let Some(workspace_id) = authorized.workspace_id {
+            result.outgoing.extend(bootstrap_identity_events(
+                store,
+                &local,
+                event.from_endpoint,
+                workspace_id,
+            )?);
+        }
     } else if connection_ack::codec::is_ack(&bytes) {
         // Ack projection validates the original request through the ack's
         // declared dependency. The worker only checks local endpoint shape
@@ -1041,11 +1258,75 @@ fn ingest_connection_frame(
     Ok(result)
 }
 
+fn bootstrap_identity_events(
+    store: &Store,
+    local: &endpoint::types::EndpointKeypair,
+    recipient_endpoint: endpoint::types::EndpointId,
+    workspace_id: [u8; 32],
+) -> Result<Vec<Vec<u8>>, String> {
+    let max_timestamp =
+        event_schema::max_timestamp(store).map_err(|err| format!("load max timestamp: {err}"))?;
+    let entries = event_schema::event_index_entries_in_timestamp_range(store, 0, max_timestamp)
+        .map_err(|err| format!("load workspace events: {err}"))?;
+    let mut out = Vec::new();
+    for entry in entries {
+        if entry.workspace_id != Some(workspace_id) {
+            continue;
+        }
+        let Some(bytes) = event_schema::event_bytes(store, &entry.event_id)
+            .map_err(|err| format!("load event bytes: {err}"))?
+        else {
+            continue;
+        };
+        if !is_identity_bootstrap_event(&bytes)? {
+            continue;
+        }
+        out.push(transit::commands::create_bootstrap(
+            local,
+            recipient_endpoint,
+            &bytes,
+        )?);
+    }
+    Ok(out)
+}
+
+fn is_identity_bootstrap_event(bytes: &[u8]) -> Result<bool, String> {
+    match bytes.first().copied() {
+        Some(workspace::codec::TYPE_WORKSPACE) => Ok(true),
+        Some(signed::codec::TYPE_SIGNED) => {
+            let envelope = signed::codec::decode(bytes)?;
+            Ok(matches!(
+                envelope.inner_type,
+                admin::codec::TYPE_ADMIN
+                    | user_invite::codec::TYPE_USER_INVITE
+                    | user::codec::TYPE_USER
+                    | device_invite::codec::TYPE_DEVICE_INVITE
+                    | endpoint_shared::codec::TYPE_ENDPOINT_SHARED
+            ))
+        }
+        _ => Ok(false),
+    }
+}
+
+fn is_join_bootstrap_event(bytes: &[u8]) -> Result<bool, String> {
+    if bytes.first().copied() != Some(signed::codec::TYPE_SIGNED) {
+        return Ok(false);
+    }
+    let envelope = signed::codec::decode(bytes)?;
+    Ok(matches!(
+        envelope.inner_type,
+        user::codec::TYPE_USER
+            | device_invite::codec::TYPE_DEVICE_INVITE
+            | endpoint_shared::codec::TYPE_ENDPOINT_SHARED
+    ))
+}
+
 fn record_with_bootstrap_receive_metadata(
     record: EventRecord,
     metadata: UnwrappedFrameMetadata,
     local_endpoint: endpoint::types::EndpointId,
     invite_secret_event_id: types::ConnectionId,
+    workspace_id: Option<[u8; 32]>,
 ) -> ReceivedRecord {
     ReceivedRecord::with_receive(
         record,
@@ -1055,6 +1336,7 @@ fn record_with_bootstrap_receive_metadata(
             metadata.sender_endpoint,
             metadata.frame.remember_origin,
             invite_secret_event_id,
+            workspace_id,
         ),
     )
 }
@@ -1164,6 +1446,19 @@ mod tests {
         )
     }
 
+    fn bootstrap_inbound_from_remote(
+        remote: &endpoint::types::EndpointKeypair,
+        local_endpoint: endpoint::types::EndpointId,
+        inner: Vec<u8>,
+    ) -> InboundNetworkRow {
+        let bytes = transit::commands::create_bootstrap(remote, local_endpoint, &inner)
+            .expect("create bootstrap transit");
+        InboundNetworkRow::new(
+            NetworkSource::new("127.0.0.1:41001".parse().expect("test addr")),
+            bytes,
+        )
+    }
+
     fn signed_content_bytes(workspace_id: [u8; 32]) -> Vec<u8> {
         content_event::commands::generate(workspace_id, [8; 32], [9; 32], 1, 1, 8)
             .expect("generate signed content")
@@ -1250,7 +1545,7 @@ mod tests {
         let local_only_id = event_id(&local_only);
         let inbound = inbound_from_remote(&remote, local.endpoint, connection_id, vec![local_only]);
 
-        let err = ingest_network(&store, &Protocol::new(), inbound, false)
+        let err = ingest_network(&store, &Protocol::new(), inbound, false, None)
             .expect_err("remote local-only event must reject");
 
         assert!(err.contains("connection durable ingress only accepts shared events"));
@@ -1270,7 +1565,7 @@ mod tests {
         let content_id = event_id(&content);
         let inbound = inbound_from_remote(&remote, local.endpoint, connection_id, vec![content]);
 
-        let err = ingest_network(&store, &Protocol::new(), inbound, false)
+        let err = ingest_network(&store, &Protocol::new(), inbound, false, None)
             .expect_err("out-of-scope workspace event must reject");
 
         assert!(
@@ -1280,6 +1575,41 @@ mod tests {
         assert!(
             !event_schema::has_event(&store, &content_id).expect("check event table"),
             "out-of-scope remote event must not be stored"
+        );
+    }
+
+    #[test]
+    fn rejects_non_identity_events_inside_bootstrap_transit() {
+        let local = keypair();
+        let remote = keypair();
+        let workspace_id = [7; 32];
+        let store = Protocol::open_memory_store().expect("open store");
+        store
+            .insert_table_rows(endpoint::projector::local_endpoint(local))
+            .expect("insert local endpoint");
+        let content = signed_content_bytes(workspace_id);
+        let content_id = event_id(&content);
+        let inbound = bootstrap_inbound_from_remote(&remote, local.endpoint, content);
+
+        let err = ingest_network(
+            &store,
+            &Protocol::new(),
+            inbound,
+            false,
+            Some(BootstrapScope {
+                workspace_id,
+                authorized_endpoint: remote.endpoint,
+            }),
+        )
+        .expect_err("bootstrap content must reject");
+
+        assert!(
+            err.contains("bootstrap durable ingress only accepts identity bootstrap events"),
+            "{err}"
+        );
+        assert!(
+            !event_schema::has_event(&store, &content_id).expect("check event table"),
+            "rejected bootstrap content must not be stored"
         );
     }
 
@@ -1296,7 +1626,7 @@ mod tests {
         let content_id = event_id(&content);
         let inbound = inbound_from_remote(&remote, local.endpoint, connection_id, vec![content]);
 
-        let output = ingest_network(&store, &Protocol::new(), inbound, false)
+        let output = ingest_network(&store, &Protocol::new(), inbound, false, None)
             .expect("shareable content is admitted");
 
         assert_eq!(

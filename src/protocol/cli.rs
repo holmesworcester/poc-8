@@ -39,7 +39,7 @@ impl Context {
 
 pub fn commands() -> Vec<CliCommand<Context>> {
     let mut out = Vec::new();
-    out.extend(event_modules::identity::invite::cli::commands());
+    out.extend(event_modules::identity::cli::commands());
     out.extend(event_modules::connection::cli::commands());
     out.extend(event_modules::content::content_event::cli::commands());
     out.extend(event_modules::sync::cli::commands());

@@ -33,6 +33,7 @@ pub fn project(envelope: &EventWithContext<'_>) -> Result<ProjectionOutput, Stri
         }
         let ReceiveAuthorization::BootstrapInvite {
             invite_secret_event_id,
+            workspace_id,
         } = receive.authorization()
         else {
             return Err("connection request requires bootstrap invite authorization".to_string());
@@ -55,6 +56,12 @@ pub fn project(envelope: &EventWithContext<'_>) -> Result<ProjectionOutput, Stri
             rows.push(projection::transport_target_row(
                 connection_id,
                 receive.origin(),
+            ));
+        }
+        if let Some(workspace_id) = workspace_id {
+            rows.push(projection::bootstrap_workspace_row(
+                connection_id,
+                workspace_id,
             ));
         }
     }
@@ -144,6 +151,7 @@ mod tests {
                     [1; 32],
                     true,
                     invite_secret_event_id,
+                    None,
                 )),
             },
         })
@@ -202,6 +210,7 @@ mod tests {
                         [1; 32],
                         true,
                         invite_secret_event_id,
+                        None,
                     )),
                 },
             })
@@ -234,6 +243,7 @@ mod tests {
                         [1; 32],
                         true,
                         invite_secret_event_id,
+                        None,
                     )),
                 },
             })

@@ -9,6 +9,8 @@
 use std::{net::SocketAddr, str::FromStr};
 
 use crate::core::crypto;
+use crate::core::crypto::Ed25519PrivateKey;
+use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker::CommandOutput;
 
 use super::super::endpoint;
@@ -21,6 +23,9 @@ const INVITE_KIND: &str = "user";
 const LABEL_INVITE_ID: &str = "INVITE_ID";
 const LABEL_INVITE_PRIVKEY: &str = "INVITE_PRIVKEY";
 const LABEL_WORKSPACE: &str = "WORKSPACE";
+const LABEL_SCOPE: &str = "SCOPE";
+const SCOPE_IDENTITY: &str = "identity";
+const LABEL_USER_ID: &str = "USER_ID";
 const LABEL_ENDPOINT_ID: &str = "ENDPOINT_ID";
 const LABEL_ADDRESS: &str = "ADDRESS";
 
@@ -41,6 +46,51 @@ pub fn create(
             invite_id = encode_hex(&invite_event_id),
             invite_secret = encode_hex(&bootstrap_secret),
             workspace = encode_hex(&workspace_id),
+            endpoint = encode_hex(&local.endpoint),
+            address = encode_address(public_addr),
+        ),
+        vec![codec::record_from_bytes(bytes).expect("encoded invite secret is valid")],
+    )
+}
+
+pub fn create_scoped(
+    local: endpoint::types::EndpointKeypair,
+    public_addr: SocketAddr,
+    workspace_id: EventId,
+    invite_event_id: EventId,
+    invite_private_key: Ed25519PrivateKey,
+) -> CommandOutput<String> {
+    create_scoped_with_user_authority(
+        local,
+        public_addr,
+        workspace_id,
+        invite_event_id,
+        invite_private_key,
+        None,
+    )
+}
+
+pub fn create_scoped_with_user_authority(
+    local: endpoint::types::EndpointKeypair,
+    public_addr: SocketAddr,
+    workspace_id: EventId,
+    invite_event_id: EventId,
+    invite_private_key: Ed25519PrivateKey,
+    user_authority_event_id: Option<EventId>,
+) -> CommandOutput<String> {
+    let secret_event = InviteSecretEvent::scoped(invite_private_key, workspace_id, invite_event_id);
+    let bytes = codec::encode(&secret_event);
+    let user_part = user_authority_event_id
+        .map(|user_id| format!("/{LABEL_USER_ID}.{}", encode_hex(&user_id)))
+        .unwrap_or_default();
+    CommandOutput::with_events(
+        format!(
+            "{INVITE_PREFIX}{INVITE_VERSION}/{INVITE_KIND}/{LABEL_INVITE_ID}.{invite_id}/{LABEL_INVITE_PRIVKEY}.{invite_secret}/{LABEL_WORKSPACE}.{workspace}/{LABEL_SCOPE}.{scope}{user_part}/{LABEL_ENDPOINT_ID}.{endpoint}/{LABEL_ADDRESS}.{address}",
+            invite_id = encode_hex(&invite_event_id),
+            invite_secret = encode_hex(&invite_private_key),
+            workspace = encode_hex(&workspace_id),
+            scope = SCOPE_IDENTITY,
+            user_part = user_part,
             endpoint = encode_hex(&local.endpoint),
             address = encode_address(public_addr),
         ),
@@ -85,6 +135,8 @@ pub fn parse(value: &str) -> Result<Invite, String> {
     let mut addr = None;
     let mut invite_event_id = None;
     let mut workspace_id = None;
+    let mut user_authority_event_id = None;
+    let mut identity_scope = false;
 
     for part in parts {
         let (label, value) = part
@@ -104,6 +156,23 @@ pub fn parse(value: &str) -> Result<Invite, String> {
             LABEL_WORKSPACE => {
                 if workspace_id.replace(decode_hex_32(value)?).is_some() {
                     return Err("invite has duplicate WORKSPACE".to_string());
+                }
+            }
+            LABEL_SCOPE => {
+                if identity_scope {
+                    return Err("invite has duplicate SCOPE".to_string());
+                }
+                if value != SCOPE_IDENTITY {
+                    return Err(format!("unsupported invite scope {value}"));
+                }
+                identity_scope = true;
+            }
+            LABEL_USER_ID => {
+                if user_authority_event_id
+                    .replace(decode_hex_32(value)?)
+                    .is_some()
+                {
+                    return Err("invite has duplicate USER_ID".to_string());
                 }
             }
             LABEL_ENDPOINT_ID => {
@@ -128,6 +197,8 @@ pub fn parse(value: &str) -> Result<Invite, String> {
         invite_event_id: invite_event_id
             .ok_or_else(|| "invite is missing INVITE_ID".to_string())?,
         workspace_id: workspace_id.ok_or_else(|| "invite is missing WORKSPACE".to_string())?,
+        user_authority_event_id,
+        identity_scope,
     })
 }
 
