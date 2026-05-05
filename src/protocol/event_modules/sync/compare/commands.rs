@@ -16,6 +16,10 @@ use super::types::{CompareEvent, RangeSummary, TimestampRange};
 const MAX_HAVE_IDS_PER_RANGE: usize = 64;
 
 pub trait ReadContext {
+    // The caller must provide a connection-scoped view. These methods talk in
+    // generic ranges and ids because the negentropy algorithm is generic, but the
+    // implementation is responsible for hiding any event outside the connection's
+    // mutual workspace set.
     /// Summarize every shared event whose timestamp is inside the range.
     fn summary(&self, range: TimestampRange) -> Result<RangeSummary, String>;
     /// Enumerate ids in one timestamp range when summaries differ.
@@ -104,6 +108,9 @@ pub fn handle_inbound_event(
     if need_id::codec::is_event(bytes) {
         let event = need_id::codec::decode(bytes)?;
         ensure_connection(event.connection_id, expected_connection_id)?;
+        // Need-id is intentionally not treated as proof that we should send the
+        // event. Peers can guess ids, replay ids, or request ids from stale
+        // summaries. The scoped ReadContext is the authorization check.
         if context.can_send_event(&event.id)? {
             report.send_event_ids.push(event.id);
             report.sent_events = 1;

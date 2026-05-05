@@ -20,6 +20,11 @@ pub fn project(envelope: &EventWithContext<'_>) -> Result<ProjectionOutput, Stri
     let request_id = types::event_id(&bytes);
     let mut rows = vec![projection::connection_event_row(request_id, bytes)];
     if let Some(receive) = receive {
+        // A received request establishes a route only when the connection worker
+        // supplied bootstrap-invite authorization. The canonical request bytes
+        // alone are not enough: anyone can name a bootstrap hash, but only a peer
+        // that proved knowledge of the invite secret over the receive boundary
+        // gets receive metadata naming the local secret event dependency.
         if event.to_endpoint != receive.local_endpoint() {
             return Err("connection request addressed to a different endpoint".to_string());
         }

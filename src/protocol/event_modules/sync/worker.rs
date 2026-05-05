@@ -19,6 +19,12 @@
 //! part of the durable content history. Requested durable events are queued by
 //! id for the connection worker; sync does not build data packets.
 //!
+//! The security invariant is that every answer is scoped to the mutual
+//! workspaces of the local endpoint and the remote endpoint on the connection.
+//! Range summaries, have ids, dependency closure ids, and need-id responses all
+//! use that same scoped context. Whether a peer asked for a particular id is not
+//! an authorization boundary; membership in the event workspace is.
+//!
 //! A future dep-aware worker will probably have more queues and cursors, but it
 //! should preserve this boundary: sync may query sync-owned indexes and propose
 //! sync events; it should not perform TCP IO, mutate content projections, or
@@ -141,6 +147,9 @@ fn start(
     for connection_id in connections {
         let context =
             StoreSyncContext::for_connection(store, index, local.endpoint, connection_id)?;
+        // A route alone is not enough to start sync. Until the identity graph
+        // says both endpoints are in at least one common workspace, there is no
+        // namespace in which an event summary can be safely compared.
         if context.workspace_ids.is_empty() {
             continue;
         }
@@ -199,6 +208,9 @@ fn drain_inbound_events(
 struct StoreSyncContext<'a> {
     store: &'a Store,
     index: &'a SyncIndex,
+    // This list is the single read-side authority for one sync conversation. All
+    // index methods below filter through it before exposing ids or summaries to
+    // compare::commands.
     workspace_ids: Vec<EventId>,
 }
 
@@ -220,6 +232,9 @@ impl<'a> StoreSyncContext<'a> {
     }
 
     fn entry_is_allowed(&self, entry: &EventIndexEntry) -> bool {
+        // Shared events without a workspace are not syncable. Identity root
+        // events, signed identity events, and content records must all carry the
+        // workspace they belong to so this check can be local and mechanical.
         entry.workspace_id.is_some_and(|workspace_id| {
             self.workspace_ids
                 .iter()
@@ -308,6 +323,10 @@ impl compare::commands::ReadContext for StoreSyncContext<'_> {
         &self,
         event_id: &crate::protocol::event_modules::types::EventId,
     ) -> Result<bool, String> {
+        // This is the last gate before a need-id becomes an outbox row. The peer
+        // may send arbitrary ids, including ids it never saw in our have stream;
+        // responding is allowed only when the durable event is shared and belongs
+        // to one of this connection's mutual workspaces.
         event_schema::has_shared_event_in_workspaces(self.store, event_id, &self.workspace_ids)
             .map_err(|err| format!("check scoped event presence: {err}"))
     }

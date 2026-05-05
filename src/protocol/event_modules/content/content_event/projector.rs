@@ -1,4 +1,9 @@
 //! Projector for signed workspace-scoped content events.
+//!
+//! Content is ordinary shared history, so the event carries a workspace id and is
+//! sync-scoped by that id. Its authority is not the transport endpoint key used
+//! to open a connection; it is the Ed25519 signing key published by an
+//! endpoint_shared event in the same workspace.
 
 use crate::protocol::event_modules::identity::{endpoint_shared, signed};
 use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput};

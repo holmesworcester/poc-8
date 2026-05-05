@@ -4,6 +4,11 @@
 //! dependency. Projection validates that the signer dependency is the matching
 //! signed device invite, then writes the shared endpoint row plus the local
 //! membership index used by duplicate-join preflight.
+//!
+//! Endpoint joins are one-workspace facts. The device invite key authorizes one
+//! endpoint_shared event for one user authority in one workspace; projection
+//! re-checks all three bindings before writing the endpoint membership row that
+//! later gates connection ingress and sync.
 
 use crate::protocol::event_modules::identity::{device_invite, signed};
 use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput};

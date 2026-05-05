@@ -635,7 +635,9 @@ fn store_durable_event_in_tx(
 /// The status change, context load, projector call, row writes, and dependent
 /// unblocking all happen in the caller's transaction. If projection fails, the
 /// Applied status rolls back, so failed events cannot become dependency context
-/// for later projectors.
+/// for later projectors. This is the core context-validity invariant: projectors
+/// are allowed to trust dependency context because only Applied events are ever
+/// used to unblock and project dependents.
 fn project_ready_event_in_tx(
     store: &Store,
     modules: &impl EventRegistry,
@@ -696,8 +698,11 @@ fn project_event_with_context_in_tx(
 /// The dependency list comes from the event itself and is safe to load here
 /// because blocked durable events do not reach projection. Admission only marks
 /// an event Ready after every dependency is Applied, so context never includes
-/// merely stored or failed events. Labels are generic, bounded facts attached to
-/// this event id by earlier projections.
+/// merely stored, blocked, or failed events. Labels are generic, bounded facts
+/// attached to this event id by earlier projections. If this helper ever grows a
+/// second source of dependency facts, it must preserve the same rule: invalid
+/// events do not appear in projection context, even if their bytes are present in
+/// storage.
 fn load_event_context_in_tx(
     store: &Store,
     modules: &impl EventRegistry,

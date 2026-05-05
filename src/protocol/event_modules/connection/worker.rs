@@ -136,7 +136,10 @@ struct NetworkIngestResult {
 ///
 /// Connection events can be admitted directly. Connection-scoped inner bytes
 /// must be handed to the event family that owns the inner wire format while
-/// preserving the connection id recovered from transit.
+/// preserving the connection id recovered from transit. Durable events carry
+/// only the sender endpoint recovered by transit; they are not considered safe
+/// for the common pipeline until `ingest_durable_event` proves the sender and
+/// receiver have mutual membership in the event workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InboundFrame {
     Connection(ConnectionFrameReport),
@@ -476,6 +479,12 @@ where
     let frames = unwrap_transit_bytes(store, local, metadata, inbound.bytes)?;
     let mut report = NetworkFrameReport::default();
     for frame in frames {
+        // Transit unwrap tells us who sent the bytes and, for established
+        // transit, which connection secret decrypted them. That proves origin
+        // for the frame, not workspace authority for arbitrary durable events.
+        // Connection-scoped sync gets routed by connection id; durable shared
+        // history must pass the workspace-membership check below before it can
+        // enter the ordinary event pipeline.
         let next = match frame {
             InboundFrame::Connection(report) => NetworkFrameReport {
                 received_records: report.records,
@@ -605,6 +614,12 @@ fn ingest_durable_event(
     let workspace_id = record
         .workspace_id
         .ok_or_else(|| "connection durable ingress requires a workspace".to_string())?;
+    // This is the receive-side workspace boundary. Solicitation is deliberately
+    // not part of the check: sync often cannot know which dependencies it needs
+    // until a peer advertises them. What matters is whether the authenticated
+    // sender endpoint and our local endpoint are both joined to the workspace
+    // named by the event. If not, admitting the event would let one connection
+    // inject or exfiltrate facts for another workspace.
     let allowed_workspaces =
         endpoint_shared::schema::mutual_workspace_ids(store, local_endpoint, sender_endpoint)?;
     if !allowed_workspaces
@@ -660,6 +675,8 @@ fn unwrap_transit_bytes(
     // Transit unwrap is the only place inbound bytes become meaningful. A
     // bootstrap frame has no connection id yet; an ordinary connection transit
     // frame must recover one before any inner bytes are trusted enough to route.
+    // The recovered sender endpoint is carried forward into admission checks; we
+    // never infer sender identity from a payload field inside the decrypted bytes.
     let transit = transit::commands::unwrap(local, &bytes, |connection_id| {
         remote_endpoint(store, connection_id)
     })?;

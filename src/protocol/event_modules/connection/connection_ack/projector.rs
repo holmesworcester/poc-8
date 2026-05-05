@@ -39,6 +39,10 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
         bytes,
     )];
     if let Some(receive) = receive {
+        // A received ack can establish a route only for an already authenticated
+        // endpoint receive. Bootstrap authorization is consumed by the request;
+        // from this point forward the route is tied to the endpoint pair and
+        // connection id derived from that request/ack pair.
         if ack.to_endpoint != receive.local_endpoint() {
             return Err("connection ack addressed to a different endpoint".to_string());
         }

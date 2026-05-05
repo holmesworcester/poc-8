@@ -4,6 +4,11 @@
 //! named by the signed device-invite record. This projector verifies that the
 //! signer is either the user identity named by the invite or an existing
 //! endpoint_shared row for the same workspace/user authority.
+//!
+//! When an existing endpoint signs, the signer is the endpoint_shared
+//! signing_public_key, not the transport endpoint id. Keeping those keys separate
+//! prevents a peer that can open transport connections from gaining workspace
+//! signing authority.
 
 use crate::protocol::event_modules::identity::{
     endpoint_shared, signed, user, user_invite, workspace,

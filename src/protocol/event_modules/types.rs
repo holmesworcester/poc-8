@@ -34,6 +34,12 @@ pub struct EventRecord {
 /// Durable events currently cannot persist this field, so the common worker
 /// only allows it on events that can be projected immediately. If such an event
 /// would block, admission fails instead of silently dropping context.
+///
+/// The constructors are `pub(crate)` on purpose. Receive metadata is not an
+/// event type and not peer-controlled data; it is minted by the connection
+/// worker after it has checked the transport proof that justifies the receive
+/// authority. Projectors still re-check the metadata against the event body, but
+/// they rely on this type not being forgeable from ordinary decoded bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceiveMetadata {
     origin: SocketAddr,

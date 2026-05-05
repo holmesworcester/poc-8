@@ -3,6 +3,12 @@
 //! Bootstrap invites are signed directly by the workspace root. Ongoing invites
 //! are signed by an endpoint_shared event whose endpoint belongs to the user
 //! named by an admin grant in the same workspace.
+//!
+//! The endpoint_shared dependency has two keys with different meanings: the
+//! endpoint id is the transport identity used for connections, while
+//! signing_public_key is the Ed25519 key authorized to sign workspace actions.
+//! This projector must validate the envelope signer against signing_public_key,
+//! not endpoint_id.
 
 use crate::protocol::event_modules::types::EventRecord;
 use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput};

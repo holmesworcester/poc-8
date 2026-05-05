@@ -4,6 +4,10 @@
 //! worker, then writes one admin row. Bootstrap grants are signed by the
 //! workspace root. Ongoing grants are signed by the authority admin key named by
 //! the inner grant.
+//!
+//! Admin authority is workspace-local. A public key that is admin in workspace A
+//! cannot authorize grants in workspace B unless there is a separate admin row
+//! for workspace B, and the target user must also belong to the grant workspace.
 
 use crate::protocol::event_modules::types::{EventId, EventRecord};
 use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput};
