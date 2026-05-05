@@ -14,13 +14,21 @@
 //! without teaching core what an event is. Labels are generic, bounded context
 //! for projectors; richer read models belong in scoped module schema files.
 
+use std::net::SocketAddr;
+use std::str::FromStr;
+
 use crate::core::store::{Schema, Store, TableName, TableRow};
 use crate::protocol::event_modules::types::{
-    event_id, EventId, EventIndexEntry, EventRecord, EventScope, EventStatus, EventStatusCounts,
+    event_id, ConnectionScope, EventId, EventIndexEntry, EventRecord, EventScope, EventStatus,
+    EventStatusCounts, ReceiveAuthorization, ReceiveMetadata,
 };
+use crate::protocol::wire::{Reader, Writer};
 
 pub const EVENTS: TableName = TableName::new("event_modules.events");
+pub const EVENT_INGRESS: TableName = TableName::new("event_modules.event_ingress");
 pub const READY_EVENTS: TableName = TableName::new("event_modules.ready_events");
+pub const RECENTLY_VALID_EVENTS: TableName = TableName::new("event_modules.recently_valid_events");
+pub const APPLIED_SHARED_EVENTS: TableName = TableName::new("event_modules.applied_shared_events");
 pub const TIMESTAMP_EVENTS: TableName = TableName::new("event_modules.timestamp_events");
 pub const BLOCKED_EVENTS_BY_MISSING_DEP: TableName =
     TableName::new("event_modules.blocked_events_by_missing_dep");
@@ -30,7 +38,16 @@ pub const EVENT_LABELS: TableName = TableName::new("event_modules.labels");
 
 pub const SCHEMAS: &[Schema] = &[
     Schema::durable_row_table("event_modules.events.v1", EVENTS),
+    Schema::memory_row_table("event_modules.event_ingress.v1", EVENT_INGRESS),
     Schema::durable_row_table("event_modules.ready_events.v1", READY_EVENTS),
+    Schema::memory_row_table(
+        "event_modules.recently_valid_events.v1",
+        RECENTLY_VALID_EVENTS,
+    ),
+    Schema::memory_row_table(
+        "event_modules.applied_shared_events.v1",
+        APPLIED_SHARED_EVENTS,
+    ),
     Schema::durable_row_table("event_modules.timestamp_events.v1", TIMESTAMP_EVENTS),
     Schema::durable_row_table(
         "event_modules.blocked_events_by_missing_dep.v1",
@@ -51,6 +68,25 @@ const MAX_DEPENDENCY_ROWS_PER_EVENT: usize = 1_000_000;
 pub struct EventLabel {
     pub event_id: EventId,
     pub label: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngressEvent {
+    pub key: Vec<u8>,
+    pub record: EventRecord,
+    pub receive: Option<ReceiveMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentlyValidEvent {
+    pub key: Vec<u8>,
+    pub event_id: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedSharedEvent {
+    pub key: Vec<u8>,
+    pub entry: EventIndexEntry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +122,82 @@ pub fn insert_event(
     }
     store.insert_table_rows_in_tx(rows)?;
     Ok(true)
+}
+
+pub fn event_ingress_row(event: EventRecord, receive: Option<ReceiveMetadata>) -> TableRow {
+    let value = encode_ingress_event(&event, receive);
+    TableRow {
+        table: EVENT_INGRESS,
+        key: ingress_event_key(&value),
+        value,
+    }
+}
+
+pub fn claim_event_ingress(store: &Store, limit: usize) -> rusqlite::Result<Vec<IngressEvent>> {
+    store
+        .table_rows_with_key_prefix(EVENT_INGRESS, &[], limit)?
+        .into_iter()
+        .map(|(key, value)| {
+            let (record, receive) = decode_ingress_event(&value).map_err(table_error)?;
+            Ok(IngressEvent {
+                key,
+                record,
+                receive,
+            })
+        })
+        .collect()
+}
+
+pub fn recently_valid_event_row(event_id: EventId) -> TableRow {
+    TableRow {
+        table: RECENTLY_VALID_EVENTS,
+        key: event_id.to_vec(),
+        value: event_id.to_vec(),
+    }
+}
+
+pub fn claim_recently_valid_events(
+    store: &Store,
+    limit: usize,
+) -> rusqlite::Result<Vec<RecentlyValidEvent>> {
+    store
+        .table_rows_with_key_prefix(RECENTLY_VALID_EVENTS, &[], limit)?
+        .into_iter()
+        .map(|(key, value)| {
+            let event_id = vec_to_id(value)?;
+            Ok(RecentlyValidEvent { key, event_id })
+        })
+        .collect()
+}
+
+pub fn applied_shared_event_row(entry: EventIndexEntry) -> TableRow {
+    TableRow {
+        table: APPLIED_SHARED_EVENTS,
+        key: timestamp_key(entry.timestamp, &entry.event_id),
+        value: encode_workspace_index_value(entry.workspace_id),
+    }
+}
+
+pub fn claim_applied_shared_events(
+    store: &Store,
+    limit: usize,
+) -> rusqlite::Result<Vec<AppliedSharedEvent>> {
+    store
+        .table_rows_with_key_prefix(APPLIED_SHARED_EVENTS, &[], limit)?
+        .into_iter()
+        .map(|(key, value)| {
+            let (timestamp, event_id) = split_timestamp_key(&key)?;
+            let workspace_id = decode_workspace_index_value(&value)?;
+            Ok(AppliedSharedEvent {
+                key,
+                entry: EventIndexEntry {
+                    event_id,
+                    timestamp,
+                    workspace_id,
+                },
+            })
+        })
+        .collect()
 }
 
 pub fn event_is_applied(store: &Store, event_id: &EventId) -> rusqlite::Result<bool> {
@@ -583,4 +695,156 @@ fn vec_to_id(bytes: Vec<u8>) -> rusqlite::Result<EventId> {
 
 fn table_error(err: String) -> rusqlite::Error {
     rusqlite::Error::InvalidParameterName(err)
+}
+
+fn ingress_event_key(value: &[u8]) -> Vec<u8> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"topo:event-ingress:v1:");
+    hasher.update(value);
+    hasher.finalize().as_bytes().to_vec()
+}
+
+fn encode_ingress_event(event: &EventRecord, receive: Option<ReceiveMetadata>) -> Vec<u8> {
+    let mut writer = Writer::new();
+    writer.u64(event.timestamp);
+    writer.u64(event.body_len as u64);
+    writer.sized_bytes(&event.canonical_bytes);
+    writer.u32(event.dependencies.len());
+    for dependency in &event.dependencies {
+        writer.id(dependency);
+    }
+    match event.workspace_id {
+        Some(workspace_id) => {
+            writer.u8(1);
+            writer.id(&workspace_id);
+        }
+        None => writer.u8(0),
+    }
+    encode_scope(&mut writer, event.scope);
+    encode_receive(&mut writer, receive);
+    writer.finish()
+}
+
+fn decode_ingress_event(bytes: &[u8]) -> Result<(EventRecord, Option<ReceiveMetadata>), String> {
+    let mut reader = Reader::new(bytes, "event ingress row");
+    let timestamp = reader.u64()?;
+    let body_len = usize::try_from(reader.u64()?)
+        .map_err(|_| "event ingress body length overflows usize".to_string())?;
+    let canonical_bytes = reader.sized_bytes()?;
+    let dependency_count = reader.u32()? as usize;
+    let mut dependencies = Vec::with_capacity(dependency_count);
+    for _ in 0..dependency_count {
+        dependencies.push(reader.id()?);
+    }
+    let workspace_id = match reader.u8()? {
+        0 => None,
+        1 => Some(reader.id()?),
+        other => return Err(format!("unknown event ingress workspace flag {other}")),
+    };
+    let scope = decode_scope(&mut reader)?;
+    let receive = decode_receive(&mut reader)?;
+    reader.finish()?;
+    Ok((
+        EventRecord::from_stored_parts(
+            timestamp,
+            body_len,
+            canonical_bytes,
+            dependencies,
+            workspace_id,
+            scope,
+        ),
+        receive,
+    ))
+}
+
+fn encode_scope(writer: &mut Writer, scope: EventScope) {
+    match scope {
+        EventScope::Shared => writer.u8(0),
+        EventScope::Local => writer.u8(1),
+        EventScope::Transient => writer.u8(2),
+        EventScope::Connection(ConnectionScope::Outgoing { connection_id }) => {
+            writer.u8(3);
+            writer.id(&connection_id);
+        }
+        EventScope::Connection(ConnectionScope::Incoming { connection_id }) => {
+            writer.u8(4);
+            writer.id(&connection_id);
+        }
+    }
+}
+
+fn decode_scope(reader: &mut Reader<'_>) -> Result<EventScope, String> {
+    match reader.u8()? {
+        0 => Ok(EventScope::Shared),
+        1 => Ok(EventScope::Local),
+        2 => Ok(EventScope::Transient),
+        3 => Ok(EventScope::Connection(ConnectionScope::Outgoing {
+            connection_id: reader.id()?,
+        })),
+        4 => Ok(EventScope::Connection(ConnectionScope::Incoming {
+            connection_id: reader.id()?,
+        })),
+        other => Err(format!("unknown event ingress scope {other}")),
+    }
+}
+
+fn encode_receive(writer: &mut Writer, receive: Option<ReceiveMetadata>) {
+    let Some(receive) = receive else {
+        writer.u8(0);
+        return;
+    };
+    writer.u8(1);
+    writer.sized_bytes(receive.origin().to_string().as_bytes());
+    writer.id(&receive.local_endpoint());
+    writer.id(&receive.remote_endpoint());
+    writer.u8(u8::from(receive.remember_route()));
+    match receive.authorization() {
+        ReceiveAuthorization::BootstrapInvite {
+            invite_secret_event_id,
+        } => {
+            writer.u8(0);
+            writer.id(&invite_secret_event_id);
+        }
+        ReceiveAuthorization::EndpointReceive => writer.u8(1),
+    }
+}
+
+fn decode_receive(reader: &mut Reader<'_>) -> Result<Option<ReceiveMetadata>, String> {
+    match reader.u8()? {
+        0 => Ok(None),
+        1 => {
+            let origin = String::from_utf8(reader.sized_bytes()?)
+                .map_err(|err| format!("event ingress receive origin is not utf8: {err}"))
+                .and_then(|addr| {
+                    SocketAddr::from_str(&addr)
+                        .map_err(|err| format!("event ingress receive origin is invalid: {err}"))
+                })?;
+            let local_endpoint = reader.id()?;
+            let remote_endpoint = reader.id()?;
+            let remember_route = match reader.u8()? {
+                0 => false,
+                1 => true,
+                other => return Err(format!("unknown event ingress remember-route flag {other}")),
+            };
+            match reader.u8()? {
+                0 => Ok(Some(ReceiveMetadata::bootstrap_invite(
+                    origin,
+                    local_endpoint,
+                    remote_endpoint,
+                    remember_route,
+                    reader.id()?,
+                ))),
+                1 => Ok(Some(ReceiveMetadata::endpoint_receive(
+                    origin,
+                    local_endpoint,
+                    remote_endpoint,
+                    remember_route,
+                ))),
+                other => Err(format!(
+                    "unknown event ingress receive authorization {other}"
+                )),
+            }
+        }
+        other => Err(format!("unknown event ingress receive flag {other}")),
+    }
 }

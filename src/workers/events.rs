@@ -54,10 +54,11 @@
 
 use crate::core::store::{Store, TableRow};
 use crate::protocol::event_modules::types::{
-    event_id, EventId, EventRecord, EventStatus, ReceiveMetadata,
+    event_id, EventId, EventIndexEntry, EventRecord, EventStatus, ReceiveMetadata,
 };
 
-use super::schema;
+use crate::protocol::event_modules::schema;
+use crate::workers::{dependency_wake, event_admission};
 
 /// Default upper bound for one ready-event drain.
 ///
@@ -368,6 +369,113 @@ where
     work.execute(store, registry)
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PipelineStepReport {
+    pub admitted: AdmitReport,
+    pub drained: ApplyReadyReport,
+}
+
+pub(crate) fn enqueue_proposed_events(
+    store: &Store,
+    events: Vec<ProposedEvent>,
+) -> Result<usize, String> {
+    let rows = events
+        .into_iter()
+        .map(|event| schema::event_ingress_row(event.record, event.receive))
+        .collect();
+    store
+        .insert_table_rows(rows)
+        .map_err(|err| format!("enqueue event ingress: {err}"))
+}
+
+pub(crate) fn drain_event_ingress<R>(
+    store: &Store,
+    registry: &R,
+    limit: usize,
+) -> Result<AdmitReport, String>
+where
+    R: EventRegistry,
+{
+    store
+        .write_transaction(|store| {
+            let ingress = schema::claim_event_ingress(store, limit)?;
+            let keys = ingress
+                .iter()
+                .map(|event| event.key.clone())
+                .collect::<Vec<_>>();
+            let events = ingress
+                .into_iter()
+                .map(|event| ProposedEvent::contextual(event.record, event.receive))
+                .collect();
+            let mut report = AdmitReport::default();
+            process_event_batch_in_tx(store, registry, events, &mut report)?;
+            store.delete_table_rows_in_tx(schema::EVENT_INGRESS, keys)?;
+            Ok(report)
+        })
+        .map_err(|err| format!("drain event ingress: {err}"))
+}
+
+pub(crate) fn drain_ready_events<R>(
+    store: &Store,
+    registry: &R,
+    limit: usize,
+) -> Result<ApplyReadyReport, String>
+where
+    R: EventRegistry,
+{
+    drain_ready(store, registry, limit)
+}
+
+pub(crate) fn drain_recently_valid_events(
+    store: &Store,
+    limit: usize,
+) -> Result<ApplyReadyReport, String> {
+    store
+        .write_transaction(|store| {
+            let events = schema::claim_recently_valid_events(store, limit)?;
+            let keys = events
+                .iter()
+                .map(|event| event.key.clone())
+                .collect::<Vec<_>>();
+            let mut total = ApplyReadyReport::default();
+            for event in events {
+                total.unblocked_events += unblock_dependents(store, &event.event_id)?;
+            }
+            store.delete_table_rows_in_tx(schema::RECENTLY_VALID_EVENTS, keys)?;
+            Ok(total)
+        })
+        .map_err(|err| format!("drain recently valid events: {err}"))
+}
+
+fn enqueue_and_drain<R>(
+    store: &Store,
+    registry: &R,
+    events: Vec<ProposedEvent>,
+) -> Result<PipelineStepReport, String>
+where
+    R: EventRegistry,
+{
+    let mut total = PipelineStepReport::default();
+    for event in events {
+        enqueue_proposed_events(store, vec![event])?;
+        let admitted =
+            event_admission::run(store, registry, event_admission::Work::Drain { limit: 1 })?;
+        merge_admit_report(&mut total.admitted, admitted);
+        let wake = dependency_wake::run(store, dependency_wake::Work::Drain { limit: 4096 })?;
+        total.drained.unblocked_events += wake.unblocked_events;
+    }
+    Ok(total)
+}
+
+fn merge_admit_report(total: &mut AdmitReport, next: AdmitReport) {
+    total.event_ids.extend(next.event_ids);
+    total.inserted_events += next.inserted_events;
+    total.ready_events += next.ready_events;
+    total.blocked_events += next.blocked_events;
+    total.blocked_edges += next.blocked_edges;
+    total.applied_events += next.applied_events;
+}
+
 impl<T, R> Work<R> for CommandOutput<T>
 where
     R: EventRegistry,
@@ -375,7 +483,9 @@ where
     type Output = (T, AdmitReport);
 
     fn execute(self, store: &Store, registry: &R) -> Result<Self::Output, String> {
-        admit_command_output(store, registry, self)
+        let value = self.value;
+        let report = enqueue_and_drain(store, registry, self.events)?;
+        Ok((value, report.admitted))
     }
 }
 
@@ -386,11 +496,16 @@ where
     type Output = AdmitAndDrainReport<T>;
 
     fn execute(self, store: &Store, registry: &R) -> Result<Self::Output, String> {
-        let (value, admitted) = admit_command_output(store, registry, self.output)?;
+        let value = self.output.value;
+        let report = enqueue_and_drain(store, registry, self.output.events)?;
         let drained = drain_until_idle(store, registry, self.batch_size)?;
+        let drained = ApplyReadyReport {
+            applied_events: report.drained.applied_events + drained.applied_events,
+            unblocked_events: report.drained.unblocked_events + drained.unblocked_events,
+        };
         Ok(AdmitAndDrainReport {
             value,
-            admitted,
+            admitted: report.admitted,
             drained,
         })
     }
@@ -403,7 +518,12 @@ where
     type Output = AdmitReport;
 
     fn execute(self, store: &Store, registry: &R) -> Result<Self::Output, String> {
-        admit_records(store, registry, self.records)
+        enqueue_and_drain(
+            store,
+            registry,
+            self.records.into_iter().map(ProposedEvent::new).collect(),
+        )
+        .map(|report| report.admitted)
     }
 }
 
@@ -414,7 +534,7 @@ where
     type Output = AdmitReport;
 
     fn execute(self, store: &Store, registry: &R) -> Result<Self::Output, String> {
-        run_admission_pipeline(
+        enqueue_and_drain(
             store,
             registry,
             self.records
@@ -422,6 +542,7 @@ where
                 .map(|received| ProposedEvent::contextual(received.record, received.receive))
                 .collect(),
         )
+        .map(|report| report.admitted)
     }
 }
 
@@ -443,61 +564,16 @@ where
     type Output = ApplyReadyReport;
 
     fn execute(self, store: &Store, registry: &R) -> Result<Self::Output, String> {
-        drain_ready(store, registry, self.batch_size)
+        let mut report = drain_ready(store, registry, self.batch_size)?;
+        let wake = drain_recently_valid_events(store, self.batch_size)?;
+        report.unblocked_events += wake.unblocked_events;
+        Ok(report)
     }
 }
 
 // ---------------------------------------------------------------------------
 // Canonical event pipeline
 // ---------------------------------------------------------------------------
-
-fn admit_command_output<T>(
-    store: &Store,
-    modules: &impl EventRegistry,
-    output: CommandOutput<T>,
-) -> Result<(T, AdmitReport), String> {
-    let report = run_admission_pipeline(store, modules, output.events)?;
-    Ok((output.value, report))
-}
-
-fn admit_records(
-    store: &Store,
-    modules: &impl EventRegistry,
-    records: Vec<EventRecord>,
-) -> Result<AdmitReport, String> {
-    run_admission_pipeline(
-        store,
-        modules,
-        records.into_iter().map(ProposedEvent::new).collect(),
-    )
-}
-
-/// Run the batch-level admission pipeline in one store transaction.
-///
-/// This function gives callers the useful atomic unit: either all proposed
-/// events in the batch are admitted/projected as far as their dependencies allow,
-/// or none of the batch is. The per-event logic is intentionally delegated to
-/// `process_event_in_tx`; this helper owns transaction shape, not event meaning.
-///
-/// SQLite reads its own writes within this transaction, and the worker relies on
-/// that. A command may propose a parent followed by a child; the parent can be
-/// inserted, projected, and made visible to the child's dependency check before
-/// the batch commits. Splitting this into one transaction per event would be
-/// simpler only superficially: it would give up atomic command output and add
-/// commit overhead without improving the semantics.
-fn run_admission_pipeline(
-    store: &Store,
-    modules: &impl EventRegistry,
-    events: Vec<ProposedEvent>,
-) -> Result<AdmitReport, String> {
-    store
-        .write_transaction(|store| {
-            let mut report = AdmitReport::default();
-            process_event_batch_in_tx(store, modules, events, &mut report)?;
-            Ok(report)
-        })
-        .map_err(|err| format!("admit events: {err}"))
-}
 
 /// Process a caller-ordered event batch inside an existing transaction.
 ///
@@ -651,8 +727,8 @@ fn project_ready_event_in_tx(
         let record = modules.record_from_bytes(bytes).map_err(module_error)?;
         let changes = project_event_with_context_in_tx(store, modules, event_id, &record, None)?;
         write_projection_output_in_tx(store, changes)?;
+        write_applied_event_outputs_in_tx(store, event_id, &record)?;
         report.applied_events = 1;
-        report.unblocked_events = unblock_dependents(store, event_id)?;
     }
     Ok(report)
 }
@@ -668,10 +744,27 @@ fn project_ready_event_record_in_tx(
     if schema::set_event_status(store, event_id, EventStatus::Ready, EventStatus::Applied)? {
         let changes = project_event_with_context_in_tx(store, modules, event_id, record, receive)?;
         write_projection_output_in_tx(store, changes)?;
+        write_applied_event_outputs_in_tx(store, event_id, record)?;
         report.applied_events = 1;
-        report.unblocked_events = unblock_dependents(store, event_id)?;
     }
     Ok(report)
+}
+
+fn write_applied_event_outputs_in_tx(
+    store: &Store,
+    event_id: &EventId,
+    record: &EventRecord,
+) -> rusqlite::Result<()> {
+    let mut rows = vec![schema::recently_valid_event_row(*event_id)];
+    if record.scope.is_shared() {
+        rows.push(schema::applied_shared_event_row(EventIndexEntry {
+            event_id: *event_id,
+            timestamp: record.timestamp,
+            workspace_id: record.workspace_id,
+        }));
+    }
+    store.insert_table_rows_in_tx(rows)?;
+    Ok(())
 }
 
 /// Load generic context and call the registry projector.
@@ -761,9 +854,10 @@ fn drain_until_idle(
     let mut total = ApplyReadyReport::default();
     loop {
         let report = drain_ready(store, modules, batch_size)?;
+        let wake = drain_recently_valid_events(store, batch_size)?;
         total.applied_events += report.applied_events;
-        total.unblocked_events += report.unblocked_events;
-        if report.applied_events == 0 {
+        total.unblocked_events += report.unblocked_events + wake.unblocked_events;
+        if report.applied_events == 0 && wake.unblocked_events == 0 {
             return Ok(total);
         }
     }

@@ -39,12 +39,15 @@ use crate::protocol::event_modules::identity::{endpoint, endpoint_shared, invite
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::sync;
 use crate::protocol::event_modules::types::{EventRecord, ReceiveMetadata};
-use crate::protocol::event_modules::worker::{
-    self, AdmitReceivedRecords, AdmitRecords, CommandOutput, EventRegistry, ProposedEvent,
-    ReceivedRecord,
+use crate::workers::events as worker;
+use crate::workers::events::{
+    AdmitReceivedRecords, AdmitRecords, CommandOutput, EventRegistry, ProposedEvent, ReceivedRecord,
 };
+use crate::workers::{connection_egress, connection_ingress, sync_protocol};
 
-use super::{connection_ack, connection_request, schema, transit, types};
+use crate::protocol::event_modules::connection::{
+    connection_ack, connection_request, schema, transit, types,
+};
 
 pub trait ConnectionRegistry: EventRegistry {
     fn sync_index(&self) -> &sync::worker::SyncIndex;
@@ -124,12 +127,12 @@ struct OutboundSync {
 /// opaque rows ready for core TCP, protocol outbox keys represented by those
 /// rows, and small counters used by black-box CLI tests.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct NetworkIngestResult {
-    outgoing: Vec<OutboundNetworkRow>,
-    sent_outbox: Vec<Vec<Vec<u8>>>,
-    established_routes: usize,
-    sent_events: usize,
-    received_events: usize,
+pub struct NetworkIngestResult {
+    pub outgoing: Vec<OutboundNetworkRow>,
+    pub sent_outbox: Vec<Vec<Vec<u8>>>,
+    pub established_routes: usize,
+    pub sent_events: usize,
+    pub received_events: usize,
 }
 
 /// Interpretation of one inbound frame after transit unwrapping.
@@ -218,9 +221,14 @@ where
             listen,
             accept_count,
         } => run_serve(store, registry, listen, accept_count).map(Output::Served),
-        Work::ExchangeOutboundRoutes => {
-            exchange_outbound_routes(store, registry, true).map(Output::RoutesExchanged)
-        }
+        Work::ExchangeOutboundRoutes => connection_egress::run(
+            store,
+            registry,
+            connection_egress::Work::ExchangeRoutes {
+                fail_on_route_error: true,
+            },
+        )
+        .map(Output::RoutesExchanged),
         Work::StartSyncRoutes { selection } => {
             start_sync_routes(store, registry, selection, true).map(Output::SyncRoutesStarted)
         }
@@ -373,7 +381,7 @@ fn start_sync_routes<R>(
 where
     R: ConnectionRegistry,
 {
-    let start = match sync::worker::run(
+    let start = match sync_protocol::run(
         store,
         registry.sync_index(),
         sync::worker::Work::Start { selection },
@@ -392,15 +400,17 @@ where
         sent_events: started.sent_events,
         ..types::RouteExchangeReport::default()
     };
-    summary.merge(exchange_outbound_routes(
+    summary.merge(connection_egress::run(
         store,
         registry,
-        fail_on_route_error,
+        connection_egress::Work::ExchangeRoutes {
+            fail_on_route_error,
+        },
     )?);
     Ok(summary)
 }
 
-fn exchange_outbound_routes<R>(
+pub(crate) fn exchange_outbound_routes<R>(
     store: &Store,
     registry: &R,
     fail_on_route_error: bool,
@@ -458,7 +468,7 @@ fn outbound_sync(outbound: OutboundTransit) -> OutboundSync {
     }
 }
 
-fn ingest_network<R>(
+pub(crate) fn ingest_network<R>(
     store: &Store,
     registry: &R,
     inbound: InboundNetworkRow,
@@ -629,7 +639,7 @@ fn drain_projected_sync_work(
 ) -> Result<sync::worker::SyncWorkReport, String> {
     let mut aggregate = sync::worker::SyncWorkReport::default();
     loop {
-        let output = sync::worker::run(
+        let output = sync_protocol::run(
             store,
             index,
             sync::worker::Work::DrainInboundSync {
@@ -797,7 +807,14 @@ fn handle_inbound<R>(
 where
     R: ConnectionRegistry,
 {
-    let ingest = ingest_network(store, registry, inbound, remember_origin)?;
+    let ingest = connection_ingress::run(
+        store,
+        registry,
+        connection_ingress::Work::HandleInbound {
+            inbound,
+            remember_origin,
+        },
+    )?;
     summary.established_routes += ingest.established_routes;
     summary.sent_events += ingest.sent_events;
     summary.received_events += ingest.received_events;

@@ -13,7 +13,7 @@ pub mod queries;
 pub mod schema;
 pub mod transit;
 pub mod types;
-pub mod worker;
+pub use crate::workers::connection as worker;
 
 use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput};
 

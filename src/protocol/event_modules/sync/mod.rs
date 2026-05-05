@@ -12,7 +12,7 @@ pub mod compare;
 pub mod have_id;
 pub mod need_id;
 pub mod schema;
-pub mod worker;
+pub use crate::workers::sync as worker;
 
 use crate::protocol::event_modules::connection;
 use crate::protocol::event_modules::types::EventRecord;

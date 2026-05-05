@@ -10,7 +10,7 @@ use crate::protocol::event_modules::worker::CommandOutput;
 use super::super::types;
 use super::codec;
 
-pub(in crate::protocol::event_modules::connection) fn accept(
+pub(crate) fn accept(
     local: endpoint::types::EndpointKeypair,
     bytes: Vec<u8>,
 ) -> Result<CommandOutput<types::InboundConnection>, String> {

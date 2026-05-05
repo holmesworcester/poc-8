@@ -23,14 +23,11 @@ use super::types::{ConnectionId, OutboxKey};
 
 pub(in crate::protocol::event_modules) const CONNECTION_EVENTS: TableName =
     TableName::new("connection.connection_events");
-pub(in crate::protocol::event_modules) const CONNECTIONS: TableName =
-    TableName::new("connection.connections");
-pub(in crate::protocol::event_modules) const CONNECTION_SCOPED_EVENTS: TableName =
+pub(crate) const CONNECTIONS: TableName = TableName::new("connection.connections");
+pub(crate) const CONNECTION_SCOPED_EVENTS: TableName =
     TableName::new("connection.connection_scoped_events");
-pub(in crate::protocol::event_modules) const OUTBOX: TableName =
-    TableName::new("connection.outbox");
-pub(in crate::protocol::event_modules) const TRANSPORT_TARGETS: TableName =
-    TableName::new("connection.transport_targets");
+pub(crate) const OUTBOX: TableName = TableName::new("connection.outbox");
+pub(crate) const TRANSPORT_TARGETS: TableName = TableName::new("connection.transport_targets");
 
 pub const SCHEMAS: &[Schema] = &[
     Schema::durable_row_table("connection.connection_events.v1", CONNECTION_EVENTS),
@@ -67,10 +64,7 @@ pub(crate) fn transport_target_row(connection_id: ConnectionId, addr: SocketAddr
     }
 }
 
-pub(in crate::protocol::event_modules) fn connection_scoped_event_row(
-    event_id: EventId,
-    canonical_bytes: Vec<u8>,
-) -> TableRow {
+pub(crate) fn connection_scoped_event_row(event_id: EventId, canonical_bytes: Vec<u8>) -> TableRow {
     TableRow {
         table: CONNECTION_SCOPED_EVENTS,
         key: event_id.to_vec(),
@@ -78,10 +72,7 @@ pub(in crate::protocol::event_modules) fn connection_scoped_event_row(
     }
 }
 
-pub(in crate::protocol::event_modules) fn outbox_row(
-    connection_id: ConnectionId,
-    event_id: EventId,
-) -> TableRow {
+pub(crate) fn outbox_row(connection_id: ConnectionId, event_id: EventId) -> TableRow {
     let key = OutboxKey {
         connection_id,
         event_id,
@@ -94,7 +85,7 @@ pub(in crate::protocol::event_modules) fn outbox_row(
     }
 }
 
-pub(in crate::protocol::event_modules) fn remote_endpoint(
+pub(crate) fn remote_endpoint(
     store: &Store,
     connection_id: ConnectionId,
 ) -> Result<EndpointId, String> {

@@ -26,6 +26,26 @@ pub struct EventRecord {
     pub scope: EventScope,
 }
 
+impl EventRecord {
+    pub(crate) fn from_stored_parts(
+        timestamp: u64,
+        body_len: usize,
+        canonical_bytes: Vec<u8>,
+        dependencies: Vec<EventId>,
+        workspace_id: Option<EventId>,
+        scope: EventScope,
+    ) -> Self {
+        Self {
+            timestamp,
+            body_len,
+            canonical_bytes,
+            dependencies,
+            workspace_id,
+            scope,
+        }
+    }
+}
+
 /// Subjective metadata attached by a receive boundary.
 ///
 /// This is not part of the globally canonical event id. It is local projection

@@ -2,7 +2,7 @@ use std::cell::Cell;
 
 use topo::core::store::Store;
 use topo::protocol::event_modules::content::content_event;
-use topo::protocol::event_modules::identity::{endpoint, endpoint_shared};
+use topo::protocol::event_modules::identity::{endpoint, endpoint_shared, workspace};
 use topo::protocol::event_modules::schema::{self as event_schema, EventLabel};
 use topo::protocol::event_modules::types::{event_id, EventId, EventRecord, EventScope};
 use topo::protocol::event_modules::worker::{
@@ -10,6 +10,7 @@ use topo::protocol::event_modules::worker::{
 };
 use topo::protocol::event_modules::Modules;
 use topo::protocol::Protocol;
+use topo::workers::{dependency_wake, event_admission, event_projection, sync_index};
 
 #[test]
 fn command_admission_returns_event_ids_for_chaining() {
@@ -104,6 +105,108 @@ fn worker_fetches_dependency_records_and_labels_before_projection() {
     let drain = worker::run(&store, &registry, worker::DrainUntilIdle { batch_size: 10 }).unwrap();
     assert_eq!(drain.applied_events, 1);
     assert!(registry.child_saw_context.get());
+}
+
+#[test]
+fn event_pipeline_workers_claim_and_ack_explicit_queues() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Protocol::open_store(tmp.path().join("explicit-queues.db")).unwrap();
+
+    let dep_bytes = b"queued-dep".to_vec();
+    let child_bytes = b"queued-child".to_vec();
+    let dep_id = event_id(&dep_bytes);
+    let child_id = event_id(&child_bytes);
+    let registry = ContextRegistry {
+        dep_id,
+        child_id,
+        dep_bytes: dep_bytes.clone(),
+        child_bytes: child_bytes.clone(),
+        child_saw_context: Cell::new(false),
+    };
+
+    let child = registry.record_for(child_bytes).unwrap();
+    store
+        .insert_table_rows(vec![event_schema::event_ingress_row(child, None)])
+        .expect("enqueue child ingress");
+    let child_admission =
+        event_admission::run(&store, &registry, event_admission::Work::Drain { limit: 1 })
+            .expect("admit queued child");
+    assert_eq!(child_admission.blocked_events, 1);
+    assert_eq!(
+        store
+            .table_row_count(event_schema::EVENT_INGRESS)
+            .expect("count ingress"),
+        0,
+        "admission acks claimed ingress rows"
+    );
+
+    let dep = registry.record_for(dep_bytes).unwrap();
+    store
+        .insert_table_rows(vec![event_schema::event_ingress_row(dep, None)])
+        .expect("enqueue dep ingress");
+    let dep_admission =
+        event_admission::run(&store, &registry, event_admission::Work::Drain { limit: 1 })
+            .expect("admit queued dependency");
+    assert_eq!(dep_admission.applied_events, 1);
+    assert_eq!(
+        store
+            .table_row_count(event_schema::RECENTLY_VALID_EVENTS)
+            .expect("count recently valid"),
+        1,
+        "projection writes recently-valid wake input"
+    );
+
+    let wake = dependency_wake::run(&store, dependency_wake::Work::Drain { limit: 1 })
+        .expect("wake blocked child");
+    assert_eq!(wake.unblocked_events, 1);
+    assert_eq!(
+        store
+            .table_row_count(event_schema::RECENTLY_VALID_EVENTS)
+            .expect("count recently valid after wake"),
+        0,
+        "dependency wake acks recently-valid rows"
+    );
+
+    let projected = event_projection::run(
+        &store,
+        &registry,
+        event_projection::Work::Drain { limit: 1 },
+    )
+    .expect("project child");
+    assert_eq!(projected.applied_events, 1);
+    assert!(registry.child_saw_context.get());
+}
+
+#[test]
+fn sync_index_worker_consumes_applied_shared_event_queue() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Protocol::open_store(tmp.path().join("sync-index-queue.db")).unwrap();
+    let modules = Modules::new();
+
+    let output = workspace::commands::create(workspace::commands::CreateWorkspace {
+        created_at_ms: 1,
+        public_key: [9; 32],
+        name: "queue-index".to_string(),
+    })
+    .unwrap();
+    worker::run(&store, &modules, output).expect("admit shared event");
+    assert_eq!(
+        store
+            .table_row_count(event_schema::APPLIED_SHARED_EVENTS)
+            .expect("count sync index queue"),
+        1
+    );
+
+    let index = topo::protocol::event_modules::sync::worker::SyncIndex::default();
+    let report = sync_index::run(&store, &index, sync_index::Work::Drain { limit: 16 })
+        .expect("drain sync index queue");
+    assert_eq!(report.indexed_events, 1);
+    assert_eq!(
+        store
+            .table_row_count(event_schema::APPLIED_SHARED_EVENTS)
+            .expect("count sync index queue after drain"),
+        0
+    );
 }
 
 #[test]

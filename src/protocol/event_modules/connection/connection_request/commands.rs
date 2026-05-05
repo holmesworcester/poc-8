@@ -59,7 +59,7 @@ pub fn create_with_local(
     Ok(create(local.value, invite_link)?.prepend_events(local.events))
 }
 
-pub(in crate::protocol::event_modules::connection) fn accept(
+pub(crate) fn accept(
     local: endpoint::types::EndpointKeypair,
     bootstrap_hash_is_authorized: bool,
     bytes: Vec<u8>,

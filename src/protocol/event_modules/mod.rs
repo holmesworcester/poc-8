@@ -16,7 +16,7 @@ pub mod schema;
 pub mod sync;
 pub mod test_events;
 pub mod types;
-pub mod worker;
+pub use crate::workers::events as worker;
 
 use std::sync::Arc;
 

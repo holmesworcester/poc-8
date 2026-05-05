@@ -32,15 +32,17 @@ use crate::protocol::event_modules::connection;
 use crate::protocol::event_modules::identity::{endpoint, endpoint_shared};
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::types::{EventId, EventIndexEntry, EventRecord};
-use crate::protocol::event_modules::worker::CommandOutput;
+use crate::workers::events::CommandOutput;
+use crate::workers::sync_index;
 
-use super::{
+use crate::protocol::event_modules::sync::{
     compare,
     compare::types::{RangeSummary, TimestampRange},
     schema,
 };
 
 pub const DEFAULT_INBOUND_BATCH: usize = 1024;
+const DEFAULT_INDEX_BATCH: usize = 4096;
 
 /// Work accepted by the sync worker.
 ///
@@ -98,6 +100,7 @@ pub struct SyncWorkReport {
 /// should add a `Work` variant and keep the command/query/projection boundary
 /// visible here.
 pub fn run(store: &Store, index: &SyncIndex, work: Work) -> Result<Output, String> {
+    drain_index_queue(store, index)?;
     index.catch_up(store)?;
     match work {
         Work::Start { selection } => {
@@ -108,6 +111,21 @@ pub fn run(store: &Store, index: &SyncIndex, work: Work) -> Result<Output, Strin
             limit,
         } => {
             drain_inbound_events(store, index, connection_id, limit).map(Output::DrainedInboundSync)
+        }
+    }
+}
+
+fn drain_index_queue(store: &Store, index: &SyncIndex) -> Result<(), String> {
+    loop {
+        let report = sync_index::run(
+            store,
+            index,
+            sync_index::Work::Drain {
+                limit: DEFAULT_INDEX_BATCH,
+            },
+        )?;
+        if report.indexed_events < DEFAULT_INDEX_BATCH {
+            return Ok(());
         }
     }
 }
@@ -360,18 +378,23 @@ pub struct SyncIndex {
 }
 
 impl SyncIndex {
-    fn catch_up(&self, store: &Store) -> Result<(), String> {
-        let entries = event_schema::event_index_entries_in_timestamp_range(store, 0, u64::MAX)
-            .map_err(|err| format!("load sync index feed: {err}"))?;
+    pub(crate) fn insert_entry(&self, entry: EventIndexEntry) -> Result<bool, String> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| "sync index mutex poisoned".to_string())?;
+        if state.indexed.contains(&entry.event_id) {
+            return Ok(false);
+        }
+        state.insert(entry);
+        Ok(true)
+    }
+
+    fn catch_up(&self, store: &Store) -> Result<(), String> {
+        let entries = event_schema::event_index_entries_in_timestamp_range(store, 0, u64::MAX)
+            .map_err(|err| format!("load sync index feed: {err}"))?;
         for entry in entries {
-            if state.indexed.contains(&entry.event_id) {
-                continue;
-            }
-            state.insert(entry);
+            self.insert_entry(entry)?;
         }
         Ok(())
     }
