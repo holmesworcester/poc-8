@@ -92,6 +92,10 @@ pub fn schemas() -> Vec<Schema> {
     out.extend_from_slice(identity::user_invite::schema::SCHEMAS);
     out.extend_from_slice(identity::workspace::schema::SCHEMAS);
     out.extend_from_slice(content::content_event::schema::SCHEMAS);
+    out.extend_from_slice(content::message::schema::SCHEMAS);
+    out.extend_from_slice(content::reaction::schema::SCHEMAS);
+    out.extend_from_slice(content::file::schema::SCHEMAS);
+    out.extend_from_slice(content::file_slice::schema::SCHEMAS);
     out.extend_from_slice(connection::schema::SCHEMAS);
     out.extend_from_slice(sync::schema::SCHEMAS);
     out.extend_from_slice(test_events::event_with_deps::schema::SCHEMAS);
@@ -148,6 +152,28 @@ pub fn record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
         content::content_event::codec::TYPE_CONTENT => Err("content must be signed".to_string()),
         content::content_event::codec::TYPE_SIGNED_CONTENT => {
             content::content_event::codec::signed_record_from_bytes(bytes)
+        }
+        content::message::codec::TYPE_MESSAGE => Err("message must be signed".to_string()),
+        content::message::codec::TYPE_SIGNED_MESSAGE => {
+            content::message::codec::signed_record_from_bytes(bytes)
+        }
+        content::reaction::codec::TYPE_REACTION => Err("reaction must be signed".to_string()),
+        content::reaction::codec::TYPE_SIGNED_REACTION => {
+            content::reaction::codec::signed_record_from_bytes(bytes)
+        }
+        content::message_deletion::codec::TYPE_MESSAGE_DELETION => {
+            Err("message deletion must be signed".to_string())
+        }
+        content::message_deletion::codec::TYPE_SIGNED_MESSAGE_DELETION => {
+            content::message_deletion::codec::signed_record_from_bytes(bytes)
+        }
+        content::file::codec::TYPE_FILE => Err("file must be signed".to_string()),
+        content::file::codec::TYPE_SIGNED_FILE => {
+            content::file::codec::signed_record_from_bytes(bytes)
+        }
+        content::file_slice::codec::TYPE_FILE_SLICE => Err("file slice must be signed".to_string()),
+        content::file_slice::codec::TYPE_SIGNED_FILE_SLICE => {
+            content::file_slice::codec::signed_record_from_bytes(bytes)
         }
         test_events::event_with_deps::codec::TYPE_EVENT_WITH_DEPS => {
             test_events::event_with_deps::codec::record_from_bytes(bytes)
