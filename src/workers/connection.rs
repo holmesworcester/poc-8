@@ -39,12 +39,14 @@ use crate::protocol::event_modules::identity::{endpoint, endpoint_shared, invite
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::sync;
 use crate::protocol::event_modules::types::{EventRecord, ReceiveMetadata};
-use crate::protocol::event_modules::worker::{
-    self, AdmitReceivedRecords, AdmitRecords, CommandOutput, EventRegistry, ProposedEvent,
-    ReceivedRecord,
+use crate::workers::events as worker;
+use crate::workers::events::{
+    AdmitReceivedRecords, AdmitRecords, CommandOutput, EventRegistry, ProposedEvent, ReceivedRecord,
 };
 
-use super::{connection_ack, connection_request, schema, transit, types};
+use crate::protocol::event_modules::connection::{
+    connection_ack, connection_request, schema, transit, types,
+};
 
 pub trait ConnectionRegistry: EventRegistry {
     fn sync_index(&self) -> &sync::worker::SyncIndex;

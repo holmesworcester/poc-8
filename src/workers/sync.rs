@@ -32,9 +32,9 @@ use crate::protocol::event_modules::connection;
 use crate::protocol::event_modules::identity::{endpoint, endpoint_shared};
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::types::{EventId, EventIndexEntry, EventRecord};
-use crate::protocol::event_modules::worker::CommandOutput;
+use crate::workers::events::CommandOutput;
 
-use super::{
+use crate::protocol::event_modules::sync::{
     compare,
     compare::types::{RangeSummary, TimestampRange},
     schema,

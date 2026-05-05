@@ -57,7 +57,7 @@ use crate::protocol::event_modules::types::{
     event_id, EventId, EventRecord, EventStatus, ReceiveMetadata,
 };
 
-use super::schema;
+use crate::protocol::event_modules::schema;
 
 /// Default upper bound for one ready-event drain.
 ///

@@ -14,19 +14,19 @@ pub type ConnectionId = [u8; 32];
 pub(super) const EVENT_MAGIC: &[u8; 10] = b"TOPOCONN1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct InboundConnection {
+pub(crate) struct InboundConnection {
     pub outgoing: Vec<Vec<u8>>,
     pub connection_id: Option<ConnectionId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct OutboxKey {
-    pub(super) connection_id: ConnectionId,
-    pub(super) event_id: EventId,
+pub(crate) struct OutboxKey {
+    pub(crate) connection_id: ConnectionId,
+    pub(crate) event_id: EventId,
 }
 
 impl OutboxKey {
-    pub(super) fn to_bytes(self) -> Vec<u8> {
+    pub(crate) fn to_bytes(self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(64);
         bytes.extend_from_slice(&self.connection_id);
         bytes.extend_from_slice(&self.event_id);
@@ -42,19 +42,17 @@ pub(super) fn connection_id(request_id: &EventId, from_endpoint: &EndpointId) ->
     *hasher.finalize().as_bytes()
 }
 
-pub(super) fn event_id(bytes: &[u8]) -> EventId {
+pub(crate) fn event_id(bytes: &[u8]) -> EventId {
     *blake3::hash(bytes).as_bytes()
 }
 
-pub(in crate::protocol::event_modules) fn connection_id_from_bytes(
-    bytes: &[u8],
-) -> Result<ConnectionId, String> {
+pub(crate) fn connection_id_from_bytes(bytes: &[u8]) -> Result<ConnectionId, String> {
     bytes
         .try_into()
         .map_err(|_| "connection id must be 32 bytes".to_string())
 }
 
-pub(super) fn is_connection_event(bytes: &[u8]) -> bool {
+pub(crate) fn is_connection_event(bytes: &[u8]) -> bool {
     bytes.starts_with(EVENT_MAGIC)
 }
 
@@ -89,7 +87,7 @@ pub struct RouteExchangeReport {
 }
 
 impl RouteExchangeReport {
-    pub(super) fn merge(&mut self, other: Self) {
+    pub(crate) fn merge(&mut self, other: Self) {
         self.routes_synced += other.routes_synced;
         self.failed_routes += other.failed_routes;
         self.sent_events += other.sent_events;
