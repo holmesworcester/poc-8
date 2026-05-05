@@ -309,11 +309,13 @@ where
                 store,
                 registry,
                 inbound,
-                true,
-                invite_scope,
                 summary,
-                &sent_outbox,
-                None,
+                InboundHandling {
+                    remember_origin: true,
+                    bootstrap_scope: invite_scope,
+                    sent_outbox: &sent_outbox,
+                    stream_scopes: None,
+                },
             )
         },
         |rows, _| mark_sent_network_rows(store, rows, &sent_outbox),
@@ -366,11 +368,13 @@ where
                 store,
                 registry,
                 inbound,
-                false,
-                None,
                 &mut one_stream,
-                &sent_outbox,
-                Some(&bootstrap_scopes),
+                InboundHandling {
+                    remember_origin: false,
+                    bootstrap_scope: None,
+                    sent_outbox: &sent_outbox,
+                    stream_scopes: Some(&bootstrap_scopes),
+                },
             )?;
             summary.received_events += one_stream.received_events;
             Ok(outgoing)
@@ -410,11 +414,13 @@ where
                     store,
                     registry,
                     inbound,
-                    false,
-                    None,
                     &mut one_stream,
-                    &sent_outbox,
-                    Some(&bootstrap_scopes),
+                    InboundHandling {
+                        remember_origin: false,
+                        bootstrap_scope: None,
+                        sent_outbox: &sent_outbox,
+                        stream_scopes: Some(&bootstrap_scopes),
+                    },
                 )?;
                 stream_summary.received_events += one_stream.received_events;
                 Ok(outgoing)
@@ -537,11 +543,13 @@ where
                 store,
                 registry,
                 inbound,
-                false,
-                None,
                 summary,
-                &sent_outbox,
-                None,
+                InboundHandling {
+                    remember_origin: false,
+                    bootstrap_scope: None,
+                    sent_outbox: &sent_outbox,
+                    stream_scopes: None,
+                },
             )
         },
         |rows, _| mark_sent_network_rows(store, rows, &sent_outbox),
@@ -970,33 +978,40 @@ fn batch_outbox_items(items: Vec<OutboxItem>) -> Vec<Vec<OutboxItem>> {
     batches
 }
 
+struct InboundHandling<'a> {
+    remember_origin: bool,
+    bootstrap_scope: Option<BootstrapScope>,
+    sent_outbox: &'a RefCell<HashMap<Vec<u8>, Vec<Vec<u8>>>>,
+    stream_scopes: Option<&'a RefCell<HashMap<SocketAddr, BootstrapScope>>>,
+}
+
 fn handle_inbound<R>(
     store: &Store,
     registry: &R,
     inbound: InboundNetworkRow,
-    remember_origin: bool,
-    bootstrap_scope: Option<BootstrapScope>,
     summary: &mut StreamExchangeReport,
-    sent_outbox: &RefCell<HashMap<Vec<u8>, Vec<Vec<u8>>>>,
-    stream_scopes: Option<&RefCell<HashMap<SocketAddr, BootstrapScope>>>,
+    handling: InboundHandling<'_>,
 ) -> Result<Vec<OutboundNetworkRow>, String>
 where
     R: ConnectionRegistry,
 {
     let origin = inbound.source.addr();
-    let remembered_scope = stream_scopes.and_then(|scopes| scopes.borrow().get(&origin).copied());
-    let active_bootstrap_scope = bootstrap_scope
+    let remembered_scope = handling
+        .stream_scopes
+        .and_then(|scopes| scopes.borrow().get(&origin).copied());
+    let active_bootstrap_scope = handling
+        .bootstrap_scope
         .or(summary.bootstrap_scope)
         .or(remembered_scope);
     let mut ingest = ingest_network(
         store,
         registry,
         inbound,
-        remember_origin,
+        handling.remember_origin,
         active_bootstrap_scope,
     )?;
     summary.bootstrap_scope = summary.bootstrap_scope.or(ingest.bootstrap_scope);
-    if let (Some(scopes), Some(scope)) = (stream_scopes, ingest.bootstrap_scope) {
+    if let (Some(scopes), Some(scope)) = (handling.stream_scopes, ingest.bootstrap_scope) {
         scopes.borrow_mut().insert(origin, scope);
     }
     summary.established_routes += ingest.established_routes;
@@ -1021,7 +1036,7 @@ where
     )
     .map_err(|err| format!("drain ready events after inbound network: {err}"))?;
 
-    remember_sent_outbox(sent_outbox, &ingest.outgoing, &ingest.sent_outbox)?;
+    remember_sent_outbox(handling.sent_outbox, &ingest.outgoing, &ingest.sent_outbox)?;
     Ok(ingest.outgoing)
 }
 

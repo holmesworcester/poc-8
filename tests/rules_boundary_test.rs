@@ -751,6 +751,47 @@ fn cli_harness_is_process_only() {
 }
 
 #[test]
+fn functional_cli_and_network_tests_use_black_box_setup() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let test_files = [
+        "tests/black_box_sync_test.rs",
+        "tests/cascade_cli_test.rs",
+        "tests/generate_cli_test.rs",
+        "tests/invite_accept_cli_test.rs",
+    ];
+    let forbidden = [
+        "use topo::core::",
+        "use topo::protocol::",
+        "topo::core::",
+        "topo::protocol::",
+        "Protocol::",
+        "worker::run",
+        "open_store",
+        "insert_table_rows",
+        "install_workspace_graph",
+        "workspace_graph",
+        "EventRecord",
+        "CommandOutput",
+    ];
+    let mut violations = Vec::new();
+
+    for file in test_files {
+        let text = source_text(&root.join(file));
+        for needle in forbidden {
+            if text.contains(needle) {
+                violations.push(format!("{file} contains {needle}"));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "functional CLI/network tests must set up initial state through public CLI/process/network boundaries, not protocol/store internals:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
 fn core_does_not_import_protocol() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let core_files = rust_files(&root.join("src/core"));

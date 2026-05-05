@@ -60,7 +60,7 @@ the rule is still prose/review only.
 | `types.rs` does not store encoded/canonical artifacts as semantic fields. | static | `event_module_types_do_not_store_encoded_event_artifacts`. |
 | Production shared events require authority. | partial | Durable shared-state events must be signed by an authorized dependency unless they are self-authenticating root events such as `workspace`. Local-only secrets, connection-scoped protocol work, and test-only event modules are explicit carveouts. Raw `device_invite` and raw content are rejected by registry dispatch; signed identity/content projectors validate signer authority from event context. |
 | Crypto behavior must be real where claimed and primitive implementations live in core crypto. | static + partial | `source_does_not_contain_fake_crypto_claims`; transit uses `core::crypto` X25519/XChaCha helpers while keeping associated-data and purpose policy in connection code. Cryptographic correctness still needs implementation review and tests. |
-| Functional proof comes from black-box CLI/network tests, except pure projector/command tests. | partial | Existing tests spawn the real `topo` binary for sync/generate/cascade paths; this remains a process/testing rule, not a type guarantee. |
+| Functional proof comes from black-box CLI/network tests, except pure projector/command tests. | static + partial | Existing tests spawn the real `topo` binary for sync/generate/cascade paths. `functional_cli_and_network_tests_use_black_box_setup` rejects protocol/store imports and known seeding shortcuts in functional CLI/network tests so initial setup cannot install domain rows or identity graphs directly. |
 | Workers with cursors, leases, fairness, and wake declarations are the long-term control loop. | uncovered | Described in [plan.md](plan.md); only the event-modules worker, connection worker, and sync worker exist in the current POC. |
 | Rust idiom and common correctness lints pass. | static | Run `cargo clippy --all-targets -- -D warnings` in addition to `cargo test`; Clippy complements but does not replace [rules_boundary_test.rs](tests/rules_boundary_test.rs). |
 
@@ -823,6 +823,10 @@ Use these rules:
 
 - Functional tests are black-box by default. They should drive the public
   `topo` binary and assert observable behavior.
+- Initial setup for functional tests must also be black-box. If a test needs
+  workspaces, users, endpoints, invites, routes, or initial content, create them
+  through the public CLI/process/network path being claimed rather than seeding
+  core tables, copying rows, or installing domain graphs directly.
 - CLI tests run the actual `topo` binary.
 - Networking tests use real networking through the CLI. If a test claims sync,
   transport, or multi-node behavior, it must move bytes across real sockets with
