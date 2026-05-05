@@ -4,6 +4,8 @@
 //! The facade owns primitive selection and low-level library calls, keeping
 //! event modules from growing their own hash or signature implementations.
 
+use std::io::{Cursor, Read, Write};
+
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -133,6 +135,64 @@ fn x25519_hkdf_sha256_key(
     Ok(key)
 }
 
+/// BLAKE3 verified streaming root hash + outboard for the given plaintext.
+///
+/// The outboard carries the BLAKE3 tree nodes that prove any slice of the
+/// plaintext belongs to the returned root hash. Senders compute this once;
+/// receivers verify each slice independently against the root.
+pub fn bao_outboard(plaintext: &[u8]) -> Result<(Hash, Vec<u8>), String> {
+    let mut outboard = Vec::new();
+    let mut encoder = bao::encode::Encoder::new_outboard(Cursor::new(&mut outboard));
+    encoder
+        .write_all(plaintext)
+        .map_err(|err| format!("bao encode: {err}"))?;
+    let hash = encoder
+        .finalize()
+        .map_err(|err| format!("bao finalize: {err}"))?;
+    Ok((*hash.as_bytes(), outboard))
+}
+
+/// Extract a self-contained BAO slice proof for `[slice_start, slice_start + slice_len)`.
+///
+/// The returned bytes contain both the verified plaintext and the tree nodes
+/// needed to verify it against `root_hash`. They are what slice events should
+/// carry on the wire.
+pub fn bao_extract_slice(
+    plaintext: &[u8],
+    outboard: &[u8],
+    slice_start: u64,
+    slice_len: u64,
+) -> Result<Vec<u8>, String> {
+    let mut extractor = bao::encode::SliceExtractor::new_outboard(
+        Cursor::new(plaintext),
+        Cursor::new(outboard),
+        slice_start,
+        slice_len,
+    );
+    let mut proof = Vec::new();
+    extractor
+        .read_to_end(&mut proof)
+        .map_err(|err| format!("bao extract: {err}"))?;
+    Ok(proof)
+}
+
+/// Verify a BAO slice proof against `root_hash` and return the slice plaintext.
+pub fn bao_verify_slice(
+    root_hash: &Hash,
+    proof: &[u8],
+    slice_start: u64,
+    slice_len: u64,
+) -> Result<Vec<u8>, String> {
+    let hash = bao::Hash::from(*root_hash);
+    let mut decoder =
+        bao::decode::SliceDecoder::new(Cursor::new(proof), &hash, slice_start, slice_len);
+    let mut output = Vec::new();
+    decoder
+        .read_to_end(&mut output)
+        .map_err(|err| format!("bao verify: {err}"))?;
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +281,41 @@ mod tests {
             &ciphertext,
         )
         .is_err());
+    }
+
+    #[test]
+    fn bao_round_trips_each_slice_against_root_hash() {
+        let plaintext: Vec<u8> = (0..600_000u32).map(|byte| byte as u8).collect();
+        let (root_hash, outboard) = bao_outboard(&plaintext).expect("outboard");
+
+        let slice_size = 256 * 1024;
+        let mut start = 0u64;
+        while (start as usize) < plaintext.len() {
+            let len = (plaintext.len() as u64 - start).min(slice_size as u64);
+            let proof =
+                bao_extract_slice(&plaintext, &outboard, start, len).expect("extract slice");
+            let verified = bao_verify_slice(&root_hash, &proof, start, len).expect("verify slice");
+            assert_eq!(
+                verified.as_slice(),
+                &plaintext[start as usize..(start + len) as usize]
+            );
+            start += slice_size as u64;
+        }
+    }
+
+    #[test]
+    fn bao_verify_rejects_tampered_proof_and_wrong_root_hash() {
+        let plaintext = b"important payload bytes".to_vec();
+        let (root_hash, outboard) = bao_outboard(&plaintext).expect("outboard");
+        let mut proof = bao_extract_slice(&plaintext, &outboard, 0, plaintext.len() as u64)
+            .expect("extract slice");
+
+        let last = proof.len() - 1;
+        proof[last] ^= 1;
+        assert!(bao_verify_slice(&root_hash, &proof, 0, plaintext.len() as u64).is_err());
+
+        proof[last] ^= 1;
+        let wrong_hash = [0xff; HASH_BYTES];
+        assert!(bao_verify_slice(&wrong_hash, &proof, 0, plaintext.len() as u64).is_err());
     }
 }

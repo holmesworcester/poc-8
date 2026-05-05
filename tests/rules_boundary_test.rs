@@ -756,6 +756,7 @@ fn functional_cli_and_network_tests_use_black_box_setup() {
     let test_files = [
         "tests/black_box_sync_test.rs",
         "tests/cascade_cli_test.rs",
+        "tests/content_cli_test.rs",
         "tests/generate_cli_test.rs",
         "tests/invite_accept_cli_test.rs",
     ];
