@@ -124,12 +124,6 @@ fn purge_deleted_message(
             vec![message::schema::message_key(event.workspace_id, message_id)],
         )
         .map_err(|err| format!("delete message row: {err}"))?;
-    store
-        .delete_table_rows_in_tx(
-            message::schema::SEALED_MESSAGES,
-            vec![message::schema::message_key(event.workspace_id, message_id)],
-        )
-        .map_err(|err| format!("delete sealed message row: {err}"))?;
     if event_schema::purge_event(store, &message_id)
         .map_err(|err| format!("purge message event: {err}"))?
     {
@@ -162,15 +156,6 @@ fn purge_reaction_for_deleted_message(
             )],
         )
         .map_err(|err| format!("delete reaction row: {err}"))?;
-    store
-        .delete_table_rows_in_tx(
-            reaction::schema::SEALED_REACTIONS,
-            vec![reaction::schema::reaction_key(
-                event.workspace_id,
-                reaction_id,
-            )],
-        )
-        .map_err(|err| format!("delete sealed reaction row: {err}"))?;
     if event_schema::purge_event(store, &reaction_id)
         .map_err(|err| format!("purge reaction event: {err}"))?
     {

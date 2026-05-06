@@ -15,7 +15,6 @@ use crate::protocol::event_modules::content::{file, file_slice, message};
 use crate::protocol::event_modules::identity::endpoint;
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker::{self, CommandOutput, ProposedEvent};
-use crate::workers::content_decrypt;
 
 const SEND_FILE_USAGE: &str = "send-file WORKSPACE_ID_HEX TEXT --file PATH [--mime MIME]";
 
@@ -178,12 +177,6 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
     if report.admitted.inserted_events == 0 {
         return Err("send-file bundle was not admitted".to_string());
     }
-    content_decrypt::run(
-        &context.store,
-        content_decrypt::Work::Drain {
-            limit: worker::DEFAULT_READY_BATCH,
-        },
-    )?;
     Ok(CliOutput::lines(report.value.lines()))
 }
 

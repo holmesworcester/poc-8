@@ -15,7 +15,6 @@ use crate::protocol::event_modules::identity::{endpoint, endpoint_shared, user};
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker;
-use crate::workers::content_decrypt;
 
 use super::{commands, schema};
 
@@ -120,12 +119,6 @@ fn run_send_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
     if report.admitted.inserted_events == 0 {
         return Err("message was not admitted".to_string());
     }
-    content_decrypt::run(
-        &context.store,
-        content_decrypt::Work::Drain {
-            limit: worker::DEFAULT_READY_BATCH,
-        },
-    )?;
     Ok(CliOutput::lines(
         SendSummary {
             event_id: report.value.message_id,

@@ -59,7 +59,7 @@ the rule is still prose/review only.
 | `EventRecord` literals are constructed only by codecs. | static | `event_records_are_constructed_only_by_codecs`. |
 | Codecs use shared binary helpers and reject trailing bytes. | static + partial | `codec_files_use_shared_binary_helpers_and_finish_reads`; this catches common drift but is not a formal fixed-width proof. |
 | `types.rs` does not store encoded/canonical artifacts as semantic fields. | static | `event_module_types_do_not_store_encoded_event_artifacts`. |
-| Production shared events require authority. | partial | Durable shared-state events must be signed by an authorized dependency unless they are self-authenticating root events such as `workspace`. Local-only secrets, connection-scoped protocol work, and test-only event modules are explicit carveouts. Raw `device_invite` and raw content are rejected by registry dispatch; signed identity/content projectors validate signer authority from event context. |
+| Production shared events require authority. | partial | Durable shared-state events must be signed by an authorized dependency unless they are self-authenticating root events such as `workspace`. Local-only secrets, connection-scoped protocol work, and test-only event modules are explicit carveouts. Raw `device_invite` and raw content are rejected by registry dispatch; signed identity projectors and content preparation validate signer authority from event context before pure projection. |
 | Crypto behavior must be real where claimed and primitive implementations live in core crypto. | static + partial | `source_does_not_contain_fake_crypto_claims`; transit uses `core::crypto` X25519/XChaCha helpers while keeping associated-data and purpose policy in connection code. Cryptographic correctness still needs implementation review and tests. |
 | Functional proof comes from black-box CLI/network tests, except pure projector/command tests. | static + partial | Existing tests spawn the real `topo` binary for sync/generate/cascade/content paths. `functional_cli_and_network_tests_use_black_box_setup` rejects protocol/store imports and known seeding shortcuts in functional CLI/network tests so initial setup cannot install domain rows or identity graphs directly. |
 | Workers with bounded calls, fairness limits, and explicit inputs are the control loop. | partial | Described in [src/workers/README.md](src/workers/README.md); event admission/projection/dependency unblock, transit out, and sync expose explicit worker entrypoints and queues. The caller chooses the next worker step. |
@@ -109,8 +109,8 @@ The following rules should stay mechanically enforced where practical:
 - Codec files do not define public semantic types, and every codec module has a
   sibling `types.rs`.
 - Domain roots contain only child event modules plus shared domain files:
-  `mod.rs`, `schema.rs`, `queries.rs`, `types.rs`, `commands.rs`, and
-  `cli.rs`. Domain commands are for cross-child protocol decisions over
+  `mod.rs`, `schema.rs`, `queries.rs`, `types.rs`, `commands.rs`,
+  `prepare.rs`, and `cli.rs`. Domain commands are for cross-child protocol decisions over
   explicit context. Worker
   implementations live under `src/workers`; domain roots may re-export worker
   modules for compatibility while the codebase migrates.
@@ -121,6 +121,11 @@ The following rules should stay mechanically enforced where practical:
   at the domain root instead of masquerading as event modules.
 - Event-module files use standard concern names only. New concern files require
   an explicit boundary decision and a static-test update.
+- `prepare.rs` is the projection-time semantic preparation concern. It may
+  decode, verify signatures already declared by codecs, check dependency
+  context, and use real `core::crypto` to open the current event before handing
+  a semantic value to a pure projector. It must not write rows, emit events,
+  drive workers, or become durable plaintext cache logic.
 - `mod.rs` files have one job: declare child modules and provide shallow
   registry/catalog dispatch such as schema aggregation, tag-to-codec decoding,
   and tag-to-projector routing. They must not own commands, queries, workers,
@@ -276,6 +281,9 @@ event_modules/<domain>/<module>/types.rs
 
 event_modules/<domain>/<module>/projector.rs
   EventWithContext -> ProjectionOutput { rows, labels }
+
+event_modules/<domain>/prepare.rs
+  EventWithContext -> prepared semantic value for pure projection
 
 event_modules/<domain>/<module>/schema.rs
   module-owned projection schema, indexes, queues, cursors, and storage class

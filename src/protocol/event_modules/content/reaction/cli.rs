@@ -6,7 +6,6 @@ use crate::protocol::event_modules::content::message;
 use crate::protocol::event_modules::identity::endpoint;
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker;
-use crate::workers::content_decrypt;
 
 use super::commands;
 
@@ -79,12 +78,6 @@ fn run_react_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutp
     if report.admitted.inserted_events == 0 {
         return Err("reaction was not admitted".to_string());
     }
-    content_decrypt::run(
-        &context.store,
-        content_decrypt::Work::Drain {
-            limit: worker::DEFAULT_READY_BATCH,
-        },
-    )?;
     Ok(CliOutput::lines(
         ReactSummary {
             event_id: report.value.reaction_id,

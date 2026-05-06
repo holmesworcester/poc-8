@@ -12,7 +12,6 @@ use crate::protocol::event_modules::identity::{admin, endpoint, endpoint_shared}
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker as common_worker;
-use crate::workers::content_decrypt;
 
 use super::{
     key_wrap, local_history_node_secret, local_key_secret, local_recipient_key, recipient_key,
@@ -310,13 +309,6 @@ fn run_key_derive_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cl
     let worker::Output::DerivedKeySecrets(report) = output else {
         return Err("unexpected key derive worker output".to_string());
     };
-    content_decrypt::run(
-        &context.store,
-        content_decrypt::Work::Drain {
-            limit: common_worker::DEFAULT_READY_BATCH,
-        },
-    )?;
-
     Ok(CliOutput::lines(vec![
         format!("scanned_key_wraps: {}", report.scanned_key_wraps),
         format!("derived_key_secrets: {}", report.derived_key_secrets),

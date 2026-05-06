@@ -116,7 +116,8 @@ calculation, deletion facts, invite history grants, or retained-node key wraps.
 
 ## Dependency Model
 
-Encrypted content uses ordinary dependencies:
+Encrypted content uses ordinary dependencies. All dependency ids stay outside
+ciphertext so the common event worker can fetch context before plaintext exists:
 
 ```text
 encrypted_message record dependencies:
@@ -130,9 +131,18 @@ If `local_key_secret_id` is absent, the common worker stores the event as
 Blocked. When a local-only event with that id is later admitted and projected,
 the common worker unblocks and reprojects the encrypted content.
 
-The encrypted-content projector may decrypt using dependency context because the
-key is already in `EventWithContext`. That path does not need an encryption
-worker.
+Encrypted-content projection has one in-memory preparation step:
+
+```text
+common worker loads applied dependency context
+  -> content prepare decodes/verifies/decrypts the current event with that context
+  -> pure content projector writes rows/deletes/labels
+```
+
+There is no durable plaintext context cache and no content-decrypt worker.
+Decryption is cheap enough to perform during projection. The expensive and
+security-relevant boundary is still dependency validity: context contains only
+events already accepted by their own projectors.
 
 ## Derivation Model
 
