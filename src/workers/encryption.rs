@@ -4,6 +4,18 @@
 //! active step that can follow from those facts. It opens wraps only when the
 //! matching local recipient private material is present, then admits the
 //! resulting local key-secret event through the common event worker.
+//!
+//! Recipient-key rotation also lives here. After the rotation worker admits the
+//! `recipient_key_tombstone` shared events, it owns a follow-up local-retention
+//! step: the retired `encryption.local_recipient_keys` row, the retired
+//! `local_recipient_key` event canonical bytes, the retired `recipient_key`
+//! event canonical bytes, and every `key_wrap` row plus event canonical bytes
+//! addressed to a retired recipient must be purged. The tombstone projector
+//! keeps the public read-model row delete; durable canonical-byte purge stays
+//! in this worker because it crosses the retention boundary owned by
+//! `workers::common::retention`. Rotation depends on real X25519 +
+//! XChaCha20-Poly1305 material from `core::crypto`; this file only schedules
+//! commands and runs the cleanup transaction, it does not invent crypto.
 
 use crate::core::crypto;
 use crate::core::logical_clock;
@@ -12,6 +24,7 @@ use crate::protocol::event_modules::identity::{endpoint, endpoint_shared};
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker::{self, EventRegistry};
+use crate::workers::common::retention;
 
 use crate::protocol::event_modules::encryption::{
     key_wrap, local_history_node_secret, local_key_secret, local_recipient_key, recipient_key,
@@ -65,6 +78,12 @@ pub struct DeriveHistoryNodeReport {
     pub local_history_node_secret_id: Option<EventId>,
     pub tombstoned_node_id: Option<EventId>,
     pub admitted_events: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetiredRecipientKey {
+    recipient_key_id: EventId,
+    local_recipient_key_id: EventId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,7 +261,8 @@ fn rotate_recipient_key<R: EventRegistry>(
     report.admitted_events += admitted.admitted.inserted_events;
     report.recipient_key_id = Some(new_recipient_key_id);
 
-    for old_key in old_active {
+    let mut retired = Vec::with_capacity(old_active.len());
+    for old_key in &old_active {
         let tombstone = recipient_key_tombstone::commands::tombstone(
             recipient_key_tombstone::commands::TombstoneRecipientKey {
                 workspace_id,
@@ -266,7 +286,18 @@ fn rotate_recipient_key<R: EventRegistry>(
             report.tombstoned_recipient_keys += 1;
         }
         report.admitted_events += admitted.admitted.inserted_events;
+        retired.push(*old_key);
     }
+
+    // The shared tombstones above are durable, so the retired keys can never
+    // re-enter the active set. Now purge the locally retained material that
+    // would otherwise let an on-disk attacker reconstruct the old key secret:
+    // the local X25519 private row, the retired local/recipient event bytes,
+    // and every key_wrap event addressed to a retired recipient (rows and
+    // canonical bytes alike). The tombstone semantic record itself is
+    // intentionally preserved.
+    purge_retired_recipient_material(store, workspace_id, &retired)
+        .map_err(|err| format!("purge retired recipient material: {err}"))?;
 
     Ok(report)
 }
@@ -341,27 +372,92 @@ fn active_local_recipient_keys(
     store: &Store,
     workspace_id: EventId,
     endpoint_shared_id: EventId,
-) -> Result<Vec<recipient_key::types::RecipientKeyRow>, String> {
+) -> Result<Vec<RetiredRecipientKey>, String> {
     let local_keys = local_recipient_key::schema::list_for_workspace(store, workspace_id)?;
     let mut active = Vec::new();
     for row in recipient_key::schema::list_for_workspace(store, workspace_id)? {
         if row.endpoint_shared_id != endpoint_shared_id {
             continue;
         }
-        if !local_keys
+        let Some(local) = local_keys
             .iter()
-            .any(|candidate| candidate.recipient_key == row.recipient_key)
-        {
+            .find(|candidate| candidate.recipient_key == row.recipient_key)
+        else {
             continue;
-        }
+        };
         if recipient_key_tombstone::schema::get(store, workspace_id, row.recipient_key_id)?
             .is_some()
         {
             continue;
         }
-        active.push(row);
+        active.push(RetiredRecipientKey {
+            recipient_key_id: row.recipient_key_id,
+            local_recipient_key_id: local.local_recipient_key_id,
+        });
     }
     Ok(active)
+}
+
+fn purge_retired_recipient_material(
+    store: &Store,
+    workspace_id: EventId,
+    retired: &[RetiredRecipientKey],
+) -> Result<(), String> {
+    if retired.is_empty() {
+        return Ok(());
+    }
+    // Collect the wraps to retire outside the write transaction so the cleanup
+    // tx only does writes. Wrap row keys are prefixed by `workspace_id`, so a
+    // single workspace scan finds every wrap addressed to a retired recipient.
+    let workspace_wraps = key_wrap::schema::list_for_workspace(store, workspace_id)?;
+    let mut wraps_to_purge = Vec::new();
+    for wrap in workspace_wraps {
+        if retired
+            .iter()
+            .any(|key| key.recipient_key_id == wrap.recipient_key_id)
+        {
+            wraps_to_purge.push(wrap);
+        }
+    }
+
+    let local_recipient_keys: Vec<Vec<u8>> = retired
+        .iter()
+        .map(|key| {
+            local_recipient_key::schema::local_recipient_key_key(
+                workspace_id,
+                key.local_recipient_key_id,
+            )
+        })
+        .collect();
+    let key_wrap_row_keys: Vec<Vec<u8>> = wraps_to_purge
+        .iter()
+        .map(|wrap| {
+            key_wrap::schema::key_wrap_key(
+                wrap.workspace_id,
+                wrap.removal_frontier_id,
+                wrap.recipient_key_id,
+            )
+        })
+        .collect();
+    let event_ids_to_purge: Vec<EventId> = retired
+        .iter()
+        .flat_map(|key| [key.recipient_key_id, key.local_recipient_key_id])
+        .chain(wraps_to_purge.iter().map(|wrap| wrap.key_wrap_id))
+        .collect();
+
+    store
+        .write_transaction(move |store| {
+            store.delete_table_rows_in_tx(
+                local_recipient_key::schema::LOCAL_RECIPIENT_KEYS,
+                local_recipient_keys,
+            )?;
+            store.delete_table_rows_in_tx(key_wrap::schema::KEY_WRAPS, key_wrap_row_keys)?;
+            for event_id in &event_ids_to_purge {
+                retention::purge_event_storage_in_tx(store, event_id)?;
+            }
+            Ok(())
+        })
+        .map_err(|err| format!("purge retired recipient material tx: {err}"))
 }
 
 fn source_secret_material(

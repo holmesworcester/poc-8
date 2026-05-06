@@ -228,7 +228,8 @@ fn cli_rotates_recipient_keys_and_tombstones_history_path_nodes() {
     let keys = assert_success(topo(&["--db", &alice, "keys", &workspace_id]));
     assert_eq!(line_value(&keys, "recipient_keys"), "1");
     assert_eq!(line_value(&keys, "recipient_key_tombstones"), "1");
-    assert_eq!(line_value(&keys, "local_recipient_keys"), "2");
+    // Rotation purges the retired private key alongside the public tombstone.
+    assert_eq!(line_value(&keys, "local_recipient_keys"), "1");
 
     let advanced = assert_success(topo(&["--db", &alice, "clock", "advance", "1000"]));
     assert_eq!(line_value(&advanced, "next_timestamp"), "71000");
@@ -310,6 +311,145 @@ fn cli_rotates_recipient_keys_and_tombstones_history_path_nodes() {
         "{}",
         stderr(&from_retired_root)
     );
+}
+
+#[test]
+fn cli_rotate_recipient_purges_old_local_private_key_and_wraps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = temp_db(&tmp, "alice.db");
+    let workspace_id = create_workspace(&alice, "FS Rotate", "alice", "alice-laptop");
+
+    // Build a complete frontier-with-wrap setup BEFORE rotation. The wrap is
+    // addressed to alice's own retired recipient key, so rotation must purge
+    // its row, its canonical bytes, the retired private-key row, and the two
+    // retired event-store entries.
+    let recipient = assert_success(topo(&["--db", &alice, "key-recipient", &workspace_id]));
+    let retired_recipient_key_id = line_value(&recipient, "recipient_key_id");
+    let retired_local_recipient_key_id = line_value(&recipient, "local_recipient_key_id");
+
+    let frontier = assert_success(topo(&["--db", &alice, "key-frontier", &workspace_id]));
+    let removal_frontier_id = line_value(&frontier, "removal_frontier_id");
+
+    let wrapped = assert_success(topo(&[
+        "--db",
+        &alice,
+        "key-wrap",
+        &workspace_id,
+        &removal_frontier_id,
+        &retired_recipient_key_id,
+    ]));
+    let retired_key_wrap_id = line_value(&wrapped, "key_wrap_id");
+
+    // Sanity: keys WS counts the pre-rotation rows we expect. If these change,
+    // the test below is checking the wrong baseline.
+    let pre = assert_success(topo(&["--db", &alice, "keys", &workspace_id]));
+    assert_eq!(line_value(&pre, "recipient_keys"), "1");
+    assert_eq!(line_value(&pre, "recipient_key_tombstones"), "0");
+    assert_eq!(line_value(&pre, "local_recipient_keys"), "1");
+    assert_eq!(line_value(&pre, "key_wraps"), "1");
+
+    // Pre-rotation SQLite check: the retired event ids are durably present.
+    assert!(
+        event_row_exists(&alice, &retired_recipient_key_id),
+        "expected retired recipient_key event row before rotation",
+    );
+    assert!(
+        event_row_exists(&alice, &retired_local_recipient_key_id),
+        "expected retired local_recipient_key event row before rotation",
+    );
+    assert!(
+        event_row_exists(&alice, &retired_key_wrap_id),
+        "expected retired key_wrap event row before rotation",
+    );
+
+    let rotated = assert_success(topo(&[
+        "--db",
+        &alice,
+        "key-rotate-recipient",
+        &workspace_id,
+    ]));
+    assert_eq!(line_value(&rotated, "old_active_recipient_keys"), "1");
+    assert_eq!(line_value(&rotated, "tombstoned_recipient_keys"), "1");
+    let new_recipient_key_id = line_value(&rotated, "recipient_key_id");
+    let new_local_recipient_key_id = line_value(&rotated, "local_recipient_key_id");
+    assert_ne!(new_recipient_key_id, retired_recipient_key_id);
+    assert_ne!(new_local_recipient_key_id, retired_local_recipient_key_id);
+
+    // CLI surface: the retired private key is gone, the tombstone semantic
+    // record remains, and the retired wrap row was deleted along with it.
+    let post = assert_success(topo(&["--db", &alice, "keys", &workspace_id]));
+    assert_eq!(line_value(&post, "recipient_keys"), "1");
+    assert_eq!(line_value(&post, "recipient_key_tombstones"), "1");
+    assert_eq!(line_value(&post, "local_recipient_keys"), "1");
+    assert_eq!(line_value(&post, "key_wraps"), "0");
+
+    // SQLite-level: the retired recipient_key, retired local_recipient_key,
+    // and retired key_wrap event rows are absent from event_modules.events.
+    // Forward secrecy depends on these canonical bytes being unrecoverable.
+    assert!(
+        !event_row_exists(&alice, &retired_recipient_key_id),
+        "retired recipient_key event canonical bytes must be purged",
+    );
+    assert!(
+        !event_row_exists(&alice, &retired_local_recipient_key_id),
+        "retired local_recipient_key event canonical bytes must be purged",
+    );
+    assert!(
+        !event_row_exists(&alice, &retired_key_wrap_id),
+        "retired key_wrap event canonical bytes must be purged",
+    );
+
+    // The new recipient material still works: a new frontier plus wrap targets
+    // the new recipient_key_id, so rotation did not break unrelated material.
+    let new_frontier = assert_success(topo(&["--db", &alice, "key-frontier", &workspace_id]));
+    let new_frontier_id = line_value(&new_frontier, "removal_frontier_id");
+    let new_wrap = assert_success(topo(&[
+        "--db",
+        &alice,
+        "key-wrap",
+        &workspace_id,
+        &new_frontier_id,
+        &new_recipient_key_id,
+    ]));
+    assert_eq!(
+        line_value(&new_wrap, "recipient_key_id"),
+        new_recipient_key_id
+    );
+}
+
+fn event_row_exists(db_path: &str, event_id_hex: &str) -> bool {
+    let event_id = hex_to_bytes(event_id_hex);
+    let conn =
+        rusqlite::Connection::open(db_path).expect("open sqlite db");
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM \"event_modules.events\" WHERE row_key = ?1",
+            rusqlite::params![event_id],
+            |row| row.get(0),
+        )
+        .expect("count event row");
+    count > 0
+}
+
+fn hex_to_bytes(value: &str) -> Vec<u8> {
+    assert_eq!(value.len(), 64, "event id must be 32-byte hex");
+    let mut out = Vec::with_capacity(32);
+    let bytes = value.as_bytes();
+    for idx in 0..32 {
+        let high = hex_digit(bytes[idx * 2]);
+        let low = hex_digit(bytes[idx * 2 + 1]);
+        out.push((high << 4) | low);
+    }
+    out
+}
+
+fn hex_digit(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => panic!("invalid hex digit: {byte}"),
+    }
 }
 
 fn create_workspace(db: &str, name: &str, username: &str, device_name: &str) -> String {
