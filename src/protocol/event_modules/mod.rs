@@ -92,6 +92,7 @@ pub fn schemas() -> Vec<Schema> {
     out.extend_from_slice(identity::endpoint::schema::SCHEMAS);
     out.extend_from_slice(identity::endpoint_shared::schema::SCHEMAS);
     out.extend_from_slice(identity::invite::schema::SCHEMAS);
+    out.extend_from_slice(identity::invite_server::schema::SCHEMAS);
     out.extend_from_slice(identity::user::schema::SCHEMAS);
     out.extend_from_slice(identity::user_invite::schema::SCHEMAS);
     out.extend_from_slice(identity::workspace::schema::SCHEMAS);

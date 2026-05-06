@@ -1,6 +1,6 @@
 use crate::core::crypto;
 use crate::protocol::event_modules::identity::{
-    admin, device_invite, endpoint_shared, signed, user, user_invite, workspace,
+    admin, device_invite, endpoint, endpoint_shared, signed, user, user_invite, workspace,
 };
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::types::{EventId, EventRecord};
@@ -312,6 +312,7 @@ fn bootstrap_two_users_and_two_endpoints_replay_without_daemon() {
             user_authority_event_id: alice.user_id,
             endpoint_id: alice_join.endpoint_id,
             signing_public_key: crypto::ed25519_public_key(&alice_join.endpoint_private_key),
+            endpoint_role: endpoint::types::EndpointRole::Device,
             device_name: "alice-second-join".to_string(),
             device_invite_id: alice_join.device_invite_id,
             device_invite_private_key: alice_join.device_invite_private_key,
@@ -435,6 +436,7 @@ fn same_user_client_can_link_multiple_workspaces_but_authority_does_not_cross() 
             user_authority_event_id: alice_b.user_id,
             endpoint_id: crypto::ed25519_public_key(&[86; 32]),
             signing_public_key: crypto::ed25519_public_key(&[86; 32]),
+            endpoint_role: endpoint::types::EndpointRole::Device,
             device_name: "cross-workspace".to_string(),
             device_invite_id: join_a.device_invite_id,
             device_invite_private_key: join_a.device_invite_private_key,
@@ -899,6 +901,7 @@ fn share_endpoint(
             user_authority_event_id: input.user_id,
             endpoint_id: crypto::ed25519_public_key(&input.endpoint_private_key),
             signing_public_key: crypto::ed25519_public_key(&input.endpoint_private_key),
+            endpoint_role: endpoint::types::EndpointRole::Device,
             device_name: input.device_name.to_string(),
             device_invite_id,
             device_invite_private_key: input.device_invite_private_key,

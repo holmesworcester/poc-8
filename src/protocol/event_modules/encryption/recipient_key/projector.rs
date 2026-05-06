@@ -40,6 +40,9 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
     if signer_endpoint_shared.signing_public_key != envelope.signer_public_key {
         return Err("recipient key signer public key does not match endpoint_shared".to_string());
     }
+    if !signer_endpoint_shared.endpoint_role.can_receive_key_wraps() {
+        return Err("recipient key signer endpoint role cannot receive key wraps".to_string());
+    }
 
     Ok(ProjectionOutput::rows(vec![schema::recipient_key_row(
         event.context.event_id,
@@ -65,6 +68,18 @@ mod tests {
     }
 
     fn endpoint_shared_record(workspace_id: [u8; 32], signing_public_key: [u8; 32]) -> Record {
+        endpoint_shared_record_with_role(
+            workspace_id,
+            signing_public_key,
+            crate::protocol::event_modules::identity::endpoint::types::EndpointRole::Device,
+        )
+    }
+
+    fn endpoint_shared_record_with_role(
+        workspace_id: [u8; 32],
+        signing_public_key: [u8; 32],
+        endpoint_role: crate::protocol::event_modules::identity::endpoint::types::EndpointRole,
+    ) -> Record {
         let payload =
             endpoint_shared::codec::encode(&endpoint_shared::types::EndpointSharedEvent {
                 created_at_ms: 4,
@@ -72,6 +87,7 @@ mod tests {
                 user_authority_event_id: [3; 32],
                 endpoint_id: [21; 32],
                 signing_public_key,
+                endpoint_role,
                 device_name: "laptop".to_string(),
             })
             .expect("encode endpoint_shared");
@@ -183,6 +199,24 @@ mod tests {
         assert_eq!(
             project(&event).expect_err("wrong workspace must fail"),
             "recipient key signer endpoint_shared workspace does not match event"
+        );
+    }
+
+    #[test]
+    fn rejects_invite_server_endpoint_recipient_key() {
+        let signer_private_key = [9; 32];
+        let signer_record = endpoint_shared_record_with_role(
+            [1; 32],
+            signing_public_key_for(&signer_private_key),
+            crate::protocol::event_modules::identity::endpoint::types::EndpointRole::InviteServer,
+        );
+        let signer_id = event_id(&signer_record.canonical_bytes);
+        let record = recipient_key_record([1; 32], signer_id, signer_private_key);
+        let event = event_with_context(&record, signer_id, signer_record);
+
+        assert_eq!(
+            project(&event).expect_err("invite-server recipient key must fail"),
+            "recipient key signer endpoint role cannot receive key wraps"
         );
     }
 }

@@ -6,17 +6,19 @@
 //! ```text
 //! type(1) || created_at_ms(8) || workspace_id(32)
 //! || user_authority_event_id(32) || endpoint_id(32)
-//! || signing_public_key(32)
+//! || signing_public_key(32) || endpoint_role(1)
 //! || device_name_utf8_zero_padded(64)
 //! ```
 
+use crate::protocol::event_modules::identity::endpoint::types::EndpointRole;
 use crate::protocol::event_modules::types::{EventRecord, EventScope};
 use crate::protocol::wire::{Reader, Writer};
 
 use super::types::{EndpointSharedEvent, ENDPOINT_DEVICE_NAME_BYTES};
 
 pub const TYPE_ENDPOINT_SHARED: u8 = 135;
-pub const ENDPOINT_SHARED_WIRE_SIZE: usize = 1 + 8 + 32 + 32 + 32 + 32 + ENDPOINT_DEVICE_NAME_BYTES;
+pub const ENDPOINT_SHARED_WIRE_SIZE: usize =
+    1 + 8 + 32 + 32 + 32 + 32 + 1 + ENDPOINT_DEVICE_NAME_BYTES;
 
 pub fn encode(event: &EndpointSharedEvent) -> Result<Vec<u8>, String> {
     let device_name = encode_device_name(&event.device_name)?;
@@ -27,6 +29,7 @@ pub fn encode(event: &EndpointSharedEvent) -> Result<Vec<u8>, String> {
     out.id(&event.user_authority_event_id);
     out.id(&event.endpoint_id);
     out.id(&event.signing_public_key);
+    out.u8(event.endpoint_role.as_u8());
     out.raw(&device_name);
     Ok(out.finish())
 }
@@ -42,6 +45,7 @@ pub fn decode(bytes: &[u8]) -> Result<EndpointSharedEvent, String> {
     let user_authority_event_id = reader.id()?;
     let endpoint_id = reader.id()?;
     let signing_public_key = reader.id()?;
+    let endpoint_role = EndpointRole::from_u8(reader.u8()?)?;
     let device_name = decode_device_name(reader.slice(ENDPOINT_DEVICE_NAME_BYTES)?)?;
     reader.finish()?;
     Ok(EndpointSharedEvent {
@@ -50,6 +54,7 @@ pub fn decode(bytes: &[u8]) -> Result<EndpointSharedEvent, String> {
         user_authority_event_id,
         endpoint_id,
         signing_public_key,
+        endpoint_role,
         device_name,
     })
 }
@@ -106,6 +111,7 @@ mod tests {
             user_authority_event_id: [2; 32],
             endpoint_id: [3; 32],
             signing_public_key: [4; 32],
+            endpoint_role: EndpointRole::Device,
             device_name: "laptop".to_string(),
         }
     }
@@ -146,6 +152,7 @@ mod tests {
     fn rejects_non_canonical_device_name_padding() {
         let mut encoded = encode(&event()).expect("encode endpoint shared");
         let name_start = 1 + 8 + 32 + 32 + 32 + 32;
+        let name_start = name_start + 1;
         encoded[name_start + "laptop".len() + 1] = b'x';
 
         assert_eq!(

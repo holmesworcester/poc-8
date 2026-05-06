@@ -36,7 +36,8 @@ use crate::core::network_queues::{self, InboundNetworkRow, NetworkTarget, Outbou
 use crate::core::store::Store;
 use crate::core::tcp;
 use crate::protocol::event_modules::identity::{
-    admin, device_invite, endpoint, endpoint_shared, invite, signed, user, user_invite, workspace,
+    admin, device_invite, endpoint, endpoint_shared, invite, invite_server, signed, user,
+    user_invite, workspace,
 };
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::sync;
@@ -1314,6 +1315,7 @@ fn is_identity_bootstrap_event(bytes: &[u8]) -> Result<bool, String> {
                 envelope.inner_type,
                 admin::codec::TYPE_ADMIN
                     | user_invite::codec::TYPE_USER_INVITE
+                    | invite_server::codec::TYPE_INVITE_SERVER
                     | user::codec::TYPE_USER
                     | device_invite::codec::TYPE_DEVICE_INVITE
                     | endpoint_shared::codec::TYPE_ENDPOINT_SHARED
@@ -1431,6 +1433,7 @@ mod tests {
             user_authority_event_id: [44; 32],
             endpoint_id: endpoint.endpoint,
             signing_public_key: endpoint.signing_public_key,
+            endpoint_role: endpoint::types::EndpointRole::Device,
             device_name: "test".to_string(),
         };
         store

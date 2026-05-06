@@ -57,6 +57,7 @@ fn install_local_content_signer(store: &Store) -> (EventId, EventId, [u8; 32]) {
         user_authority_event_id: [4; 32],
         endpoint_id: local.endpoint,
         signing_public_key: local.signing_public_key,
+        endpoint_role: endpoint::types::EndpointRole::Device,
         device_name: "worker".to_string(),
     };
     store

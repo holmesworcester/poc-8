@@ -27,6 +27,14 @@ branch: codex/poc8-identity-auth-graph
 
 Do not implement this in the main `/home/holmes/poc-8` worktree.
 
+## Active Branch TODOs
+
+- Before merge, bring current `master` into this branch and adapt any local
+  workers to the newer worker organization model from master.
+- Deletion forward secrecy still requires real encrypted message/reaction
+  events plus durable purge of obsolete event bytes and local secrets after
+  durable deletion/frontier facts preserve semantic state.
+
 ## Scope
 
 In scope:

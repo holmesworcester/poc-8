@@ -11,6 +11,7 @@ pub mod device_invite;
 pub mod endpoint;
 pub mod endpoint_shared;
 pub mod invite;
+pub mod invite_server;
 pub mod signed;
 pub mod user;
 pub mod user_invite;
@@ -49,6 +50,9 @@ fn project_signed_record(event: &EventWithContext<'_>) -> Result<Option<Projecti
         endpoint_shared::codec::TYPE_ENDPOINT_SHARED => Ok(Some(
             endpoint_shared::projector::project_signed(&envelope, event)?,
         )),
+        invite_server::codec::TYPE_INVITE_SERVER => {
+            Ok(Some(invite_server::projector::project(event)?))
+        }
         user_invite::codec::TYPE_USER_INVITE => Ok(Some(user_invite::projector::project(event)?)),
         user::codec::TYPE_USER => Ok(Some(user::projector::project(event)?)),
         _ => Err(format!(
@@ -63,6 +67,7 @@ pub fn signed_record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
     match envelope.inner_type {
         admin::codec::TYPE_ADMIN
         | endpoint_shared::codec::TYPE_ENDPOINT_SHARED
+        | invite_server::codec::TYPE_INVITE_SERVER
         | user_invite::codec::TYPE_USER_INVITE
         | user::codec::TYPE_USER => signed::codec::record_from_bytes(bytes),
         device_invite::codec::TYPE_DEVICE_INVITE => {

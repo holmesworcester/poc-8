@@ -141,6 +141,85 @@ fn cli_key_wrap_derives_access_only_for_wrapped_recipient() {
 }
 
 #[test]
+fn cli_invite_server_syncs_but_cannot_be_a_key_recipient() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = temp_db(&tmp, "alice.db");
+    let server = temp_db(&tmp, "invite-server.db");
+    let bob = temp_db(&tmp, "bob.db");
+    let workspace_id = create_workspace(&alice, "Helper FS", "alice", "alice-laptop");
+    let server_join_port = free_port();
+    let bob_join_port = free_port();
+
+    join_invite_server(&alice, &server, &workspace_id, server_join_port, "relay");
+    let server_identity = assert_success(topo(&["--db", &server, "identity"]));
+    assert!(
+        server_identity.contains("endpoint_role=invite-server"),
+        "{server_identity}"
+    );
+
+    let denied = topo(&["--db", &server, "key-recipient", &workspace_id]);
+    assert!(
+        !denied.status.success(),
+        "invite-server recipient key should be invalid\nstdout={}\nstderr={}",
+        stdout(&denied),
+        stderr(&denied)
+    );
+    assert!(
+        stderr(&denied).contains("local endpoint role cannot receive key wraps"),
+        "{}",
+        stderr(&denied)
+    );
+
+    join_workspace(
+        &alice,
+        &bob,
+        &workspace_id,
+        bob_join_port,
+        "bob",
+        "bob-phone",
+    );
+    let bob_recipient = assert_success(topo(&["--db", &bob, "key-recipient", &workspace_id]));
+    let bob_recipient_id = line_value(&bob_recipient, "recipient_key_id");
+    sync_once(&bob, &alice, bob_join_port);
+
+    let alice_to_bob = free_port();
+    let alice_to_server = free_port();
+    connect_pair(&alice, &bob, alice_to_bob);
+    connect_pair(&alice, &server, alice_to_server);
+
+    let frontier = assert_success(topo(&["--db", &alice, "key-frontier", &workspace_id]));
+    let removal_frontier_id = line_value(&frontier, "removal_frontier_id");
+    assert_success(topo(&[
+        "--db",
+        &alice,
+        "key-wrap",
+        &workspace_id,
+        &removal_frontier_id,
+        &bob_recipient_id,
+    ]));
+
+    sync_two_routes(&alice, &bob, alice_to_bob, &server, alice_to_server);
+
+    let bob_derive = assert_success(topo(&["--db", &bob, "key-derive"]));
+    assert_eq!(line_value(&bob_derive, "derived_key_secrets"), "1");
+    let server_derive = assert_success(topo(&["--db", &server, "key-derive"]));
+    assert_eq!(line_value(&server_derive, "derived_key_secrets"), "0");
+    assert_eq!(
+        line_value(
+            &assert_success(topo(&[
+                "--db",
+                &server,
+                "key-access",
+                &workspace_id,
+                &removal_frontier_id,
+            ])),
+            "access",
+        ),
+        "no"
+    );
+}
+
+#[test]
 fn cli_rotates_recipient_keys_and_tombstones_history_path_nodes() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
@@ -281,6 +360,19 @@ fn join_workspace(
     assert!(host_out.contains("accepted_connections: 1"), "{host_out}");
 }
 
+fn join_invite_server(host: &str, server: &str, workspace_id: &str, port: u16, device_name: &str) {
+    let mut listener = spawn_invite_server_listener(host, workspace_id, port, 1);
+    let invite = listener.invite_link();
+    let accepted = match try_accept_invite_server_with_retry(server, &invite, device_name) {
+        Ok(output) => output,
+        Err(err) => listener.fail("invite-server accept failed", err),
+    };
+    assert_eq!(line_value(&accepted, "workspace_id"), workspace_id);
+    assert_eq!(line_value(&accepted, "endpoint_role"), "invite-server");
+    let host_out = listener.wait_success("invite-server listener");
+    assert!(host_out.contains("accepted_connections: 1"), "{host_out}");
+}
+
 struct ListeningInvite {
     child: Child,
     invite_rx: Receiver<Result<String, String>>,
@@ -343,6 +435,28 @@ fn spawn_workspace_invite_listener(
         db,
         "invite",
         "--workspace",
+        workspace_id,
+        "--listen",
+        "127.0.0.1",
+        &port,
+        "--accept",
+        &accept,
+    ]);
+    listening_invite_from_child(child)
+}
+
+fn spawn_invite_server_listener(
+    db: &str,
+    workspace_id: &str,
+    port: u16,
+    accept: usize,
+) -> ListeningInvite {
+    let port = port.to_string();
+    let accept = accept.to_string();
+    let child = spawn_topo(&[
+        "--db",
+        db,
+        "invite-server",
         workspace_id,
         "--listen",
         "127.0.0.1",
@@ -426,6 +540,33 @@ fn try_accept_with_identity_retry(
             invite,
             "--username",
             username,
+            "--devicename",
+            device_name,
+        ]);
+        if output.status.success() {
+            return Ok(stdout(&output));
+        }
+        last = stderr(&output);
+        if !last.contains("open tcp stream") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(last)
+}
+
+fn try_accept_invite_server_with_retry(
+    db: &str,
+    invite: &str,
+    device_name: &str,
+) -> Result<String, String> {
+    let mut last = String::new();
+    for _ in 0..200 {
+        let output = topo(&[
+            "--db",
+            db,
+            "accept-invite-server",
+            invite,
             "--devicename",
             device_name,
         ]);

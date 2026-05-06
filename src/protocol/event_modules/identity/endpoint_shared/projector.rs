@@ -10,7 +10,9 @@
 //! re-checks all three bindings before writing the endpoint membership row that
 //! later gates connection ingress and sync.
 
-use crate::protocol::event_modules::identity::{device_invite, signed};
+use crate::protocol::event_modules::identity::{
+    device_invite, endpoint::types::EndpointRole, invite_server, signed,
+};
 use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput};
 
 use super::{codec, schema};
@@ -33,15 +35,36 @@ pub fn project_signed(
     let signer = event
         .context
         .dependency(&envelope.signer_event_id)
-        .ok_or_else(|| "endpoint_shared device_invite dependency is missing".to_string())?;
+        .ok_or_else(|| "endpoint_shared invite dependency is missing".to_string())?;
     let invite_envelope = signed::codec::decode(&signer.canonical_bytes)
-        .map_err(|_| "endpoint_shared dependency is not a signed device_invite".to_string())?;
-    if invite_envelope.inner_type != device_invite::codec::TYPE_DEVICE_INVITE {
-        return Err("endpoint_shared dependency is not a signed device_invite".to_string());
+        .map_err(|_| "endpoint_shared dependency is not a signed endpoint invite".to_string())?;
+    let expected_role = match invite_envelope.inner_type {
+        device_invite::codec::TYPE_DEVICE_INVITE => {
+            validate_device_invite_authority(envelope, &invite_envelope, &endpoint_shared)?
+        }
+        invite_server::codec::TYPE_INVITE_SERVER => {
+            validate_invite_server_authority(envelope, &invite_envelope, &endpoint_shared)?
+        }
+        _ => return Err("endpoint_shared dependency is not a signed endpoint invite".to_string()),
+    };
+    if endpoint_shared.endpoint_role != expected_role {
+        return Err("endpoint_shared role does not match invite authority".to_string());
     }
-    let invite = device_invite::codec::decode(&invite_envelope.payload)
-        .map_err(|_| "endpoint_shared dependency is not a signed device_invite".to_string())?;
 
+    Ok(ProjectionOutput::rows(schema::endpoint_shared_rows(
+        event.context.event_id,
+        envelope.signer_event_id,
+        &endpoint_shared,
+    )?))
+}
+
+fn validate_device_invite_authority(
+    envelope: &signed::types::SignedEnvelope,
+    invite_envelope: &signed::types::SignedEnvelope,
+    endpoint_shared: &super::types::EndpointSharedEvent,
+) -> Result<EndpointRole, String> {
+    let invite = device_invite::codec::decode(&invite_envelope.payload)
+        .map_err(|_| "endpoint_shared dependency is not a signed endpoint invite".to_string())?;
     if invite.public_key != envelope.signer_public_key {
         return Err("endpoint_shared signer public key does not match device_invite".to_string());
     }
@@ -51,12 +74,26 @@ pub fn project_signed(
     if invite.user_authority_event_id != endpoint_shared.user_authority_event_id {
         return Err("endpoint_shared user authority does not match device_invite".to_string());
     }
+    Ok(EndpointRole::Device)
+}
 
-    Ok(ProjectionOutput::rows(schema::endpoint_shared_rows(
-        event.context.event_id,
-        envelope.signer_event_id,
-        &endpoint_shared,
-    )?))
+fn validate_invite_server_authority(
+    envelope: &signed::types::SignedEnvelope,
+    invite_envelope: &signed::types::SignedEnvelope,
+    endpoint_shared: &super::types::EndpointSharedEvent,
+) -> Result<EndpointRole, String> {
+    let invite = invite_server::codec::decode(&invite_envelope.payload)
+        .map_err(|_| "endpoint_shared dependency is not a signed endpoint invite".to_string())?;
+    if invite.public_key != envelope.signer_public_key {
+        return Err("endpoint_shared signer public key does not match invite_server".to_string());
+    }
+    if invite.workspace_id != endpoint_shared.workspace_id {
+        return Err("endpoint_shared workspace does not match invite_server".to_string());
+    }
+    if envelope.signer_event_id != endpoint_shared.user_authority_event_id {
+        return Err("endpoint_shared user authority does not match invite_server".to_string());
+    }
+    Ok(EndpointRole::InviteServer)
 }
 
 #[cfg(test)]
@@ -128,6 +165,7 @@ mod tests {
                 user_authority_event_id,
                 endpoint_id: [3; 32],
                 signing_public_key: [4; 32],
+                endpoint_role: EndpointRole::Device,
                 device_name: "phone".to_string(),
                 device_invite_id,
                 device_invite_private_key: private_key,
@@ -199,7 +237,7 @@ mod tests {
 
         assert_eq!(
             project_signed(&envelope, &event).expect_err("missing dependency must fail"),
-            "endpoint_shared device_invite dependency is missing"
+            "endpoint_shared invite dependency is missing"
         );
     }
 
@@ -260,7 +298,87 @@ mod tests {
 
         assert_eq!(
             project_signed(&envelope, &event).expect_err("unsigned invite must fail"),
-            "endpoint_shared dependency is not a signed device_invite"
+            "endpoint_shared dependency is not a signed endpoint invite"
+        );
+    }
+
+    #[test]
+    fn projects_invite_server_endpoint_shared_role() {
+        let server_private_key = [17; 32];
+        let server_public_key = public_key(&server_private_key);
+        let invite = invite_server::commands::create(invite_server::commands::CreateInviteServer {
+            created_at_ms: 10,
+            public_key: server_public_key,
+            workspace_id: [1; 32],
+            authority_event_id: [1; 32],
+            signer_event_id: [1; 32],
+            signer_private_key: [11; 32],
+        })
+        .expect("create invite-server");
+        let invite_server_id = invite.value.invite_server_id;
+        let invite_server_record = invite.events[0].record().clone();
+        let output = commands::share_endpoint(
+            &ReadContext,
+            commands::ShareEndpoint {
+                created_at_ms: 20,
+                workspace_id: [1; 32],
+                user_authority_event_id: invite_server_id,
+                endpoint_id: [3; 32],
+                signing_public_key: [4; 32],
+                endpoint_role: EndpointRole::InviteServer,
+                device_name: "relay".to_string(),
+                device_invite_id: invite_server_id,
+                device_invite_private_key: server_private_key,
+            },
+        )
+        .expect("share invite-server endpoint");
+        let record = output.events[0].record().clone();
+        let envelope = signed::codec::decode(&record.canonical_bytes).expect("signed envelope");
+        let event = signed_context(
+            output.value.endpoint_shared_id,
+            &record,
+            invite_server_id,
+            invite_server_record,
+        );
+
+        let output = project_signed(&envelope, &event).expect("project invite-server endpoint");
+        let row = schema::decode_endpoint_shared_row(&output.rows[0].key, &output.rows[0].value)
+            .expect("decode endpoint row");
+
+        assert_eq!(row.endpoint_role, EndpointRole::InviteServer);
+        assert_eq!(row.user_authority_event_id, invite_server_id);
+    }
+
+    #[test]
+    fn rejects_endpoint_role_that_does_not_match_invite_authority() {
+        let (device_invite_id, invite_record) = device_invite_record([7; 32], [1; 32], [2; 32]);
+        let output = commands::share_endpoint(
+            &ReadContext,
+            commands::ShareEndpoint {
+                created_at_ms: 20,
+                workspace_id: [1; 32],
+                user_authority_event_id: [2; 32],
+                endpoint_id: [3; 32],
+                signing_public_key: [4; 32],
+                endpoint_role: EndpointRole::InviteServer,
+                device_name: "phone".to_string(),
+                device_invite_id,
+                device_invite_private_key: [7; 32],
+            },
+        )
+        .expect("share endpoint");
+        let record = output.events[0].record().clone();
+        let envelope = signed::codec::decode(&record.canonical_bytes).expect("signed envelope");
+        let event = signed_context(
+            output.value.endpoint_shared_id,
+            &record,
+            device_invite_id,
+            invite_record,
+        );
+
+        assert_eq!(
+            project_signed(&envelope, &event).expect_err("wrong role must fail"),
+            "endpoint_shared role does not match invite authority"
         );
     }
 

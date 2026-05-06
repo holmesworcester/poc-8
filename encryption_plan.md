@@ -286,9 +286,15 @@ Still pending:
 
 - Functional retained-cover and purge-cover calculation from delete/expiry sets.
 - Shared delete facts and deterministic deletion summaries.
+- Real encrypted message and reaction events. Plaintext message/reaction rows
+  cannot support deletion forward secrecy.
 - Wrap obligations for retained history nodes.
 - Invite-time history grants for newly authorized endpoints.
 - Encrypted filesystem content events that depend on local history node secrets.
+- Durable purge of obsolete ciphertext/event bytes and local secrets after the
+  durable deletion/frontier facts, labels, summaries, or retained-node
+  commitments preserve the semantic state. Projector read-model deletion alone
+  is not a forward-secrecy boundary against an on-disk attacker.
 - Property tests comparing incremental retained-cover projection with a pure
   functional reference implementation.
 

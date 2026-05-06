@@ -93,6 +93,9 @@ fn run_key_recipient_command(
     if membership.signing_public_key != local.signing_public_key {
         return Err("local endpoint signing key does not match workspace membership".to_string());
     }
+    if !membership.endpoint_role.can_receive_key_wraps() {
+        return Err("local endpoint role cannot receive key wraps".to_string());
+    }
 
     let local_key = local_recipient_key::commands::create(workspace_id)?;
     let local_report = common_worker::run(

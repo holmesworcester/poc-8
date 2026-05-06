@@ -202,6 +202,8 @@ mod tests {
             user_authority_event_id: admin_user_id,
             endpoint_id: signer_public_key(&TRANSPORT_ENDPOINT_PRIVATE),
             signing_public_key: signer_public_key(endpoint_private_key),
+            endpoint_role:
+                crate::protocol::event_modules::identity::endpoint::types::EndpointRole::Device,
             device_name: "admin-laptop".to_string(),
         };
         let signed = signed::commands::sign_payload(

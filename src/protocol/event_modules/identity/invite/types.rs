@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 
 use crate::protocol::event_modules::types::EventId;
 
-use super::super::endpoint::types::EndpointId;
+use super::super::endpoint::types::{EndpointId, EndpointRole};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invite {
@@ -18,6 +18,7 @@ pub struct Invite {
     pub invite_event_id: EventId,
     pub workspace_id: EventId,
     pub user_authority_event_id: Option<EventId>,
+    pub endpoint_role: EndpointRole,
     pub identity_scope: bool,
 }
 

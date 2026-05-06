@@ -196,6 +196,9 @@ fn rotate_recipient_key<R: EventRegistry>(
     if membership.signing_public_key != local.signing_public_key {
         return Err("local endpoint signing key does not match workspace membership".to_string());
     }
+    if !membership.endpoint_role.can_receive_key_wraps() {
+        return Err("local endpoint role cannot receive key wraps".to_string());
+    }
     let old_active =
         active_local_recipient_keys(store, workspace_id, membership.endpoint_shared_id)?;
     let mut report = RotateRecipientKeyReport {

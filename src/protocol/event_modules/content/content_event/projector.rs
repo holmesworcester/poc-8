@@ -87,6 +87,8 @@ mod tests {
                 user_authority_event_id: [8; 32],
                 endpoint_id: [7; 32],
                 signing_public_key,
+                endpoint_role:
+                    crate::protocol::event_modules::identity::endpoint::types::EndpointRole::Device,
                 device_name: "laptop".to_string(),
             })
             .expect("encode endpoint_shared");

@@ -22,7 +22,8 @@ use crate::protocol::event_modules::types::{EventId, EventRecord};
 use crate::protocol::event_modules::worker::{self, CommandOutput};
 
 use super::{
-    admin, device_invite, endpoint, endpoint_shared, invite, user, user_invite, workspace,
+    admin, device_invite, endpoint, endpoint_shared, invite, invite_server, user, user_invite,
+    workspace,
 };
 
 const CREATE_WORKSPACE_USAGE: &str =
@@ -30,6 +31,9 @@ const CREATE_WORKSPACE_USAGE: &str =
 const INVITE_USAGE: &str =
     "invite [--workspace WORKSPACE_ID_HEX] (--public-addr ADDR | --listen IP PORT [--accept N])";
 const ACCEPT_USAGE: &str = "accept INVITE_LINK [--username USER] [--devicename DEVICE]";
+const INVITE_SERVER_USAGE: &str =
+    "invite-server WORKSPACE_ID_HEX (--public-addr ADDR | --listen IP PORT [--accept N])";
+const ACCEPT_INVITE_SERVER_USAGE: &str = "accept-invite-server INVITE_LINK [--devicename DEVICE]";
 const LINK_USAGE: &str =
     "link WORKSPACE_ID_HEX (--public-addr ADDR | --listen IP PORT [--accept N])";
 const ACCEPT_LINK_USAGE: &str = "accept-link INVITE_LINK [--devicename DEVICE]";
@@ -58,6 +62,18 @@ pub fn commands() -> Vec<CliCommand<Context>> {
             usage: ACCEPT_USAGE,
             help: "Accept a workspace invite over real TCP.",
             run: run_accept_command,
+        },
+        CliCommand {
+            name: "invite-server",
+            usage: INVITE_SERVER_USAGE,
+            help: "Create an invite-server workspace endpoint invite.",
+            run: run_invite_server_command,
+        },
+        CliCommand {
+            name: "accept-invite-server",
+            usage: ACCEPT_INVITE_SERVER_USAGE,
+            help: "Accept an invite-server workspace endpoint invite over real TCP.",
+            run: run_accept_invite_server_command,
         },
         CliCommand {
             name: "link",
@@ -214,6 +230,9 @@ fn run_accept_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOut
         let connected = connect_invite(context, &options.invite)?;
         return Ok(CliOutput::line(format!("connected: {}", connected.addr)));
     }
+    if invite.endpoint_role != endpoint::types::EndpointRole::Device {
+        return Err("accept requires a user invite".to_string());
+    }
     if let Some(local) = endpoint::commands::local_keypair(&context.store)? {
         reject_duplicate_join(&context.store, local.endpoint, invite.workspace_id)?;
     }
@@ -272,6 +291,100 @@ fn run_accept_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOut
     ]))
 }
 
+fn run_invite_server_command(
+    context: &mut Context,
+    args: CliArgs<'_>,
+) -> Result<CliOutput, String> {
+    let options = InviteServerOptions::parse(args)?;
+    let local = ensure_local_endpoint(context)?;
+    let membership = local_membership(&context.store, local.endpoint, options.workspace_id)?;
+    let authority_admin_id = admin_for_user(
+        &context.store,
+        options.workspace_id,
+        membership.user_authority_event_id,
+    )?
+    .ok_or_else(|| "local user is not an admin in this workspace".to_string())?;
+    let invite_private_key = crypto::random_ed25519_private_key();
+    let output = invite_server::commands::create(invite_server::commands::CreateInviteServer {
+        created_at_ms: next_timestamp(&context.store)?,
+        public_key: crypto::ed25519_public_key(&invite_private_key),
+        workspace_id: options.workspace_id,
+        authority_event_id: authority_admin_id,
+        signer_event_id: membership.endpoint_shared_id,
+        signer_private_key: local.signing_secret,
+    })?;
+    let invite_server_id = output.value.invite_server_id;
+    admit(context, output)?;
+    let scoped = invite::commands::create_scoped_with_role(
+        local,
+        options.public_addr(),
+        options.workspace_id,
+        invite_server_id,
+        invite_private_key,
+        endpoint::types::EndpointRole::InviteServer,
+        None,
+    );
+    let link = worker::run(&context.store, &context.protocol, scoped)
+        .map_err(|err| format!("apply invite-server secret: {err}"))?
+        .0;
+    maybe_listen(context, options.listen, &link)
+}
+
+fn run_accept_invite_server_command(
+    context: &mut Context,
+    args: CliArgs<'_>,
+) -> Result<CliOutput, String> {
+    let options = AcceptInviteServerOptions::parse(args)?;
+    let invite = invite::commands::parse(&options.invite)?;
+    if !invite.identity_scope || invite.endpoint_role != endpoint::types::EndpointRole::InviteServer
+    {
+        return Err("accept-invite-server requires an invite-server identity invite".to_string());
+    }
+    if invite.user_authority_event_id.is_some() {
+        return Err("invite-server invite must not carry USER_ID".to_string());
+    }
+    if let Some(local) = endpoint::commands::local_keypair(&context.store)? {
+        reject_duplicate_join(&context.store, local.endpoint, invite.workspace_id)?;
+    }
+    let local = ensure_local_endpoint(context)?;
+    let shared = endpoint_shared::commands::share_endpoint(
+        &context.store,
+        endpoint_shared::commands::ShareEndpoint {
+            created_at_ms: next_timestamp(&context.store)?,
+            workspace_id: invite.workspace_id,
+            user_authority_event_id: invite.invite_event_id,
+            endpoint_id: local.endpoint,
+            signing_public_key: local.signing_public_key,
+            endpoint_role: endpoint::types::EndpointRole::InviteServer,
+            device_name: options.device_name,
+            device_invite_id: invite.invite_event_id,
+            device_invite_private_key: invite.bootstrap_secret,
+        },
+    )?;
+    let endpoint_shared_id = shared.value.endpoint_shared_id;
+    let initial_records = proposed_records(&shared.events);
+    let connected = connect_invite_with_initial_records(context, &options.invite, initial_records)?;
+    let key =
+        invite_server::schema::invite_server_key(&invite.workspace_id, &invite.invite_event_id);
+    let value = context
+        .store
+        .table_row(invite_server::schema::INVITE_SERVERS, &key)
+        .map_err(|err| format!("load invite_server: {err}"))?
+        .ok_or_else(|| "invite_server was not received".to_string())?;
+    let row = invite_server::schema::decode_invite_server_row(&key, &value)?;
+    if row.public_key != crypto::ed25519_public_key(&invite.bootstrap_secret) {
+        return Err("invite private key does not match invite_server".to_string());
+    }
+    reject_duplicate_join(&context.store, local.endpoint, invite.workspace_id)?;
+    admit(context, shared)?;
+    Ok(CliOutput::lines(vec![
+        format!("connected: {}", connected.addr),
+        format!("workspace_id: {}", encode_hex(&invite.workspace_id)),
+        format!("endpoint_shared_id: {}", encode_hex(&endpoint_shared_id)),
+        "endpoint_role: invite-server".to_string(),
+    ]))
+}
+
 fn run_link_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutput, String> {
     let options = LinkOptions::parse(args)?;
     let local = ensure_local_endpoint(context)?;
@@ -311,6 +424,9 @@ fn run_accept_link_command(context: &mut Context, args: CliArgs<'_>) -> Result<C
     if !invite.identity_scope {
         return Err("accept-link requires an identity invite".to_string());
     }
+    if invite.endpoint_role != endpoint::types::EndpointRole::Device {
+        return Err("accept-link requires a device-link invite".to_string());
+    }
     let user_authority_event_id = invite
         .user_authority_event_id
         .ok_or_else(|| "device link is missing USER_ID".to_string())?;
@@ -326,6 +442,7 @@ fn run_accept_link_command(context: &mut Context, args: CliArgs<'_>) -> Result<C
             user_authority_event_id,
             endpoint_id: local.endpoint,
             signing_public_key: local.signing_public_key,
+            endpoint_role: endpoint::types::EndpointRole::Device,
             device_name: options.device_name,
             device_invite_id: invite.invite_event_id,
             device_invite_private_key: invite.bootstrap_secret,
@@ -431,9 +548,10 @@ fn run_peers_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutp
     {
         let row = endpoint_shared::schema::decode_endpoint_shared_row(&key, &value)?;
         lines.push(format!(
-            "{} user_id={} device_name={}",
+            "{} user_id={} endpoint_role={} device_name={}",
             encode_hex(&row.endpoint_id),
             encode_hex(&row.user_authority_event_id),
+            row.endpoint_role.as_str(),
             row.device_name
         ));
     }
@@ -456,11 +574,12 @@ fn run_identity_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliO
         let membership = local_membership(&context.store, local.endpoint, workspace_id)?;
         let workspace = workspace_row(&context.store, workspace_id)?;
         lines.push(format!(
-            "workspace: {} {} user_id={} endpoint_shared_id={}",
+            "workspace: {} {} user_id={} endpoint_shared_id={} endpoint_role={}",
             encode_hex(&workspace_id),
             workspace.name,
             encode_hex(&membership.user_authority_event_id),
-            encode_hex(&membership.endpoint_shared_id)
+            encode_hex(&membership.endpoint_shared_id),
+            membership.endpoint_role.as_str()
         ));
     }
     Ok(CliOutput::lines(lines))
@@ -604,6 +723,68 @@ impl AcceptOptions {
         Ok(Self {
             invite,
             username,
+            device_name,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InviteServerOptions {
+    workspace_id: EventId,
+    listen: ListenMode,
+}
+
+impl InviteServerOptions {
+    fn parse(args: CliArgs<'_>) -> Result<Self, String> {
+        let workspace_id = decode_hex_32(
+            args.get(0).ok_or_else(|| INVITE_SERVER_USAGE.to_string())?,
+            INVITE_SERVER_USAGE,
+        )?;
+        let tail = CliArgs::new(&args.values()[1..]);
+        let (_, listen) = parse_workspace_and_listen(tail, false, INVITE_SERVER_USAGE)?;
+        Ok(Self {
+            workspace_id,
+            listen,
+        })
+    }
+
+    fn public_addr(self) -> SocketAddr {
+        public_addr(self.listen)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AcceptInviteServerOptions {
+    invite: String,
+    device_name: String,
+}
+
+impl AcceptInviteServerOptions {
+    fn parse(args: CliArgs<'_>) -> Result<Self, String> {
+        let invite = args
+            .get(0)
+            .ok_or_else(|| ACCEPT_INVITE_SERVER_USAGE.to_string())?
+            .to_string();
+        let mut device_name = "invite-server".to_string();
+        let mut idx = 1;
+        while idx < args.values().len() {
+            match args.get(idx).expect("index in bounds") {
+                "--devicename" => {
+                    device_name = args
+                        .get(idx + 1)
+                        .ok_or_else(|| ACCEPT_INVITE_SERVER_USAGE.to_string())?
+                        .to_string();
+                    idx += 2;
+                }
+                other => {
+                    return Err(format!(
+                        "unknown accept-invite-server option `{other}`\n{ACCEPT_INVITE_SERVER_USAGE}"
+                    ));
+                }
+            }
+        }
+        Ok(Self {
+            invite,
             device_name,
         })
     }
@@ -857,6 +1038,7 @@ fn prepare_endpoint_join(
             user_authority_event_id: input.user_id,
             endpoint_id: local.endpoint,
             signing_public_key: local.signing_public_key,
+            endpoint_role: endpoint::types::EndpointRole::Device,
             device_name: input.device_name,
             device_invite_id,
             device_invite_private_key,

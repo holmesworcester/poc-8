@@ -247,6 +247,8 @@ mod tests {
                 user_authority_event_id: user_id,
                 endpoint_id: public_key(&OTHER_ENDPOINT_PRIVATE),
                 signing_public_key: public_key(&endpoint_private_key),
+                endpoint_role:
+                    crate::protocol::event_modules::identity::endpoint::types::EndpointRole::Device,
                 device_name: "laptop".to_string(),
                 device_invite_id: [5; 32],
                 device_invite_private_key: DEVICE_INVITE_PRIVATE,
