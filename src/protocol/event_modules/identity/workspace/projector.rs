@@ -27,6 +27,7 @@ mod tests {
     use super::super::types::WorkspaceEvent;
     use super::*;
 
+    // Invariant: projects one workspace row keyed by workspace id.
     #[test]
     fn projects_one_workspace_row_keyed_by_workspace_id() {
         let event = WorkspaceEvent {

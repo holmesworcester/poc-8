@@ -88,6 +88,7 @@ mod tests {
         }
     }
 
+    // Invariant: user rows decode to projected shape.
     #[test]
     fn user_rows_decode_to_projected_shape() {
         let row = user_row([2; 32], [9; 32], [5; 32], &event()).expect("user row");
@@ -107,6 +108,7 @@ mod tests {
         );
     }
 
+    // Invariant: duplicate user row insert is idempotent.
     #[test]
     fn duplicate_user_row_insert_is_idempotent() {
         let row = user_row([2; 32], [9; 32], [5; 32], &event()).expect("user row");

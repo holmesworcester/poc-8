@@ -77,6 +77,7 @@ mod tests {
         }
     }
 
+    // Invariant: outgoing need id projects cached event and transit out rows.
     #[test]
     fn outgoing_need_id_projects_cached_event_and_transit_out_rows() {
         let record = codec::outbound_record(need_event()).expect("record");
@@ -90,6 +91,7 @@ mod tests {
         assert_eq!(output.rows[1].table, worker_schema::TRANSIT_OUT);
     }
 
+    // Invariant: incoming need id projects inbound sync work row.
     #[test]
     fn incoming_need_id_projects_inbound_sync_work_row() {
         let bytes = codec::encode(&need_event());
@@ -101,6 +103,7 @@ mod tests {
         assert_eq!(output.rows[0].value, record.canonical_bytes);
     }
 
+    // Invariant: need id rejects connection scope mismatch.
     #[test]
     fn need_id_rejects_connection_scope_mismatch() {
         let mut record = codec::outbound_record(need_event()).expect("record");

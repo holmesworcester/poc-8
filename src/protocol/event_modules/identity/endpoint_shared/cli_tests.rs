@@ -19,6 +19,7 @@ impl commands::EndpointMembershipRead for NoMembership {
     }
 }
 
+// Invariant: admits received device invite then signed endpoint shared join.
 #[test]
 fn admits_received_device_invite_then_signed_endpoint_shared_join() {
     let workspace_private_key = [1; 32];

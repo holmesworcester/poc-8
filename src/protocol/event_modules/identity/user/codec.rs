@@ -84,6 +84,7 @@ mod tests {
         }
     }
 
+    // Invariant: roundtrips fixed width user payload.
     #[test]
     fn roundtrips_fixed_width_user_payload() {
         let encoded = encode(&event()).expect("encode user");
@@ -92,6 +93,7 @@ mod tests {
         assert_eq!(decode(&encoded).expect("decode user"), event());
     }
 
+    // Invariant: rejects trailing bytes.
     #[test]
     fn rejects_trailing_bytes() {
         let mut encoded = encode(&event()).expect("encode user");
@@ -102,6 +104,7 @@ mod tests {
             .contains("trailing user bytes"));
     }
 
+    // Invariant: rejects non canonical username padding.
     #[test]
     fn rejects_non_canonical_username_padding() {
         let mut encoded = encode(&event()).expect("encode user");
@@ -114,6 +117,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects usernames that do not fit fixed slot.
     #[test]
     fn rejects_usernames_that_do_not_fit_fixed_slot() {
         let err = encode(&UserEvent {

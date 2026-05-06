@@ -57,6 +57,7 @@ mod tests {
 
     use super::*;
 
+    // Invariant: create returns signed user with user invite dependency.
     #[test]
     fn create_returns_signed_user_with_user_invite_dependency() {
         let invite_id = [2; 32];
@@ -95,6 +96,7 @@ mod tests {
         assert_eq!(decoded.username, "alice");
     }
 
+    // Invariant: create rejects blank username before proposing event.
     #[test]
     fn create_rejects_blank_username_before_proposing_event() {
         let err = create(CreateUser {

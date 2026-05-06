@@ -17,6 +17,7 @@ use topo::protocol::event_modules::types::EventId;
 use topo::protocol::event_modules::worker::{self, CommandOutput};
 use topo::protocol::Protocol;
 
+// Invariant: daemons sync cli generated content without manual sync and without scope leaks.
 #[test]
 fn daemons_sync_cli_generated_content_without_manual_sync_and_without_scope_leaks() {
     let _guard = black_box_guard();
@@ -62,6 +63,7 @@ fn daemons_sync_cli_generated_content_without_manual_sync_and_without_scope_leak
     assert_content_count(&bob, alice_private.workspace_id, 0);
 }
 
+// Invariant: second daemon for same db is rejected.
 #[test]
 fn second_daemon_for_same_db_is_rejected() {
     let _guard = black_box_guard();

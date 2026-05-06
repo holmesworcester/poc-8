@@ -154,6 +154,7 @@ mod tests {
         }
     }
 
+    // Invariant: projects endpoint shared and membership rows from signed device invite.
     #[test]
     fn projects_endpoint_shared_and_membership_rows_from_signed_device_invite() {
         let (device_invite_id, invite_record) = device_invite_record([7; 32], [1; 32], [2; 32]);
@@ -177,6 +178,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects when device invite dependency is missing.
     #[test]
     fn rejects_when_device_invite_dependency_is_missing() {
         let (device_invite_id, _) = device_invite_record([7; 32], [1; 32], [2; 32]);
@@ -198,6 +200,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects signer public key mismatch.
     #[test]
     fn rejects_signer_public_key_mismatch() {
         let (device_invite_id, invite_record) = device_invite_record([7; 32], [1; 32], [2; 32]);
@@ -211,6 +214,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects workspace or user authority mismatch.
     #[test]
     fn rejects_workspace_or_user_authority_mismatch() {
         let (device_invite_id, invite_record) = device_invite_record([7; 32], [1; 32], [2; 32]);
@@ -236,6 +240,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects unsigned device invite dependency.
     #[test]
     fn rejects_unsigned_device_invite_dependency() {
         let raw_invite = device_invite::types::DeviceInviteEvent {
@@ -259,6 +264,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects non endpoint shared payload.
     #[test]
     fn rejects_non_endpoint_shared_payload() {
         let (device_invite_id, invite_record) = device_invite_record([7; 32], [1; 32], [2; 32]);

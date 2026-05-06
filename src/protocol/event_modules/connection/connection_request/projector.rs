@@ -151,6 +151,7 @@ mod tests {
         (record, invite_secret_event_id, invite_record)
     }
 
+    // Invariant: projects request bytes without receive metadata.
     #[test]
     fn projects_request_bytes_without_receive_metadata() {
         let record = request_record();
@@ -168,6 +169,7 @@ mod tests {
         assert_eq!(output.rows[1].value, [9; 32]);
     }
 
+    // Invariant: projects received request connection and route rows.
     #[test]
     fn projects_received_request_connection_and_route_rows() {
         let (record, invite_secret_event_id, invite_record) = authorized_request_record();
@@ -200,6 +202,7 @@ mod tests {
         assert_eq!(output.rows[2].value, origin.to_string().into_bytes());
     }
 
+    // Invariant: rejects received request without bootstrap authorization.
     #[test]
     fn rejects_received_request_without_bootstrap_authorization() {
         let record = request_record();
@@ -224,6 +227,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects received request when invite secret dependency is missing.
     #[test]
     fn rejects_received_request_when_invite_secret_dependency_is_missing() {
         let (record, _, _) = authorized_request_record();
@@ -248,6 +252,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects received request when invite secret hash does not match.
     #[test]
     fn rejects_received_request_when_invite_secret_hash_does_not_match() {
         let (record, invite_secret_event_id, _) = authorized_request_record();

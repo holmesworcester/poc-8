@@ -303,6 +303,7 @@ mod tests {
         Ok(())
     }
 
+    // Invariant: daemon runs named workers with generic counters.
     #[test]
     fn daemon_runs_named_workers_with_generic_counters() {
         let mut context = TestContext;
@@ -327,6 +328,7 @@ mod tests {
         assert_eq!(report.get("test_runs"), report.get("test.worker"));
     }
 
+    // Invariant: daemon treats store busy as retryable.
     #[test]
     fn daemon_treats_store_busy_as_retryable() {
         assert!(is_retryable_store_busy("drain: database is locked"));

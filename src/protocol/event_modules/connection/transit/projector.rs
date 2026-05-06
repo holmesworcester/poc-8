@@ -165,6 +165,7 @@ mod tests {
         endpoint::commands::create_local_keypair().value
     }
 
+    // Invariant: bootstrap frame projects inner bytes with provenance.
     #[test]
     fn bootstrap_frame_projects_inner_bytes_with_provenance() {
         let local = keypair();
@@ -198,6 +199,7 @@ mod tests {
         assert!(provenance.remember_route);
     }
 
+    // Invariant: rejects frame for another local endpoint.
     #[test]
     fn rejects_frame_for_another_local_endpoint() {
         let local = keypair();

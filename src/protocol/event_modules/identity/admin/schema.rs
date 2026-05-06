@@ -85,6 +85,7 @@ mod tests {
 
     use super::*;
 
+    // Invariant: admin rows decode to projected shape.
     #[test]
     fn admin_rows_decode_to_projected_shape() {
         let row = admin_row([1; 32], [2; 32], 9, [3; 32], [4; 32], [5; 32]);
@@ -106,6 +107,7 @@ mod tests {
         );
     }
 
+    // Invariant: duplicate admin row insert is idempotent.
     #[test]
     fn duplicate_admin_row_insert_is_idempotent() {
         let row = admin_row([1; 32], [2; 32], 9, [3; 32], [4; 32], [5; 32]);

@@ -288,6 +288,7 @@ mod tests {
     use super::*;
     use std::thread;
 
+    // Invariant: write frame sends length prefixed bytes within budget.
     #[test]
     fn write_frame_sends_length_prefixed_bytes_within_budget() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
@@ -307,6 +308,7 @@ mod tests {
         assert_eq!(reader.join().expect("reader thread"), b"abc");
     }
 
+    // Invariant: write frame zero budget times out before blocking.
     #[test]
     fn write_frame_zero_budget_times_out_before_blocking() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");

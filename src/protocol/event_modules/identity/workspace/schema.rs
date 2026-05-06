@@ -93,6 +93,7 @@ mod tests {
 
     use super::*;
 
+    // Invariant: workspace rows decode to projected shape.
     #[test]
     fn workspace_rows_decode_to_projected_shape() {
         let row = workspace_row([1; 32], 9, [2; 32], "Ops").expect("workspace row");
@@ -111,6 +112,7 @@ mod tests {
         );
     }
 
+    // Invariant: duplicate workspace row insert is idempotent.
     #[test]
     fn duplicate_workspace_row_insert_is_idempotent() {
         let row = workspace_row([3; 32], 10, [4; 32], "Product").expect("workspace row");

@@ -31,6 +31,7 @@ mod tests {
     use super::super::types::InviteSecretEvent;
     use super::*;
 
+    // Invariant: project writes secret by bootstrap hash as local authority row.
     #[test]
     fn project_writes_secret_by_bootstrap_hash_as_local_authority_row() {
         let event = InviteSecretEvent::new([7; 32]);

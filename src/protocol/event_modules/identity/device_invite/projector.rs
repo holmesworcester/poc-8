@@ -297,6 +297,7 @@ mod tests {
         }
     }
 
+    // Invariant: projects user signed device invite row.
     #[test]
     fn projects_user_signed_device_invite_row() {
         let (workspace_id, workspace_record) = workspace_record(&WORKSPACE_PRIVATE);
@@ -336,6 +337,7 @@ mod tests {
         assert_eq!(decoded.user_invite_event_id, Some(user_invite_id));
     }
 
+    // Invariant: rejects unsigned device invite payload.
     #[test]
     fn rejects_unsigned_device_invite_payload() {
         let (workspace_id, workspace_record) = workspace_record(&WORKSPACE_PRIVATE);
@@ -366,6 +368,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects user signed device invite without user invite dependency.
     #[test]
     fn rejects_user_signed_device_invite_without_user_invite_dependency() {
         let (workspace_id, workspace_record) = workspace_record(&WORKSPACE_PRIVATE);
@@ -385,6 +388,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects user signed device invite for different workspace.
     #[test]
     fn rejects_user_signed_device_invite_for_different_workspace() {
         let (workspace_id, _) = workspace_record(&WORKSPACE_PRIVATE);
@@ -415,6 +419,7 @@ mod tests {
         );
     }
 
+    // Invariant: projects endpoint shared signed device invite row.
     #[test]
     fn projects_endpoint_shared_signed_device_invite_row() {
         let (workspace_id, workspace_record) = workspace_record(&WORKSPACE_PRIVATE);
@@ -446,6 +451,7 @@ mod tests {
         assert_eq!(decoded.user_invite_event_id, None);
     }
 
+    // Invariant: rejects endpoint shared signed device invite with wrong endpoint key.
     #[test]
     fn rejects_endpoint_shared_signed_device_invite_with_wrong_endpoint_key() {
         let (workspace_id, workspace_record) = workspace_record(&WORKSPACE_PRIVATE);
@@ -475,6 +481,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects endpoint shared signed device invite with user invite dependency.
     #[test]
     fn rejects_endpoint_shared_signed_device_invite_with_user_invite_dependency() {
         let (workspace_id, workspace_record) = workspace_record(&WORKSPACE_PRIVATE);
@@ -506,6 +513,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects endpoint shared signed device invite workspace or user mismatch.
     #[test]
     fn rejects_endpoint_shared_signed_device_invite_workspace_or_user_mismatch() {
         let (workspace_id, _) = workspace_record(&WORKSPACE_PRIVATE);

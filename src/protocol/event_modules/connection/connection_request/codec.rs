@@ -78,6 +78,7 @@ mod tests {
         }
     }
 
+    // Invariant: record declares invite secret dependency.
     #[test]
     fn record_declares_invite_secret_dependency() {
         let record = record_from_bytes(encode(&request())).expect("record");

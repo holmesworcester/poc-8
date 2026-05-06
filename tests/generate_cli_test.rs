@@ -9,6 +9,7 @@ use topo::protocol::event_modules::types::EventId;
 use topo::protocol::event_modules::worker;
 use topo::protocol::Protocol;
 
+// Invariant: generate cli uses real store and reports applied events.
 #[test]
 fn generate_cli_uses_real_store_and_reports_applied_events() {
     let tmp = tempfile::tempdir().unwrap();

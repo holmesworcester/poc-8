@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use cli_harness::*;
 
+// Invariant: cascade cli replays event with deps out of order and unblocks 10k.
 #[test]
 fn cascade_cli_replays_event_with_deps_out_of_order_and_unblocks_10k() {
     let tmp = tempfile::tempdir().unwrap();
@@ -43,6 +44,7 @@ fn cascade_cli_replays_event_with_deps_out_of_order_and_unblocks_10k() {
     assert!(rate.is_finite() && rate > 0.0);
 }
 
+// Invariant: ignored 50k cascade run preserves unblock correctness at stress scale.
 #[test]
 #[ignore]
 fn cascade_cli_replays_event_with_deps_out_of_order_and_unblocks_50k() {

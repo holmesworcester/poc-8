@@ -137,6 +137,7 @@ fn x25519_hkdf_sha256_key(
 mod tests {
     use super::*;
 
+    // Invariant: hash is deterministic and input sensitive.
     #[test]
     fn hash_is_deterministic_and_input_sensitive() {
         let left = hash(b"topo auth graph");
@@ -144,6 +145,7 @@ mod tests {
         assert_ne!(left, hash(b"topo auth graph."));
     }
 
+    // Invariant: ed25519 signatures verify with matching key and bytes.
     #[test]
     fn ed25519_signatures_verify_with_matching_key_and_bytes() {
         let private_key = [7; ED25519_PRIVATE_KEY_BYTES];
@@ -161,6 +163,7 @@ mod tests {
         ));
     }
 
+    // Invariant: ed25519 signatures are deterministic for the same key and bytes.
     #[test]
     fn ed25519_signatures_are_deterministic_for_the_same_key_and_bytes() {
         let private_key = [11; ED25519_PRIVATE_KEY_BYTES];
@@ -172,6 +175,7 @@ mod tests {
         );
     }
 
+    // Invariant: x25519 xchacha20poly1305 roundtrips with matching context.
     #[test]
     fn x25519_xchacha20poly1305_roundtrips_with_matching_context() {
         let alice_secret = random_x25519_private_key();

@@ -47,6 +47,7 @@ mod tests {
 
     use super::*;
 
+    // Invariant: project writes public endpoint and secret as local rows.
     #[test]
     fn project_writes_public_endpoint_and_secret_as_local_rows() {
         let local = commands::create_local_keypair().value;

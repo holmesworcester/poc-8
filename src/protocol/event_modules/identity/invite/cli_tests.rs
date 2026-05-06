@@ -4,6 +4,7 @@ use crate::protocol::event_modules::identity::endpoint;
 
 use super::{commands, schema};
 
+// Invariant: invite cli creates local endpoint and local invite secret.
 #[test]
 fn invite_cli_creates_local_endpoint_and_local_invite_secret() {
     let tmp = tempfile::tempdir().expect("temp dir");

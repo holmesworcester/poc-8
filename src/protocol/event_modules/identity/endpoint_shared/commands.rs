@@ -120,6 +120,7 @@ mod tests {
         }
     }
 
+    // Invariant: share endpoint returns signed event depending on device invite.
     #[test]
     fn share_endpoint_returns_signed_event_depending_on_device_invite() {
         let private_key = [7; ED25519_PRIVATE_KEY_BYTES];
@@ -174,6 +175,7 @@ mod tests {
         assert_eq!(inner.device_name, "laptop");
     }
 
+    // Invariant: share endpoint rejects duplicate membership preflight.
     #[test]
     fn share_endpoint_rejects_duplicate_membership_preflight() {
         let err = share_endpoint(
@@ -187,6 +189,7 @@ mod tests {
         assert_eq!(err, "endpoint is already joined to workspace");
     }
 
+    // Invariant: share endpoint rejects empty ids and bad device name.
     #[test]
     fn share_endpoint_rejects_empty_ids_and_bad_device_name() {
         let err = share_endpoint(

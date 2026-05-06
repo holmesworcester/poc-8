@@ -207,6 +207,7 @@ mod tests {
             .value
     }
 
+    // Invariant: signed envelope roundtrips and exposes signer dependency.
     #[test]
     fn signed_envelope_roundtrips_and_exposes_signer_dependency() {
         let envelope = fixture();
@@ -220,6 +221,7 @@ mod tests {
         assert_eq!(record.body_len, 4);
     }
 
+    // Invariant: signed user invite uses inner timestamp and unique dependencies.
     #[test]
     fn signed_user_invite_uses_inner_timestamp_and_unique_dependencies() {
         let payload = user_invite::codec::encode(&user_invite::types::UserInviteEvent {
@@ -241,6 +243,7 @@ mod tests {
         assert_eq!(record.scope, EventScope::Shared);
     }
 
+    // Invariant: signed endpoint shared exposes signer workspace and user authority dependencies.
     #[test]
     fn signed_endpoint_shared_exposes_signer_workspace_and_user_authority_dependencies() {
         let payload =
@@ -265,6 +268,7 @@ mod tests {
         assert_eq!(record.dependencies, vec![[8; 32], [1; 32], [2; 32]]);
     }
 
+    // Invariant: signed admin uses inner timestamp and unique dependencies.
     #[test]
     fn signed_admin_uses_inner_timestamp_and_unique_dependencies() {
         let payload = admin::codec::encode(&admin::types::AdminEvent {
@@ -286,6 +290,7 @@ mod tests {
         );
     }
 
+    // Invariant: signed admin metadata deduplicates signer and inner dependencies.
     #[test]
     fn signed_admin_metadata_deduplicates_signer_and_inner_dependencies() {
         let payload = admin::codec::encode(&admin::types::AdminEvent {
@@ -302,6 +307,7 @@ mod tests {
         assert_eq!(record.dependencies, vec![[1; 32]]);
     }
 
+    // Invariant: signed envelope rejects trailing bytes.
     #[test]
     fn signed_envelope_rejects_trailing_bytes() {
         let mut bytes = encode(&fixture());
@@ -312,6 +318,7 @@ mod tests {
             .contains("trailing signed envelope bytes"));
     }
 
+    // Invariant: signed envelope rejects wrong signature.
     #[test]
     fn signed_envelope_rejects_wrong_signature() {
         let mut bytes = encode(&fixture());
@@ -323,6 +330,7 @@ mod tests {
             .contains("signature verification failed"));
     }
 
+    // Invariant: signed envelope rejects tampered payload before metadata extraction.
     #[test]
     fn signed_envelope_rejects_tampered_payload_before_metadata_extraction() {
         let payload = user_invite::codec::encode(&user_invite::types::UserInviteEvent {
@@ -339,6 +347,7 @@ mod tests {
             .contains("signature verification failed"));
     }
 
+    // Invariant: signed envelope rejects wrong signer event id.
     #[test]
     fn signed_envelope_rejects_wrong_signer_event_id() {
         let mut bytes = encode(&fixture());
@@ -349,6 +358,7 @@ mod tests {
             .contains("signature verification failed"));
     }
 
+    // Invariant: signed envelope rejects wrong signer public key.
     #[test]
     fn signed_envelope_rejects_wrong_signer_public_key() {
         let mut bytes = encode(&fixture());
@@ -359,6 +369,7 @@ mod tests {
             .contains("signature verification failed"));
     }
 
+    // Invariant: signed envelope canonical bytes are deterministic.
     #[test]
     fn signed_envelope_canonical_bytes_are_deterministic() {
         let signer_event_id = [4; 32];

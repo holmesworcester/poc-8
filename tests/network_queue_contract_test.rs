@@ -5,6 +5,7 @@ use topo::core::network_queues::{
 };
 use topo::core::store::Store;
 
+// Invariant: network queues are opaque and idempotent rows.
 #[test]
 fn network_queues_are_opaque_and_idempotent_rows() {
     let tmp = tempfile::tempdir().unwrap();

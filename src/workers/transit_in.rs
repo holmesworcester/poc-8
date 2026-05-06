@@ -82,6 +82,7 @@ mod tests {
         endpoint::commands::create_local_keypair().value
     }
 
+    // Invariant: drains network frames into canonical in without admitting inner event.
     #[test]
     fn drains_network_frames_into_canonical_in_without_admitting_inner_event() {
         let local = keypair();

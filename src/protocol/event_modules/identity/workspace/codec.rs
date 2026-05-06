@@ -95,6 +95,7 @@ mod tests {
         }
     }
 
+    // Invariant: roundtrips fixed width workspace event.
     #[test]
     fn roundtrips_fixed_width_workspace_event() {
         let encoded = encode(&event()).expect("encode workspace");
@@ -102,6 +103,7 @@ mod tests {
         assert_eq!(decode(&encoded).expect("decode workspace"), event());
     }
 
+    // Invariant: rejects trailing bytes.
     #[test]
     fn rejects_trailing_bytes() {
         let mut encoded = encode(&event()).expect("encode workspace");
@@ -109,6 +111,7 @@ mod tests {
         assert!(decode(&encoded).is_err());
     }
 
+    // Invariant: rejects non canonical name padding.
     #[test]
     fn rejects_non_canonical_name_padding() {
         let mut encoded = encode(&event()).expect("encode workspace");
@@ -117,6 +120,7 @@ mod tests {
         assert!(decode(&encoded).is_err());
     }
 
+    // Invariant: record is shared root event.
     #[test]
     fn record_is_shared_root_event() {
         let encoded = encode(&event()).expect("encode workspace");

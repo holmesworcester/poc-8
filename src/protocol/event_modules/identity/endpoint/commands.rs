@@ -123,6 +123,7 @@ mod tests {
         }
     }
 
+    // Invariant: create local keypair proposes local only matching secret event.
     #[test]
     fn create_local_keypair_proposes_local_only_matching_secret_event() {
         let output = create_local_keypair();
@@ -137,6 +138,7 @@ mod tests {
         assert_eq!(decoded, output.value);
     }
 
+    // Invariant: local keypair rejects stored secret that does not match endpoint.
     #[test]
     fn local_keypair_rejects_stored_secret_that_does_not_match_endpoint() {
         let good = create_local_keypair().value;
@@ -153,6 +155,7 @@ mod tests {
         assert_eq!(err, "stored endpoint does not match local endpoint secret");
     }
 
+    // Invariant: local keypair rejects stored signing secret that does not match public key.
     #[test]
     fn local_keypair_rejects_stored_signing_secret_that_does_not_match_public_key() {
         let good = create_local_keypair().value;
@@ -172,6 +175,7 @@ mod tests {
         );
     }
 
+    // Invariant: local keypair reports missing side of local material.
     #[test]
     fn local_keypair_reports_missing_side_of_local_material() {
         let local = create_local_keypair().value;

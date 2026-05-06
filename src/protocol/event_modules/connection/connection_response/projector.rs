@@ -159,6 +159,7 @@ mod tests {
         }
     }
 
+    // Invariant: projects response bytes with matching request dependency.
     #[test]
     fn projects_response_bytes_with_matching_request_dependency() {
         let request = request_record();
@@ -177,6 +178,7 @@ mod tests {
         assert_eq!(output.rows[0].value, response.canonical_bytes);
     }
 
+    // Invariant: projects received response connection and route rows.
     #[test]
     fn projects_received_response_connection_and_route_rows() {
         let request = request_record();
@@ -208,6 +210,7 @@ mod tests {
         assert_eq!(output.rows[2].value, origin.to_string().into_bytes());
     }
 
+    // Invariant: rejects response for another endpoint request.
     #[test]
     fn rejects_response_for_another_endpoint_request() {
         let request = connection_request::codec::record_from_bytes(
@@ -227,6 +230,7 @@ mod tests {
         assert!(err.contains("another endpoint"));
     }
 
+    // Invariant: rejects received response without endpoint receive authorization.
     #[test]
     fn rejects_received_response_without_endpoint_receive_authorization() {
         let request = request_record();
@@ -256,6 +260,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects received response when receive sender does not match response sender.
     #[test]
     fn rejects_received_response_when_receive_sender_does_not_match_response_sender() {
         let request = request_record();

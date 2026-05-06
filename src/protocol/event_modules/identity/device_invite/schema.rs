@@ -93,6 +93,7 @@ mod tests {
         }
     }
 
+    // Invariant: device invite rows decode to projected shape.
     #[test]
     fn device_invite_rows_decode_to_projected_shape() {
         let row = device_invite_row([4; 32], &event()).expect("row");
@@ -112,6 +113,7 @@ mod tests {
         );
     }
 
+    // Invariant: duplicate device invite row insert is idempotent.
     #[test]
     fn duplicate_device_invite_row_insert_is_idempotent() {
         let row = device_invite_row([4; 32], &event()).expect("row");

@@ -121,6 +121,7 @@ mod tests {
 
     use super::*;
 
+    // Invariant: bootstrap command proposes workspace signed admin event.
     #[test]
     fn bootstrap_command_proposes_workspace_signed_admin_event() {
         let signer_private_key = [7; crypto::ED25519_PRIVATE_KEY_BYTES];
@@ -157,6 +158,7 @@ mod tests {
         assert_eq!(event.user_event_id, [1; 32]);
     }
 
+    // Invariant: grant command rejects unsigned ongoing admin grants.
     #[test]
     fn grant_command_rejects_unsigned_ongoing_admin_grants() {
         let err = grant(GrantAdmin {
@@ -174,6 +176,7 @@ mod tests {
         );
     }
 
+    // Invariant: grant rejects workspace authority so bootstrap shape stays explicit.
     #[test]
     fn grant_rejects_workspace_authority_so_bootstrap_shape_stays_explicit() {
         let err = grant(GrantAdmin {
@@ -188,6 +191,7 @@ mod tests {
         assert_eq!(err, "ongoing admin grant authority must be an admin event");
     }
 
+    // Invariant: sign grant uses real signed envelope with inner dependencies.
     #[test]
     fn sign_grant_uses_real_signed_envelope_with_inner_dependencies() {
         let signer_private_key = [7; crypto::ED25519_PRIVATE_KEY_BYTES];
@@ -222,6 +226,7 @@ mod tests {
         );
     }
 
+    // Invariant: sign grant rejects signer that is not authority admin.
     #[test]
     fn sign_grant_rejects_signer_that_is_not_authority_admin() {
         let err = sign_grant(SignGrantAdmin {

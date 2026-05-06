@@ -203,6 +203,7 @@ mod tests {
         endpoint::commands::create_local_keypair().value
     }
 
+    // Invariant: create invite proposes local only secret event and parseable link.
     #[test]
     fn create_invite_proposes_local_only_secret_event_and_parseable_link() {
         let local = local_endpoint();
@@ -228,6 +229,7 @@ mod tests {
         assert_eq!(secret_event.bootstrap_secret, invite.bootstrap_secret);
     }
 
+    // Invariant: parse accepts stable invite link shape.
     #[test]
     fn parse_accepts_stable_invite_link_shape() {
         let link = concat!(
@@ -256,6 +258,7 @@ mod tests {
         assert_eq!(addr(link).expect("parse invite addr"), invite.addr);
     }
 
+    // Invariant: parse rejects duplicate or unknown invite parts.
     #[test]
     fn parse_rejects_duplicate_or_unknown_invite_parts() {
         let duplicate = concat!(
@@ -296,6 +299,7 @@ mod tests {
         );
     }
 
+    // Invariant: secret hash is stable domain separated and secret sensitive.
     #[test]
     fn secret_hash_is_stable_domain_separated_and_secret_sensitive() {
         let secret = [0x42; 32];

@@ -45,6 +45,7 @@ mod tests {
 
     use super::*;
 
+    // Invariant: runs steps in round robin order until stopped.
     #[test]
     fn runs_steps_in_round_robin_order_until_stopped() {
         let steps = ["a", "b", "c"];
@@ -66,6 +67,7 @@ mod tests {
         assert_eq!(report.steps, 6);
     }
 
+    // Invariant: rejects empty step sets.
     #[test]
     fn rejects_empty_step_sets() {
         let err = run_round_robin::<u8>(&[], Duration::from_millis(1), || true, |_| Ok(()))

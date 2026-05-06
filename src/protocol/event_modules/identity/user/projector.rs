@@ -137,6 +137,7 @@ mod tests {
         }
     }
 
+    // Invariant: projects user row scoped by user invite workspace.
     #[test]
     fn projects_user_row_scoped_by_user_invite_workspace() {
         let (invite_id, invite_record) = user_invite_record(&INVITE_PRIVATE);
@@ -155,6 +156,7 @@ mod tests {
         assert_eq!(row.username, "alice");
     }
 
+    // Invariant: rejects missing signer dependency context.
     #[test]
     fn rejects_missing_signer_dependency_context() {
         let (invite_id, _) = user_invite_record(&INVITE_PRIVATE);
@@ -165,6 +167,7 @@ mod tests {
         assert_eq!(err, "missing signer dependency context for user");
     }
 
+    // Invariant: rejects wrong signer dependency type.
     #[test]
     fn rejects_wrong_signer_dependency_type() {
         let workspace_id = workspace_id();
@@ -191,6 +194,7 @@ mod tests {
         assert_eq!(err, "user signer must be user_invite");
     }
 
+    // Invariant: rejects user signed by key not named by invite.
     #[test]
     fn rejects_user_signed_by_key_not_named_by_invite() {
         let (invite_id, invite_record) = user_invite_record(&INVITE_PRIVATE);
@@ -205,6 +209,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects blank username.
     #[test]
     fn rejects_blank_username() {
         let (invite_id, invite_record) = user_invite_record(&INVITE_PRIVATE);
@@ -216,6 +221,7 @@ mod tests {
         assert_eq!(err, "username must not be empty");
     }
 
+    // Invariant: rejects user for different workspace than invite.
     #[test]
     fn rejects_user_for_different_workspace_than_invite() {
         let (invite_id, invite_record) = user_invite_record(&INVITE_PRIVATE);

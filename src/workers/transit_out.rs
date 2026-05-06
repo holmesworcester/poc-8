@@ -434,6 +434,7 @@ mod tests {
 
     use super::*;
 
+    // Invariant: exchange routes removes rows whose bytes are gone.
     #[test]
     fn exchange_routes_removes_rows_whose_bytes_are_gone() {
         let store = Protocol::open_memory_store().expect("open store");

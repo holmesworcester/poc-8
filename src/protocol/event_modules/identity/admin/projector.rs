@@ -222,6 +222,7 @@ mod tests {
         }
     }
 
+    // Invariant: rejects raw admin even for workspace authority.
     #[test]
     fn rejects_raw_admin_even_for_workspace_authority() {
         let (workspace_id, workspace_record) = make_workspace_record([7; 32]);
@@ -244,6 +245,7 @@ mod tests {
         assert_eq!(err, "admin must be signed");
     }
 
+    // Invariant: rejects raw admin at protocol admission boundary.
     #[test]
     fn rejects_raw_admin_at_protocol_admission_boundary() {
         let (workspace_id, _workspace_record) = make_workspace_record([7; 32]);
@@ -261,6 +263,7 @@ mod tests {
         assert_eq!(err, "admin must be signed");
     }
 
+    // Invariant: rejects unsigned ongoing admin grant even when authority dependency exists.
     #[test]
     fn rejects_unsigned_ongoing_admin_grant_even_when_authority_dependency_exists() {
         let (workspace_id, workspace_record) = make_workspace_record([7; 32]);
@@ -298,6 +301,7 @@ mod tests {
         assert_eq!(err, "admin must be signed");
     }
 
+    // Invariant: projects signed root admin from workspace authority and root user binding.
     #[test]
     fn projects_signed_root_admin_from_workspace_authority_and_root_user_binding() {
         let workspace_private_key = [7; 32];
@@ -340,6 +344,7 @@ mod tests {
         assert_eq!(row.user_event_id, workspace_id);
     }
 
+    // Invariant: rejects signed bootstrap admin when signer key does not match workspace.
     #[test]
     fn rejects_signed_bootstrap_admin_when_signer_key_does_not_match_workspace() {
         let workspace_private_key = [7; 32];
@@ -372,6 +377,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects bootstrap public key that does not match root workspace user.
     #[test]
     fn rejects_bootstrap_public_key_that_does_not_match_root_workspace_user() {
         let workspace_private_key = [7; 32];
@@ -401,6 +407,7 @@ mod tests {
         assert!(err.contains("admin public_key does not match root workspace public_key"));
     }
 
+    // Invariant: rejects signed admin authority from another workspace.
     #[test]
     fn rejects_signed_admin_authority_from_another_workspace() {
         let authority_private_key = [94; 32];
@@ -453,6 +460,7 @@ mod tests {
         assert_eq!(err, "admin authority belongs to a different workspace");
     }
 
+    // Invariant: projects signed non root admin when user public key matches signed user dependency.
     #[test]
     fn projects_signed_non_root_admin_when_user_public_key_matches_signed_user_dependency() {
         let authority_private_key = [94; 32];
@@ -508,6 +516,7 @@ mod tests {
         assert_eq!(row.authority_event_id, authority_id);
     }
 
+    // Invariant: rejects signed non root admin when user public key differs from user dependency.
     #[test]
     fn rejects_signed_non_root_admin_when_user_public_key_differs_from_user_dependency() {
         let authority_private_key = [94; 32];
@@ -559,6 +568,7 @@ mod tests {
         assert_eq!(err, "admin public_key does not match user public_key");
     }
 
+    // Invariant: rejects signed non root admin when user belongs to another workspace.
     #[test]
     fn rejects_signed_non_root_admin_when_user_belongs_to_another_workspace() {
         let authority_private_key = [94; 32];
@@ -611,6 +621,7 @@ mod tests {
         assert_eq!(err, "admin user belongs to a different workspace");
     }
 
+    // Invariant: projects signed admin grant from authority admin key.
     #[test]
     fn projects_signed_admin_grant_from_authority_admin_key() {
         let authority_private_key = [94; 32];
@@ -667,6 +678,7 @@ mod tests {
         assert_eq!(row.public_key, [11; 32]);
     }
 
+    // Invariant: rejects signed admin when signer is not authority admin id.
     #[test]
     fn rejects_signed_admin_when_signer_is_not_authority_admin_id() {
         let authority_private_key = [94; 32];
@@ -718,6 +730,7 @@ mod tests {
         assert_eq!(err, "signed admin grant signer must be the authority admin");
     }
 
+    // Invariant: rejects signed admin when signer key does not match authority admin.
     #[test]
     fn rejects_signed_admin_when_signer_key_does_not_match_authority_admin() {
         let authority_private_key = [94; 32];

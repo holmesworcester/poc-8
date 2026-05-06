@@ -116,6 +116,7 @@ mod tests {
 
     use super::*;
 
+    // Invariant: create proposes local invite secret before request.
     #[test]
     fn create_proposes_local_invite_secret_before_request() {
         let connector = endpoint::commands::create_local_keypair().value;

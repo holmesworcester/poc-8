@@ -7,6 +7,7 @@ use crate::protocol::event_modules::types::{EventId, EventRecord};
 use crate::protocol::event_modules::worker::{self, CommandOutput};
 use crate::protocol::Protocol;
 
+// Invariant: unknown signed identity payloads are rejected at admission.
 #[test]
 fn unknown_signed_identity_payloads_are_rejected_at_admission() {
     let signed = signed::commands::sign_payload([1; 32], &[2; 32], vec![250, 1, 2, 3])
@@ -20,6 +21,7 @@ fn unknown_signed_identity_payloads_are_rejected_at_admission() {
     assert_eq!(err, "signed envelope inner type 250 has no identity record");
 }
 
+// Invariant: bootstrap two users and two endpoints replay without daemon.
 #[test]
 fn bootstrap_two_users_and_two_endpoints_replay_without_daemon() {
     let protocol = Protocol::new();
@@ -213,6 +215,7 @@ fn bootstrap_two_users_and_two_endpoints_replay_without_daemon() {
     assert_eq!(duplicate, "endpoint is already joined to workspace");
 }
 
+// Invariant: same user client can link multiple workspaces but authority does not cross.
 #[test]
 fn same_user_client_can_link_multiple_workspaces_but_authority_does_not_cross() {
     let protocol = Protocol::new();
@@ -341,6 +344,7 @@ fn same_user_client_can_link_multiple_workspaces_but_authority_does_not_cross() 
     );
 }
 
+// Invariant: unsigned device invite bytes are not admissible protocol events.
 #[test]
 fn unsigned_device_invite_bytes_are_not_admissible_protocol_events() {
     let raw = device_invite::types::DeviceInviteEvent {
@@ -357,6 +361,7 @@ fn unsigned_device_invite_bytes_are_not_admissible_protocol_events() {
     assert_eq!(err, "device_invite must be signed");
 }
 
+// Invariant: admin user endpoint authorizes invites per workspace without cross authorizing.
 #[test]
 fn admin_user_endpoint_authorizes_invites_per_workspace_without_cross_authorizing() {
     let protocol = Protocol::new();

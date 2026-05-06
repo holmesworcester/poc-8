@@ -55,6 +55,7 @@ fn parse_global_args(args: Vec<String>) -> Result<(PathBuf, Vec<String>), String
 mod tests {
     use super::*;
 
+    // Invariant: parse global args keeps protocol command tail.
     #[test]
     fn parse_global_args_keeps_protocol_command_tail() {
         let (db, tail) = parse_global_args(vec![

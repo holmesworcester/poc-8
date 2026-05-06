@@ -77,6 +77,7 @@ mod tests {
         }
     }
 
+    // Invariant: outgoing have id projects cached event and transit out rows.
     #[test]
     fn outgoing_have_id_projects_cached_event_and_transit_out_rows() {
         let record = codec::outbound_record(have_event()).expect("record");
@@ -90,6 +91,7 @@ mod tests {
         assert_eq!(output.rows[1].table, worker_schema::TRANSIT_OUT);
     }
 
+    // Invariant: incoming have id projects inbound sync work row.
     #[test]
     fn incoming_have_id_projects_inbound_sync_work_row() {
         let bytes = codec::encode(&have_event());
@@ -101,6 +103,7 @@ mod tests {
         assert_eq!(output.rows[0].value, record.canonical_bytes);
     }
 
+    // Invariant: have id rejects connection scope mismatch.
     #[test]
     fn have_id_rejects_connection_scope_mismatch() {
         let mut record = codec::outbound_record(have_event()).expect("record");

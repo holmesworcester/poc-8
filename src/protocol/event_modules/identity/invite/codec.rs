@@ -52,6 +52,7 @@ mod tests {
     use super::*;
     use crate::protocol::event_modules::identity::invite::types::InviteSecretEvent;
 
+    // Invariant: decode rejects hash that does not match secret.
     #[test]
     fn decode_rejects_hash_that_does_not_match_secret() {
         let event = InviteSecretEvent {
@@ -64,6 +65,7 @@ mod tests {
         assert_eq!(err, "invite secret hash does not match secret");
     }
 
+    // Invariant: decode rejects trailing bytes.
     #[test]
     fn decode_rejects_trailing_bytes() {
         let mut bytes = encode(&InviteSecretEvent::new([7; 32]));
@@ -74,6 +76,7 @@ mod tests {
         assert!(err.starts_with("trailing "), "{err}");
     }
 
+    // Invariant: record from bytes marks invite secret local only.
     #[test]
     fn record_from_bytes_marks_invite_secret_local_only() {
         let record = record_from_bytes(encode(&InviteSecretEvent::new([7; 32]))).expect("record");

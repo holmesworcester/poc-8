@@ -681,6 +681,7 @@ mod tests {
     const TEST_ROWS: TableName = TableName::new("test.rows");
     const MEMORY_ROWS: TableName = TableName::new("test.memory_rows");
 
+    // Invariant: duplicate row insert is idempotent but conflicting value rejects.
     #[test]
     fn duplicate_row_insert_is_idempotent_but_conflicting_value_rejects() {
         let store = Store::open_memory_with_schemas(&[Schema::durable_row_table(
@@ -715,6 +716,7 @@ mod tests {
         assert!(err.to_string().contains("conflicting row for test.rows"));
     }
 
+    // Invariant: memory rows are store local and not sqlite temp tables.
     #[test]
     fn memory_rows_are_store_local_and_not_sqlite_temp_tables() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -753,6 +755,7 @@ mod tests {
         );
     }
 
+    // Invariant: memory rows roll back with write transaction.
     #[test]
     fn memory_rows_roll_back_with_write_transaction() {
         let store = Store::open_memory_with_schemas(&[Schema::memory_row_table(
@@ -783,6 +786,7 @@ mod tests {
         );
     }
 
+    // Invariant: memory prefix scan is key ordered and limited.
     #[test]
     fn memory_prefix_scan_is_key_ordered_and_limited() {
         let store = Store::open_memory_with_schemas(&[Schema::memory_row_table(

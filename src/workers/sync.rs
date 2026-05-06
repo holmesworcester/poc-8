@@ -680,6 +680,7 @@ mod tests {
 
     use super::*;
 
+    // Invariant: start rounds only from lower endpoint peer.
     #[test]
     fn start_rounds_only_from_lower_endpoint_peer() {
         let first = endpoint::commands::create_local_keypair().value;
@@ -723,6 +724,7 @@ mod tests {
         assert!(higher_output.events.is_empty());
     }
 
+    // Invariant: tick responds on routed connection to same remote endpoint.
     #[test]
     fn tick_responds_on_routed_connection_to_same_remote_endpoint() {
         let store = Protocol::open_memory_store().expect("open store");

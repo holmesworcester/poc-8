@@ -60,6 +60,7 @@ mod tests {
 
     use super::*;
 
+    // Invariant: create returns signed user invite with signer dependency.
     #[test]
     fn create_returns_signed_user_invite_with_signer_dependency() {
         let workspace_id = [2; 32];

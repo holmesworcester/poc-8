@@ -79,6 +79,7 @@ mod tests {
         }
     }
 
+    // Invariant: outgoing compare projects cached event and transit out rows.
     #[test]
     fn outgoing_compare_projects_cached_event_and_transit_out_rows() {
         let record = codec::outbound_record(compare_event()).expect("record");
@@ -92,6 +93,7 @@ mod tests {
         assert_eq!(output.rows[1].table, worker_schema::TRANSIT_OUT);
     }
 
+    // Invariant: incoming compare projects inbound sync work row.
     #[test]
     fn incoming_compare_projects_inbound_sync_work_row() {
         let bytes = codec::encode(&compare_event());
@@ -103,6 +105,7 @@ mod tests {
         assert_eq!(output.rows[0].value, record.canonical_bytes);
     }
 
+    // Invariant: compare rejects connection scope mismatch.
     #[test]
     fn compare_rejects_connection_scope_mismatch() {
         let mut record = codec::outbound_record(compare_event()).expect("record");

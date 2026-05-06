@@ -224,6 +224,7 @@ mod tests {
         }
     }
 
+    // Invariant: endpoint shared rows decode to projected shapes.
     #[test]
     fn endpoint_shared_rows_decode_to_projected_shapes() {
         let rows = endpoint_shared_rows([4; 32], [5; 32], &event()).expect("rows");
@@ -262,6 +263,7 @@ mod tests {
         );
     }
 
+    // Invariant: duplicate membership insert is idempotent.
     #[test]
     fn duplicate_membership_insert_is_idempotent() {
         let rows = endpoint_shared_rows([4; 32], [5; 32], &event()).expect("rows");
@@ -281,6 +283,7 @@ mod tests {
         );
     }
 
+    // Invariant: duplicate membership with different join fact rejects.
     #[test]
     fn duplicate_membership_with_different_join_fact_rejects() {
         let first = endpoint_shared_rows([4; 32], [5; 32], &event()).expect("first rows");

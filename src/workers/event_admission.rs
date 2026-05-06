@@ -154,6 +154,7 @@ mod tests {
             .clone()
     }
 
+    // Invariant: transit canonical admission rejects local only event from known connection.
     #[test]
     fn transit_canonical_admission_rejects_local_only_event_from_known_connection() {
         let local = keypair();
@@ -193,6 +194,7 @@ mod tests {
         );
     }
 
+    // Invariant: bootstrap transit rejects non connection request inner event.
     #[test]
     fn bootstrap_transit_rejects_non_connection_request_inner_event() {
         let local = keypair();
@@ -218,6 +220,7 @@ mod tests {
         );
     }
 
+    // Invariant: connection transit admits shared event only after workspace check.
     #[test]
     fn connection_transit_admits_shared_event_only_after_workspace_check() {
         let local = keypair();
@@ -247,6 +250,7 @@ mod tests {
         );
     }
 
+    // Invariant: connection transit rejects shared event outside sender workspace.
     #[test]
     fn connection_transit_rejects_shared_event_outside_sender_workspace() {
         let local = keypair();

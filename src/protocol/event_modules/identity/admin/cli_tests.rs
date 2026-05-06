@@ -5,6 +5,7 @@ use crate::protocol::Protocol;
 
 use super::{commands, schema};
 
+// Invariant: receipt replays bootstrap then admin authorized grant without daemon.
 #[test]
 fn receipt_replays_bootstrap_then_admin_authorized_grant_without_daemon() {
     let protocol = Protocol::new();

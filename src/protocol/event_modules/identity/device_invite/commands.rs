@@ -104,6 +104,7 @@ mod tests {
         }
     }
 
+    // Invariant: create returns invite keypair and signed shared event.
     #[test]
     fn create_returns_invite_keypair_and_signed_shared_event() {
         let private_key = [7; crypto::ED25519_PRIVATE_KEY_BYTES];
@@ -145,6 +146,7 @@ mod tests {
         assert_eq!(decoded.public_key, output.value.keypair.public_key);
     }
 
+    // Invariant: create can use endpoint shared signer without user invite dependency.
     #[test]
     fn create_can_use_endpoint_shared_signer_without_user_invite_dependency() {
         let private_key = [7; crypto::ED25519_PRIVATE_KEY_BYTES];
@@ -179,6 +181,7 @@ mod tests {
         );
     }
 
+    // Invariant: create rejects empty workspace user authority or signer.
     #[test]
     fn create_rejects_empty_workspace_user_authority_or_signer() {
         let private_key = [7; crypto::ED25519_PRIVATE_KEY_BYTES];

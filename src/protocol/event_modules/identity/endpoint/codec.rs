@@ -69,6 +69,7 @@ mod tests {
 
     use super::*;
 
+    // Invariant: decode rejects endpoint that does not match secret.
     #[test]
     fn decode_rejects_endpoint_that_does_not_match_secret() {
         let good = commands::create_local_keypair().value;
@@ -85,6 +86,7 @@ mod tests {
         assert_eq!(err, "local endpoint secret does not match endpoint");
     }
 
+    // Invariant: decode rejects signing public key that does not match secret.
     #[test]
     fn decode_rejects_signing_public_key_that_does_not_match_secret() {
         let good = commands::create_local_keypair().value;
@@ -104,6 +106,7 @@ mod tests {
         );
     }
 
+    // Invariant: decode rejects trailing bytes.
     #[test]
     fn decode_rejects_trailing_bytes() {
         let mut bytes = encode(&commands::create_local_keypair().value);
@@ -114,6 +117,7 @@ mod tests {
         assert!(err.starts_with("trailing "), "{err}");
     }
 
+    // Invariant: record from bytes marks endpoint local only.
     #[test]
     fn record_from_bytes_marks_endpoint_local_only() {
         let bytes = encode(&commands::create_local_keypair().value);

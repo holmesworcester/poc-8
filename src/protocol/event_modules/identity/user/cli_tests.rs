@@ -6,6 +6,7 @@ use crate::protocol::Protocol;
 use super::commands::{self, CreateUser};
 use super::schema;
 
+// Invariant: admits workspace invite user join flow and projects rows.
 #[test]
 fn admits_workspace_invite_user_join_flow_and_projects_rows() {
     let protocol = Protocol::new();
@@ -72,6 +73,7 @@ fn admits_workspace_invite_user_join_flow_and_projects_rows() {
     assert_eq!(user_row.username, "alice");
 }
 
+// Invariant: admission rejects user signed by key not authorized by invite.
 #[test]
 fn admission_rejects_user_signed_by_key_not_authorized_by_invite() {
     let protocol = Protocol::new();
@@ -120,6 +122,7 @@ fn admission_rejects_user_signed_by_key_not_authorized_by_invite() {
     );
 }
 
+// Invariant: join store receives shared workspace and invite records then creates user.
 #[test]
 fn join_store_receives_shared_workspace_and_invite_records_then_creates_user() {
     let protocol = Protocol::new();

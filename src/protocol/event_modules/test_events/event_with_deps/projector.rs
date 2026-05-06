@@ -36,6 +36,7 @@ mod tests {
         })
     }
 
+    // Invariant: shared event projects no rows.
     #[test]
     fn shared_event_projects_no_rows() {
         let output = project(&inner_bytes_fixture()).expect("project shared");
@@ -44,6 +45,7 @@ mod tests {
         assert!(output.labels.is_empty());
     }
 
+    // Invariant: staged event projects inner bytes by index.
     #[test]
     fn staged_event_projects_inner_bytes_by_index() {
         let inner_bytes = inner_bytes_fixture();
@@ -60,6 +62,7 @@ mod tests {
         assert_eq!(output.rows[0].value, inner_bytes);
     }
 
+    // Invariant: rejects malformed bytes.
     #[test]
     fn rejects_malformed_bytes() {
         let err = project(&[codec::TYPE_EVENT_WITH_DEPS]).expect_err("reject");

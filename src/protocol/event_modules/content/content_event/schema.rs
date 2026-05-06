@@ -102,6 +102,7 @@ mod tests {
 
     use super::*;
 
+    // Invariant: content rows are keyed and counted by workspace.
     #[test]
     fn content_rows_are_keyed_and_counted_by_workspace() {
         let store = Store::open_memory_with_schemas(SCHEMAS).expect("open store");

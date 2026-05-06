@@ -570,6 +570,7 @@ mod tests {
 
     use super::*;
 
+    // Invariant: transit out rows are memory restart work.
     #[test]
     fn transit_out_rows_are_memory_restart_work() {
         let tmp = tempfile::tempdir().expect("create temp dir");

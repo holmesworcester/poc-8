@@ -120,6 +120,7 @@ mod tests {
         }
     }
 
+    // Invariant: roundtrips fixed width device invite event.
     #[test]
     fn roundtrips_fixed_width_device_invite_event() {
         let encoded = encode(&event());
@@ -128,6 +129,7 @@ mod tests {
         assert_eq!(decode(&encoded).expect("decode device invite"), event());
     }
 
+    // Invariant: rejects wrong type and trailing bytes.
     #[test]
     fn rejects_wrong_type_and_trailing_bytes() {
         let mut encoded = encode(&event());
@@ -143,6 +145,7 @@ mod tests {
         assert!(err.starts_with("trailing "), "{err}");
     }
 
+    // Invariant: record is shared and depends on workspace user and user invite.
     #[test]
     fn record_is_shared_and_depends_on_workspace_user_and_user_invite() {
         let encoded = encode(&event());
@@ -155,6 +158,7 @@ mod tests {
         assert_eq!(record.scope, EventScope::Shared);
     }
 
+    // Invariant: signed record exposes signer and semantic dependencies.
     #[test]
     fn signed_record_exposes_signer_and_semantic_dependencies() {
         let private_key = [9; crypto::ED25519_PRIVATE_KEY_BYTES];
@@ -170,6 +174,7 @@ mod tests {
         assert_eq!(record.scope, EventScope::Shared);
     }
 
+    // Invariant: zero user invite dependency roundtrips as none.
     #[test]
     fn zero_user_invite_dependency_roundtrips_as_none() {
         let event = DeviceInviteEvent {

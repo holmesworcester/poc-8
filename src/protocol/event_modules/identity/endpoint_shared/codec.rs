@@ -110,6 +110,7 @@ mod tests {
         }
     }
 
+    // Invariant: roundtrips fixed width endpoint shared event.
     #[test]
     fn roundtrips_fixed_width_endpoint_shared_event() {
         let encoded = encode(&event()).expect("encode endpoint shared");
@@ -118,6 +119,7 @@ mod tests {
         assert_eq!(decode(&encoded).expect("decode endpoint shared"), event());
     }
 
+    // Invariant: rejects bad type trailing bytes and bad name.
     #[test]
     fn rejects_bad_type_trailing_bytes_and_bad_name() {
         let mut encoded = encode(&event()).expect("encode endpoint shared");
@@ -142,6 +144,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects non canonical device name padding.
     #[test]
     fn rejects_non_canonical_device_name_padding() {
         let mut encoded = encode(&event()).expect("encode endpoint shared");
@@ -154,6 +157,7 @@ mod tests {
         );
     }
 
+    // Invariant: raw record shape is shared with workspace and user dependencies.
     #[test]
     fn raw_record_shape_is_shared_with_workspace_and_user_dependencies() {
         let encoded = encode(&event()).expect("encode endpoint shared");

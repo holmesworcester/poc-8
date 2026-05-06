@@ -53,6 +53,7 @@ mod tests {
         }
     }
 
+    // Invariant: roundtrips fixed width user invite payload.
     #[test]
     fn roundtrips_fixed_width_user_invite_payload() {
         let encoded = encode(&event());
@@ -61,6 +62,7 @@ mod tests {
         assert_eq!(decode(&encoded).expect("decode user_invite"), event());
     }
 
+    // Invariant: rejects wrong type and trailing bytes.
     #[test]
     fn rejects_wrong_type_and_trailing_bytes() {
         let mut wrong_type = encode(&event());

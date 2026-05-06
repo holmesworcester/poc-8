@@ -110,6 +110,7 @@ mod tests {
         }
     }
 
+    // Invariant: projects one content row scoped by workspace.
     #[test]
     fn projects_one_content_row_scoped_by_workspace() {
         let (record, event_id, signer_id, signer) = event([7; 32]);
@@ -127,6 +128,7 @@ mod tests {
         assert_eq!(row.payload_bytes, 3);
     }
 
+    // Invariant: rejects mismatched workspace metadata.
     #[test]
     fn rejects_mismatched_workspace_metadata() {
         let (mut record, event_id, signer_id, signer) = event([7; 32]);
@@ -139,6 +141,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects missing signer endpoint shared dependency.
     #[test]
     fn rejects_missing_signer_endpoint_shared_dependency() {
         let (record, event_id, _, _) = event([7; 32]);
@@ -158,6 +161,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects signer for another workspace.
     #[test]
     fn rejects_signer_for_another_workspace() {
         let (record, event_id, signer_id, _) = event([7; 32]);
@@ -175,6 +179,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects signer public key mismatch.
     #[test]
     fn rejects_signer_public_key_mismatch() {
         let (record, event_id, signer_id, _) = event([7; 32]);
@@ -187,6 +192,7 @@ mod tests {
         );
     }
 
+    // Invariant: record exposes signer and workspace dependencies and metadata.
     #[test]
     fn record_exposes_signer_and_workspace_dependencies_and_metadata() {
         let (record, _, signer_id, _) = event([7; 32]);
@@ -196,6 +202,7 @@ mod tests {
         assert_eq!(record.scope, EventScope::Shared);
     }
 
+    // Invariant: raw content bytes are not admissible protocol events.
     #[test]
     fn raw_content_bytes_are_not_admissible_protocol_events() {
         let raw = codec::encode(&ContentEvent {

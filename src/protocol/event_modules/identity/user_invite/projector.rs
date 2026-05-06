@@ -227,6 +227,7 @@ mod tests {
         DependencyContext { event_id, record }
     }
 
+    // Invariant: projects workspace signed user invite row.
     #[test]
     fn projects_workspace_signed_user_invite_row() {
         let (workspace_id, workspace_record) = workspace_record(&WORKSPACE_PRIVATE);
@@ -258,6 +259,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects missing signer dependency context.
     #[test]
     fn rejects_missing_signer_dependency_context() {
         let (workspace_id, _) = workspace_record(&WORKSPACE_PRIVATE);
@@ -274,6 +276,7 @@ mod tests {
         assert_eq!(err, "missing signer dependency context for user_invite");
     }
 
+    // Invariant: rejects workspace authority mismatch.
     #[test]
     fn rejects_workspace_authority_mismatch() {
         let (workspace_id, workspace_record) = workspace_record(&WORKSPACE_PRIVATE);
@@ -297,6 +300,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects signer key that does not match workspace.
     #[test]
     fn rejects_signer_key_that_does_not_match_workspace() {
         let (workspace_id, workspace_record) = workspace_record(&WORKSPACE_PRIVATE);
@@ -320,6 +324,7 @@ mod tests {
         );
     }
 
+    // Invariant: projects admin signed user invite from endpoint owned by admin user.
     #[test]
     fn projects_admin_signed_user_invite_from_endpoint_owned_by_admin_user() {
         let (workspace_id, _) = workspace_record(&WORKSPACE_PRIVATE);
@@ -351,6 +356,7 @@ mod tests {
         assert_eq!(row.authority_event_id, admin_id);
     }
 
+    // Invariant: rejects admin signed user invite signed by transport endpoint key.
     #[test]
     fn rejects_admin_signed_user_invite_signed_by_transport_endpoint_key() {
         let (workspace_id, _) = workspace_record(&WORKSPACE_PRIVATE);
@@ -382,6 +388,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects admin signed user invite when admin authority is from another workspace.
     #[test]
     fn rejects_admin_signed_user_invite_when_admin_authority_is_from_another_workspace() {
         let (workspace_id, _) = workspace_record(&WORKSPACE_PRIVATE);
@@ -413,6 +420,7 @@ mod tests {
         );
     }
 
+    // Invariant: rejects admin signed user invite when signer endpoint user is not admin user.
     #[test]
     fn rejects_admin_signed_user_invite_when_signer_endpoint_user_is_not_admin_user() {
         let (workspace_id, _) = workspace_record(&WORKSPACE_PRIVATE);
@@ -443,6 +451,7 @@ mod tests {
         );
     }
 
+    // Invariant: allows same admin user endpoint to authorize invites in each matching workspace.
     #[test]
     fn allows_same_admin_user_endpoint_to_authorize_invites_in_each_matching_workspace() {
         let (workspace_a_id, _) = workspace_record(&WORKSPACE_PRIVATE);

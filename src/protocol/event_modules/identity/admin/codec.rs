@@ -88,6 +88,7 @@ mod tests {
         }
     }
 
+    // Invariant: roundtrips fixed width admin event.
     #[test]
     fn roundtrips_fixed_width_admin_event() {
         let encoded = encode(&event());
@@ -96,6 +97,7 @@ mod tests {
         assert_eq!(decode(&encoded).expect("decode admin"), event());
     }
 
+    // Invariant: rejects trailing bytes.
     #[test]
     fn rejects_trailing_bytes() {
         let mut encoded = encode(&event());
@@ -106,6 +108,7 @@ mod tests {
         assert!(err.contains("trailing admin bytes"), "{err}");
     }
 
+    // Invariant: record is shared and exposes unique workspace authority user deps.
     #[test]
     fn record_is_shared_and_exposes_unique_workspace_authority_user_deps() {
         let encoded = encode(&event());
@@ -118,6 +121,7 @@ mod tests {
         assert_eq!(record.dependencies, vec![[1; 32], [3; 32], [4; 32]]);
     }
 
+    // Invariant: bootstrap record deduplicates workspace authority and root user.
     #[test]
     fn bootstrap_record_deduplicates_workspace_authority_and_root_user() {
         let event = AdminEvent {

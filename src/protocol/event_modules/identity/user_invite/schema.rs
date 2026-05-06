@@ -81,6 +81,7 @@ mod tests {
         }
     }
 
+    // Invariant: user invite rows decode to projected shape.
     #[test]
     fn user_invite_rows_decode_to_projected_shape() {
         let row = user_invite_row([9; 32], &event());
@@ -99,6 +100,7 @@ mod tests {
         );
     }
 
+    // Invariant: duplicate user invite row insert is idempotent.
     #[test]
     fn duplicate_user_invite_row_insert_is_idempotent() {
         let row = user_invite_row([9; 32], &event());

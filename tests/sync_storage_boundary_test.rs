@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use cli_harness::*;
 
+// Invariant: connect handshake does not create durable events.
 #[test]
 fn connect_handshake_does_not_create_durable_events() {
     let tmp = tempfile::tempdir().unwrap();
@@ -31,6 +32,7 @@ fn connect_handshake_does_not_create_durable_events() {
     assert_eq!(connection_event_count(&bob), 1);
 }
 
+// Invariant: wrong invite private key does not project receiver connection.
 #[test]
 fn wrong_invite_private_key_does_not_project_receiver_connection() {
     let tmp = tempfile::tempdir().unwrap();
@@ -53,6 +55,7 @@ fn wrong_invite_private_key_does_not_project_receiver_connection() {
     assert_eq!(connection_event_count(&bob), 0);
 }
 
+// Invariant: connect reports unreachable invite address.
 #[test]
 fn connect_reports_unreachable_invite_address() {
     let tmp = tempfile::tempdir().unwrap();

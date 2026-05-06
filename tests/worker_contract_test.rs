@@ -13,6 +13,7 @@ use topo::protocol::Protocol;
 use topo::workers::schema as worker_schema;
 use topo::workers::{dependency_unblock, event_admission, event_projection, sync};
 
+// Invariant: command admission returns event ids for chaining.
 #[test]
 fn command_admission_returns_event_ids_for_chaining() {
     let tmp = tempfile::tempdir().unwrap();
@@ -71,6 +72,7 @@ fn install_local_content_signer(store: &Store) -> (EventId, EventId, [u8; 32]) {
     (workspace_id, endpoint_shared_id, local.signing_secret)
 }
 
+// Invariant: worker fetches dependency records and labels before projection.
 #[test]
 fn worker_fetches_dependency_records_and_labels_before_projection() {
     let tmp = tempfile::tempdir().unwrap();
@@ -108,6 +110,7 @@ fn worker_fetches_dependency_records_and_labels_before_projection() {
     assert!(registry.child_saw_context.get());
 }
 
+// Invariant: event pipeline workers claim and consume explicit queues.
 #[test]
 fn event_pipeline_workers_claim_and_consume_explicit_queues() {
     let tmp = tempfile::tempdir().unwrap();
@@ -178,6 +181,7 @@ fn event_pipeline_workers_claim_and_consume_explicit_queues() {
     assert!(registry.child_saw_context.get());
 }
 
+// Invariant: canonical in rejects are consumed and do not poison later work.
 #[test]
 fn canonical_in_rejects_are_consumed_and_do_not_poison_later_work() {
     let tmp = tempfile::tempdir().unwrap();
@@ -218,6 +222,7 @@ fn canonical_in_rejects_are_consumed_and_do_not_poison_later_work() {
     assert!(registry.good_applied.get());
 }
 
+// Invariant: sync worker consumes applied shared event queue.
 #[test]
 fn sync_worker_consumes_applied_shared_event_queue() {
     let tmp = tempfile::tempdir().unwrap();
@@ -253,6 +258,7 @@ fn sync_worker_consumes_applied_shared_event_queue() {
     );
 }
 
+// Invariant: admit and drain admits command output then drains ready events.
 #[test]
 fn admit_and_drain_admits_command_output_then_drains_ready_events() {
     let tmp = tempfile::tempdir().unwrap();
@@ -296,6 +302,7 @@ fn admit_and_drain_admits_command_output_then_drains_ready_events() {
     assert!(registry.child_saw_context.get());
 }
 
+// Invariant: drain ready batch applies only one batch.
 #[test]
 fn drain_ready_batch_applies_only_one_batch() {
     let tmp = tempfile::tempdir().unwrap();
@@ -332,6 +339,7 @@ fn drain_ready_batch_applies_only_one_batch() {
     assert_eq!(registry.children_applied.get(), 2);
 }
 
+// Invariant: worker never surfaces failed projection as dependency context.
 #[test]
 fn worker_never_surfaces_failed_projection_as_dependency_context() {
     let tmp = tempfile::tempdir().unwrap();

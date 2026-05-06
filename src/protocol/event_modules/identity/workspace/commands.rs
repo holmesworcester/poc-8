@@ -46,6 +46,7 @@ mod tests {
 
     use super::*;
 
+    // Invariant: create returns consistent event id and record.
     #[test]
     fn create_returns_consistent_event_id_and_record() {
         let output = create(CreateWorkspace {
@@ -70,6 +71,7 @@ mod tests {
         assert_eq!(decoded.name, "Design");
     }
 
+    // Invariant: create rejects non canonical workspace name.
     #[test]
     fn create_rejects_non_canonical_workspace_name() {
         let err = create(CreateWorkspace {
