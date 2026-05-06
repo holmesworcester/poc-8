@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+bao = "0.13"
 blake3 = "1"
 chacha20poly1305 = "0.10"
 crux_core = "0.17.0"

@@ -8,7 +8,7 @@ use crate::core::crypto::{self, ED25519_SIGNATURE_BYTES};
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
 use crate::protocol::wire::{Reader, Writer};
 
-use super::super::{admin, device_invite, endpoint_shared, user, user_invite};
+use super::super::{admin, device_invite, endpoint_shared, invite_server, user, user_invite};
 use super::types::SignedEnvelope;
 
 pub const TYPE_SIGNED: u8 = 130;
@@ -92,6 +92,15 @@ fn inner_metadata(event: &SignedEnvelope) -> Result<InnerMetadata, String> {
             (
                 inner.created_at_ms,
                 user_invite::codec::USER_INVITE_WIRE_SIZE - 1,
+                vec![inner.workspace_id, inner.authority_event_id],
+                Some(inner.workspace_id),
+            )
+        }
+        invite_server::codec::TYPE_INVITE_SERVER => {
+            let inner = invite_server::codec::decode(&event.payload)?;
+            (
+                inner.created_at_ms,
+                invite_server::codec::INVITE_SERVER_WIRE_SIZE - 1,
                 vec![inner.workspace_id, inner.authority_event_id],
                 Some(inner.workspace_id),
             )
@@ -250,6 +259,8 @@ mod tests {
                 user_authority_event_id: [2; 32],
                 endpoint_id: [3; 32],
                 signing_public_key: [4; 32],
+                endpoint_role:
+                    crate::protocol::event_modules::identity::endpoint::types::EndpointRole::Device,
                 device_name: "laptop".to_string(),
             })
             .expect("encode endpoint_shared");

@@ -1,74 +1,159 @@
 mod cli_harness;
 
 use std::io::{BufRead, BufReader, Read};
-use std::net::TcpListener;
 use std::process::{Child, Output};
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use cli_harness::*;
-use topo::core::crypto;
-use topo::protocol::event_modules::identity::{
-    device_invite, endpoint, endpoint_shared, user, user_invite, workspace,
-};
-use topo::protocol::event_modules::types::EventId;
-use topo::protocol::event_modules::worker::{self, CommandOutput};
-use topo::protocol::Protocol;
 
 #[test]
-fn daemons_sync_cli_generated_content_without_manual_sync_and_without_scope_leaks() {
-    let _guard = black_box_guard();
+fn two_endpoints_sync_multiple_mutual_workspaces() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
     let bob = temp_db(&tmp, "bob.db");
-    let alice_port = daemon_port();
-    let bob_port = daemon_port();
-    ensure_local_endpoint(&alice, alice_port);
-    ensure_local_endpoint(&bob, bob_port);
+    let alice_port = free_port();
+    let bob_port = free_port();
 
-    let alice_endpoint = local_endpoint(&alice);
-    let bob_endpoint = local_endpoint(&bob);
-    let shared = install_workspace_graph(
-        &[&alice, &bob],
-        51,
-        "alice-bob-a",
-        &[
-            Member::new("alice-a", alice_endpoint, 61),
-            Member::new("bob-a", bob_endpoint, 62),
-        ],
+    let workspace_a = create_workspace(&alice, "workspace-a", "alice-a", "alice-a-laptop");
+    accept_workspace_invite(
+        &alice,
+        &bob,
+        &workspace_a,
+        free_port(),
+        "bob-a",
+        "bob-a-phone",
     );
-    let alice_private = install_workspace_graph(
-        &[&alice],
-        52,
-        "alice-private-b",
-        &[Member::new("alice-b", alice_endpoint, 63)],
+    let workspace_b = create_workspace(&alice, "workspace-b", "alice-b", "alice-b-laptop");
+    accept_workspace_invite(
+        &alice,
+        &bob,
+        &workspace_b,
+        free_port(),
+        "bob-b",
+        "bob-b-phone",
+    );
+    let _alice_daemon = spawn_daemon(&alice, alice_port);
+    let _bob_daemon = spawn_daemon(&bob, bob_port);
+    connect_daemon_pair(&alice, alice_port, &bob, bob_port);
+
+    generate(&alice, &workspace_a, 3, 128);
+    generate(&alice, &workspace_b, 4, 129);
+
+    wait_for_content_count(&bob, &workspace_a, 3);
+    wait_for_content_count(&bob, &workspace_b, 4);
+}
+
+#[test]
+fn two_player_sync_does_not_leak_alice_private_workspace_to_bob() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = temp_db(&tmp, "alice.db");
+    let bob = temp_db(&tmp, "bob.db");
+    let alice_port = free_port();
+    let bob_port = free_port();
+
+    let shared = create_workspace(&alice, "shared-a", "alice-a", "alice-a-laptop");
+    accept_workspace_invite(&alice, &bob, &shared, free_port(), "bob-a", "bob-a-phone");
+    let alice_private = create_workspace(&alice, "alice-b", "alice-b", "alice-b-laptop");
+    let _alice_daemon = spawn_daemon(&alice, alice_port);
+    let _bob_daemon = spawn_daemon(&bob, bob_port);
+    connect_daemon_pair(&alice, alice_port, &bob, bob_port);
+
+    generate(&alice, &shared, 2, 128);
+
+    wait_for_content_count(&bob, &shared, 2);
+    generate(&alice, &alice_private, 5, 128);
+    thread::sleep(Duration::from_millis(1200));
+    assert_content_count(&bob, &alice_private, 0);
+}
+
+#[test]
+fn three_player_sync_through_alice_keeps_workspace_scopes_separate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = temp_db(&tmp, "alice.db");
+    let bob = temp_db(&tmp, "bob.db");
+    let carol = temp_db(&tmp, "carol.db");
+    let alice_port = free_port();
+    let bob_port = free_port();
+    let carol_port = free_port();
+
+    let workspace_a = create_workspace(&alice, "alice-bob-a", "alice-a", "alice-a-laptop");
+    accept_workspace_invite(
+        &alice,
+        &bob,
+        &workspace_a,
+        alice_port,
+        "bob-a",
+        "bob-a-phone",
+    );
+    let workspace_b = create_workspace(&alice, "alice-carol-b", "alice-b", "alice-b-laptop");
+    accept_workspace_invite(
+        &alice,
+        &carol,
+        &workspace_b,
+        alice_port,
+        "carol-b",
+        "carol-b-phone",
+    );
+    let _alice_daemon = spawn_daemon(&alice, alice_port);
+    let _bob_daemon = spawn_daemon(&bob, bob_port);
+    let _carol_daemon = spawn_daemon(&carol, carol_port);
+    connect_daemon_pair(&alice, alice_port, &bob, bob_port);
+    connect_daemon_pair(&alice, alice_port, &carol, carol_port);
+
+    generate(&bob, &workspace_a, 3, 128);
+    generate(&carol, &workspace_b, 4, 128);
+
+    wait_for_content_count(&alice, &workspace_a, 3);
+    wait_for_content_count(&alice, &workspace_b, 4);
+    wait_for_content_count(&bob, &workspace_a, 3);
+    assert_content_count(&bob, &workspace_b, 0);
+    assert_content_count(&carol, &workspace_a, 0);
+    wait_for_content_count(&carol, &workspace_b, 4);
+}
+
+#[test]
+fn daemons_sync_cli_generated_content_without_manual_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = temp_db(&tmp, "alice-daemon.db");
+    let bob = temp_db(&tmp, "bob-daemon.db");
+    let alice_port = free_port();
+    let bob_port = free_port();
+    let workspace = create_workspace(&alice, "daemon-shared", "alice-daemon", "alice-laptop");
+    accept_workspace_invite(
+        &alice,
+        &bob,
+        &workspace,
+        alice_port,
+        "bob-daemon",
+        "bob-phone",
+    );
+    let alice_invite = invite(&alice, alice_port);
+    let reverse_invite = invite(&bob, bob_port);
+
+    let _alice_daemon = spawn_daemon(&alice, alice_port);
+    let _bob_daemon = spawn_daemon(&bob, bob_port);
+    let connected = connect_with_retry(&bob, &alice_invite);
+    assert!(connected.contains("connected:"), "{connected}");
+    let reverse_connected = connect_with_retry(&alice, &reverse_invite);
+    assert!(
+        reverse_connected.contains("connected:"),
+        "{reverse_connected}"
     );
 
-    let mut alice_daemon = spawn_daemon(&alice, alice_port);
-    let mut bob_daemon = spawn_daemon(&bob, bob_port);
-    connect_daemons(&bob, &alice, alice_port);
-    connect_daemons(&alice, &bob, bob_port);
-    wait_for_connection_count(&alice, 2);
-    wait_for_connection_count(&bob, 2);
+    generate(&alice, &workspace, 3, 128);
 
-    generate(&alice, shared.workspace_id, 2, 128);
-    generate(&alice, alice_private.workspace_id, 2, 128);
-    alice_daemon.assert_running();
-    bob_daemon.assert_running();
-
-    wait_for_content_count(&bob, shared.workspace_id, 2);
-    assert_content_count(&bob, alice_private.workspace_id, 0);
+    wait_for_content_count(&bob, &workspace, 3);
 }
 
 #[test]
 fn second_daemon_for_same_db_is_rejected() {
-    let _guard = black_box_guard();
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice-single-daemon.db");
-    let first_port = daemon_port();
-    let second_port = daemon_port();
+    let first_port = free_port();
+    let second_port = free_port();
     let _daemon = spawn_daemon(&alice, first_port);
 
     let output = topo(&[
@@ -96,184 +181,161 @@ fn second_daemon_for_same_db_is_rejected() {
     );
 }
 
-fn black_box_guard() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("black-box test lock")
+struct ListeningInvite {
+    child: Child,
+    invite_rx: Receiver<Result<String, String>>,
+    stdout: JoinHandle<String>,
+    stderr: JoinHandle<String>,
 }
 
-#[derive(Clone, Copy)]
-struct Member {
-    name: &'static str,
-    endpoint_id: EventId,
-    signing_public_key: [u8; 32],
-    seed: u8,
-}
-
-impl Member {
-    fn new(name: &'static str, endpoint: endpoint::types::EndpointKeypair, seed: u8) -> Self {
-        Self {
-            name,
-            endpoint_id: endpoint.endpoint,
-            signing_public_key: endpoint.signing_public_key,
-            seed,
+impl ListeningInvite {
+    fn invite_link(&mut self) -> String {
+        match self.invite_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(line)) => {
+                assert!(
+                    line.starts_with("topo://invite/"),
+                    "missing invite link in first listener line: {line}"
+                );
+                thread::sleep(Duration::from_millis(50));
+                line
+            }
+            Ok(Err(err)) => {
+                let _ = self.child.kill();
+                panic!("listener did not print invite link: {err}");
+            }
+            Err(err) => {
+                let _ = self.child.kill();
+                panic!("timed out waiting for invite link: {err}");
+            }
         }
     }
+
+    fn wait_success(mut self, label: &str) -> String {
+        let status = self.child.wait().expect("wait for listener");
+        let stdout = self.stdout.join().expect("join stdout reader");
+        let stderr = self.stderr.join().expect("join stderr reader");
+        assert!(
+            status.success(),
+            "{label} failed\nstdout={stdout}\nstderr={stderr}"
+        );
+        stdout
+    }
+
+    fn fail(mut self, label: &str, err: String) -> ! {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let stdout = self.stdout.join().expect("join stdout reader");
+        let stderr = self.stderr.join().expect("join stderr reader");
+        panic!("{label}: {err}\nlistener stdout:\n{stdout}\nlistener stderr:\n{stderr}");
+    }
 }
 
-struct WorkspaceGraph {
-    workspace_id: EventId,
+fn create_workspace(db: &str, name: &str, username: &str, device_name: &str) -> String {
+    let out = assert_success(topo(&[
+        "--db",
+        db,
+        "create-workspace",
+        name,
+        "--username",
+        username,
+        "--devicename",
+        device_name,
+    ]));
+    line_value(&out, "workspace_id")
 }
 
-fn install_workspace_graph(
-    dbs: &[&str],
-    seed: u8,
-    name: &str,
-    members: &[Member],
-) -> WorkspaceGraph {
-    let mut graph = None;
-    for db in dbs {
-        let installed = workspace_graph(db, seed, name, members);
-        if let Some(existing) = graph {
-            assert_eq!(existing, installed.workspace_id);
+fn accept_workspace_invite(
+    host_db: &str,
+    joiner_db: &str,
+    workspace_id: &str,
+    port: u16,
+    username: &str,
+    device_name: &str,
+) {
+    let mut listener = spawn_workspace_invite_listener(host_db, workspace_id, port, 1);
+    let invite = listener.invite_link();
+    let accepted = match try_accept_with_identity_retry(joiner_db, &invite, username, device_name) {
+        Ok(output) => output,
+        Err(err) => listener.fail("workspace invite accept failed", err),
+    };
+    assert_eq!(line_value(&accepted, "workspace_id"), workspace_id);
+    let host_out = listener.wait_success("workspace invite listener");
+    assert!(host_out.contains("accepted_connections: 1"), "{host_out}");
+}
+
+fn spawn_workspace_invite_listener(
+    db: &str,
+    workspace_id: &str,
+    port: u16,
+    accept: usize,
+) -> ListeningInvite {
+    let port = port.to_string();
+    let accept = accept.to_string();
+    let child = spawn_topo(&[
+        "--db",
+        db,
+        "invite",
+        "--workspace",
+        workspace_id,
+        "--listen",
+        "127.0.0.1",
+        &port,
+        "--accept",
+        &accept,
+    ]);
+    listening_invite_from_child(child)
+}
+
+fn listening_invite_from_child(mut child: Child) -> ListeningInvite {
+    let stdout = child.stdout.take().expect("listener stdout");
+    let stderr = child.stderr.take().expect("listener stderr");
+    let (invite_tx, invite_rx) = mpsc::channel();
+    let stdout = thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut output = String::new();
+        let mut first = String::new();
+        match reader.read_line(&mut first) {
+            Ok(0) => {
+                let _ = invite_tx.send(Err("stdout closed before first line".to_string()));
+            }
+            Ok(_) => {
+                output.push_str(&first);
+                let link = first.trim_end_matches(['\r', '\n']).to_string();
+                let _ = invite_tx.send(Ok(link));
+            }
+            Err(err) => {
+                let _ = invite_tx.send(Err(err.to_string()));
+            }
         }
-        graph = Some(installed.workspace_id);
+
+        let mut rest = String::new();
+        if reader.read_to_string(&mut rest).is_ok() {
+            output.push_str(&rest);
+        }
+        output
+    });
+    let stderr = thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut output = String::new();
+        let _ = reader.read_to_string(&mut output);
+        output
+    });
+    ListeningInvite {
+        child,
+        invite_rx,
+        stdout,
+        stderr,
     }
-    WorkspaceGraph {
-        workspace_id: graph.expect("at least one db"),
-    }
-}
-
-fn workspace_graph(db: &str, seed: u8, name: &str, members: &[Member]) -> WorkspaceGraph {
-    let protocol = Protocol::new();
-    let store = Protocol::open_store(db).expect("open graph store");
-    let workspace_private = [seed; 32];
-    let workspace_public = crypto::ed25519_public_key(&workspace_private);
-    let workspace = workspace::commands::create(workspace::commands::CreateWorkspace {
-        created_at_ms: seed as u64,
-        public_key: workspace_public,
-        name: name.to_string(),
-    })
-    .expect("create workspace");
-    let workspace_id = workspace.value.workspace_id;
-    admit(&store, &protocol, workspace);
-
-    for member in members {
-        let user_private = [member.seed; 32];
-        let invite_private = [member.seed.saturating_add(80); 32];
-        let user_invite = user_invite::commands::create(user_invite::commands::CreateUserInvite {
-            created_at_ms: 100 + member.seed as u64,
-            public_key: crypto::ed25519_public_key(&invite_private),
-            workspace_id,
-            authority_event_id: workspace_id,
-            signer_event_id: workspace_id,
-            signer_private_key: workspace_private,
-        })
-        .expect("create user invite");
-        let user_invite_id = user_invite.value.user_invite_id;
-        admit(&store, &protocol, user_invite);
-
-        let user = user::commands::create(user::commands::CreateUser {
-            created_at_ms: 200 + member.seed as u64,
-            workspace_id,
-            public_key: crypto::ed25519_public_key(&user_private),
-            username: member.name.to_string(),
-            user_invite_event_id: user_invite_id,
-            user_invite_private_key: invite_private,
-        })
-        .expect("create user");
-        let user_id = user.value.user_id;
-        admit(&store, &protocol, user);
-
-        let device_private = [member.seed.saturating_add(120); 32];
-        let device_invite = device_invite::commands::create_with_private_key(
-            device_invite::commands::CreateDeviceInvite {
-                created_at_ms: 300 + member.seed as u64,
-                workspace_id,
-                user_authority_event_id: user_id,
-                user_invite_event_id: Some(user_invite_id),
-                signer_event_id: user_id,
-                signer_private_key: user_private,
-            },
-            device_private,
-        )
-        .expect("create device invite");
-        let device_invite_id = device_invite.value.device_invite_id;
-        admit(&store, &protocol, device_invite);
-
-        let shared = endpoint_shared::commands::share_endpoint(
-            &store,
-            endpoint_shared::commands::ShareEndpoint {
-                created_at_ms: 400 + member.seed as u64,
-                workspace_id,
-                user_authority_event_id: user_id,
-                endpoint_id: member.endpoint_id,
-                signing_public_key: member.signing_public_key,
-                device_name: member.name.to_string(),
-                device_invite_id,
-                device_invite_private_key: device_private,
-            },
-        )
-        .expect("share endpoint");
-        admit(&store, &protocol, shared);
-    }
-
-    WorkspaceGraph { workspace_id }
-}
-
-fn admit<T>(store: &topo::core::store::Store, protocol: &Protocol, output: CommandOutput<T>) {
-    worker::run(store, protocol, output).expect("admit command output");
-}
-
-fn local_endpoint(db: &str) -> endpoint::types::EndpointKeypair {
-    let store = Protocol::open_store(db).expect("open endpoint store");
-    endpoint::commands::local_keypair(&store)
-        .expect("load local endpoint")
-        .expect("local endpoint exists")
 }
 
 struct RunningDaemon {
-    child: Option<Child>,
-    label: String,
+    child: Child,
 }
 
 impl Drop for RunningDaemon {
     fn drop(&mut self) {
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        let _ = child.kill();
-        match child.wait_with_output() {
-            Ok(output) if !output.stderr.is_empty() => {
-                eprintln!(
-                    "daemon {} stderr:\n{}",
-                    self.label,
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            _ => {}
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-impl RunningDaemon {
-    fn assert_running(&mut self) {
-        let child = self.child.as_mut().expect("daemon child present");
-        match child.try_wait().expect("check daemon status") {
-            None => {}
-            Some(status) => {
-                let mut stderr = String::new();
-                if let Some(mut pipe) = child.stderr.take() {
-                    let _ = pipe.read_to_string(&mut stderr);
-                }
-                panic!(
-                    "daemon {} exited early with {status}\nstderr:\n{stderr}",
-                    self.label
-                );
-            }
-        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -299,30 +361,16 @@ fn spawn_daemon(db: &str, port: u16) -> RunningDaemon {
         line.starts_with("listening: "),
         "daemon did not report listening: {line}"
     );
-    RunningDaemon {
-        child: Some(child),
-        label: format!("{db}:{port}"),
-    }
+    RunningDaemon { child }
 }
 
-fn ensure_local_endpoint(db: &str, port: u16) {
-    let _ = invite(db, port);
-}
-
-fn connect_daemons(initiator_db: &str, listener_db: &str, listener_port: u16) {
-    let invite = invite(listener_db, listener_port);
-    let connected = connect_with_retry(initiator_db, &invite);
-    assert!(connected.contains("connection requested:"));
-}
-
-fn daemon_port() -> u16 {
-    static NEXT_PORT: AtomicU16 = AtomicU16::new(41000);
-    loop {
-        let port = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
+fn connect_daemon_pair(left_db: &str, left_port: u16, right_db: &str, right_port: u16) {
+    let left_invite = invite(left_db, left_port);
+    let right_invite = invite(right_db, right_port);
+    let right_to_left = connect_with_retry(right_db, &left_invite);
+    assert!(right_to_left.contains("connected:"), "{right_to_left}");
+    let left_to_right = connect_with_retry(left_db, &right_invite);
+    assert!(left_to_right.contains("connected:"), "{left_to_right}");
 }
 
 fn invite(db: &str, port: u16) -> String {
@@ -351,16 +399,44 @@ fn connect_with_invite(db: &str, invite: &str) -> Output {
     topo(&["--db", db, "connect", invite])
 }
 
-fn generate(db: &str, workspace_id: EventId, count: usize, size: usize) -> String {
-    let workspace = hex_id(workspace_id);
-    let count = count.to_string();
-    let size = size.to_string();
-    assert_success(topo(&["--db", db, "generate", &workspace, &count, &size]))
+fn try_accept_with_identity_retry(
+    db: &str,
+    invite: &str,
+    username: &str,
+    device_name: &str,
+) -> Result<String, String> {
+    let mut last = String::new();
+    for _ in 0..200 {
+        let output = topo(&[
+            "--db",
+            db,
+            "accept",
+            invite,
+            "--username",
+            username,
+            "--devicename",
+            device_name,
+        ]);
+        if output.status.success() {
+            return Ok(stdout(&output));
+        }
+        last = stderr(&output);
+        if !last.contains("open tcp stream") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(last)
 }
 
-fn assert_content_count(db: &str, workspace_id: EventId, expected: usize) {
-    let workspace = hex_id(workspace_id);
-    let out = assert_success(topo(&["--db", db, "content-count", &workspace]));
+fn generate(db: &str, workspace: &str, count: usize, size: usize) -> String {
+    let count = count.to_string();
+    let size = size.to_string();
+    assert_success(topo(&["--db", db, "generate", workspace, &count, &size]))
+}
+
+fn assert_content_count(db: &str, workspace: &str, expected: usize) {
+    let out = assert_success(topo(&["--db", db, "content-count", workspace]));
     assert_eq!(
         line_value(&out, "content_events"),
         expected.to_string(),
@@ -368,40 +444,15 @@ fn assert_content_count(db: &str, workspace_id: EventId, expected: usize) {
     );
 }
 
-fn wait_for_connection_count(db: &str, expected: usize) {
-    let mut last = String::new();
-    for _ in 0..100 {
-        let out = assert_success(topo(&["--db", db, "count"]));
-        if line_value(&out, "connections") == expected.to_string() {
-            return;
-        }
-        last = out;
-        thread::sleep(Duration::from_millis(50));
-    }
-    panic!("connection count did not reach {expected}; last output:\n{last}");
-}
-
-fn wait_for_content_count(db: &str, workspace_id: EventId, expected: usize) {
-    let workspace = hex_id(workspace_id);
+fn wait_for_content_count(db: &str, workspace: &str, expected: usize) {
     let mut last = String::new();
     for _ in 0..300 {
-        let out = assert_success(topo(&["--db", db, "content-count", &workspace]));
+        let out = assert_success(topo(&["--db", db, "content-count", workspace]));
         if line_value(&out, "content_events") == expected.to_string() {
             return;
         }
         last = out;
         thread::sleep(Duration::from_millis(100));
     }
-    let status = assert_success(topo(&["--db", db, "count"]));
-    panic!("content count did not reach {expected}; last output:\n{last}\nstatus:\n{status}");
-}
-
-fn hex_id(id: EventId) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(64);
-    for byte in id {
-        out.push(DIGITS[(byte >> 4) as usize] as char);
-        out.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    out
+    panic!("content count did not reach {expected}; last output:\n{last}");
 }

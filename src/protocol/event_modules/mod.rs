@@ -11,6 +11,7 @@
 
 pub mod connection;
 pub mod content;
+pub mod encryption;
 pub mod identity;
 pub mod schema;
 pub mod sync;
@@ -66,6 +67,9 @@ impl Modules {
         if let Some(output) = content::project_record(event)? {
             return Ok(output);
         }
+        if let Some(output) = encryption::project_record(event)? {
+            return Ok(output);
+        }
         if let Some(output) = test_events::project_record(bytes)? {
             return Ok(output);
         }
@@ -85,10 +89,22 @@ pub fn schemas() -> Vec<Schema> {
     out.extend_from_slice(identity::endpoint::schema::SCHEMAS);
     out.extend_from_slice(identity::endpoint_shared::schema::SCHEMAS);
     out.extend_from_slice(identity::invite::schema::SCHEMAS);
+    out.extend_from_slice(identity::invite_server::schema::SCHEMAS);
     out.extend_from_slice(identity::user::schema::SCHEMAS);
     out.extend_from_slice(identity::user_invite::schema::SCHEMAS);
     out.extend_from_slice(identity::workspace::schema::SCHEMAS);
     out.extend_from_slice(content::content_event::schema::SCHEMAS);
+    out.extend_from_slice(content::message::schema::SCHEMAS);
+    out.extend_from_slice(content::reaction::schema::SCHEMAS);
+    out.extend_from_slice(content::file::schema::SCHEMAS);
+    out.extend_from_slice(content::file_slice::schema::SCHEMAS);
+    out.extend_from_slice(encryption::key_wrap::schema::SCHEMAS);
+    out.extend_from_slice(encryption::local_history_node_secret::schema::SCHEMAS);
+    out.extend_from_slice(encryption::local_key_secret::schema::SCHEMAS);
+    out.extend_from_slice(encryption::local_recipient_key::schema::SCHEMAS);
+    out.extend_from_slice(encryption::recipient_key::schema::SCHEMAS);
+    out.extend_from_slice(encryption::recipient_key_tombstone::schema::SCHEMAS);
+    out.extend_from_slice(encryption::removal_frontier::schema::SCHEMAS);
     out.extend_from_slice(connection::schema::SCHEMAS);
     out.extend_from_slice(test_events::event_with_deps::schema::SCHEMAS);
     out
@@ -135,7 +151,29 @@ fn record_from_transit_canonical_in(
     match provenance.unwrapped_with {
         TransitUnwrap::Bootstrap => {
             if !connection::connection_request::codec::is_request(&bytes) {
-                return Err("bootstrap transit only carries connection requests".to_string());
+                let record = record_from_bytes(bytes)?;
+                if !record.scope.is_shared() {
+                    return Err("bootstrap transit only accepts shared identity events".to_string());
+                }
+                let workspace_id = record.workspace_id.ok_or_else(|| {
+                    "bootstrap transit shared event requires a workspace".to_string()
+                })?;
+                if !is_identity_bootstrap_event(&record.canonical_bytes)? {
+                    return Err(
+                        "bootstrap transit only accepts identity bootstrap events".to_string()
+                    );
+                }
+                if !connection::schema::bootstrap_endpoint_workspace_exists(
+                    store,
+                    provenance.local_endpoint,
+                    provenance.sender_endpoint,
+                    workspace_id,
+                )? {
+                    return Err(
+                        "bootstrap transit rejected event outside invite workspace".to_string()
+                    );
+                }
+                return Ok(ReceivedRecord::new(record));
             }
             let record = connection::connection_request::codec::record_from_bytes(bytes)?;
             return Ok(ReceivedRecord::with_receive(
@@ -196,6 +234,25 @@ fn record_from_transit_canonical_in(
     Ok(ReceivedRecord::new(record))
 }
 
+pub(crate) fn is_identity_bootstrap_event(bytes: &[u8]) -> Result<bool, String> {
+    match bytes.first().copied() {
+        Some(identity::workspace::codec::TYPE_WORKSPACE) => Ok(true),
+        Some(identity::signed::codec::TYPE_SIGNED) => {
+            let envelope = identity::signed::codec::decode(bytes)?;
+            Ok(matches!(
+                envelope.inner_type,
+                identity::admin::codec::TYPE_ADMIN
+                    | identity::user_invite::codec::TYPE_USER_INVITE
+                    | identity::invite_server::codec::TYPE_INVITE_SERVER
+                    | identity::user::codec::TYPE_USER
+                    | identity::device_invite::codec::TYPE_DEVICE_INVITE
+                    | identity::endpoint_shared::codec::TYPE_ENDPOINT_SHARED
+            ))
+        }
+        _ => Ok(false),
+    }
+}
+
 pub fn record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
     // Connection bootstrap records use a magic prefix. Ordinary shared/local
     // events and connection-scoped sync events use a single leading type tag.
@@ -233,6 +290,57 @@ pub fn record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
         content::content_event::codec::TYPE_SIGNED_CONTENT => {
             content::content_event::codec::signed_record_from_bytes(bytes)
         }
+        content::message::codec::TYPE_MESSAGE => Err("message must be signed".to_string()),
+        content::message::codec::TYPE_SIGNED_MESSAGE => {
+            content::message::codec::signed_record_from_bytes(bytes)
+        }
+        content::reaction::codec::TYPE_REACTION => Err("reaction must be signed".to_string()),
+        content::reaction::codec::TYPE_SIGNED_REACTION => {
+            content::reaction::codec::signed_record_from_bytes(bytes)
+        }
+        content::message_deletion::codec::TYPE_MESSAGE_DELETION => {
+            Err("message deletion must be signed".to_string())
+        }
+        content::message_deletion::codec::TYPE_SIGNED_MESSAGE_DELETION => {
+            content::message_deletion::codec::signed_record_from_bytes(bytes)
+        }
+        content::file::codec::TYPE_FILE => Err("file must be signed".to_string()),
+        content::file::codec::TYPE_SIGNED_FILE => {
+            content::file::codec::signed_record_from_bytes(bytes)
+        }
+        content::file_slice::codec::TYPE_FILE_SLICE => Err("file slice must be signed".to_string()),
+        content::file_slice::codec::TYPE_SIGNED_FILE_SLICE => {
+            content::file_slice::codec::signed_record_from_bytes(bytes)
+        }
+        encryption::local_recipient_key::codec::TYPE_LOCAL_RECIPIENT_KEY => {
+            encryption::record_from_bytes(bytes)
+        }
+        encryption::local_key_secret::codec::TYPE_LOCAL_KEY_SECRET => {
+            encryption::record_from_bytes(bytes)
+        }
+        encryption::local_history_node_secret::codec::TYPE_LOCAL_HISTORY_NODE_SECRET => {
+            encryption::record_from_bytes(bytes)
+        }
+        encryption::recipient_key::codec::TYPE_RECIPIENT_KEY => {
+            Err("recipient_key must be signed".to_string())
+        }
+        encryption::recipient_key::codec::TYPE_SIGNED_RECIPIENT_KEY => {
+            encryption::record_from_bytes(bytes)
+        }
+        encryption::recipient_key_tombstone::codec::TYPE_RECIPIENT_KEY_TOMBSTONE => {
+            Err("recipient_key_tombstone must be signed".to_string())
+        }
+        encryption::recipient_key_tombstone::codec::TYPE_SIGNED_RECIPIENT_KEY_TOMBSTONE => {
+            encryption::record_from_bytes(bytes)
+        }
+        encryption::removal_frontier::codec::TYPE_REMOVAL_FRONTIER => {
+            Err("removal_frontier must be signed".to_string())
+        }
+        encryption::removal_frontier::codec::TYPE_SIGNED_REMOVAL_FRONTIER => {
+            encryption::record_from_bytes(bytes)
+        }
+        encryption::key_wrap::codec::TYPE_KEY_WRAP => Err("key_wrap must be signed".to_string()),
+        encryption::key_wrap::codec::TYPE_SIGNED_KEY_WRAP => encryption::record_from_bytes(bytes),
         test_events::event_with_deps::codec::TYPE_EVENT_WITH_DEPS => {
             test_events::event_with_deps::codec::record_from_bytes(bytes)
         }

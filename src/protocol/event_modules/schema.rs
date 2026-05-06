@@ -46,7 +46,7 @@ pub const SCHEMAS: &[Schema] = &[
 
 const EVENT_ROW_HEADER_BYTES: usize = 8 + 8 + 1 + 1 + 1 + 1 + 32;
 const MAX_LABELS_PER_EVENT: usize = 4096;
-const MAX_DEPENDENCY_ROWS_PER_EVENT: usize = 1_000_000;
+pub(crate) const MAX_DEPENDENCY_ROWS_PER_EVENT: usize = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventLabel {
@@ -63,6 +63,13 @@ struct StoredEvent {
     status: EventStatus,
     workspace_id: Option<EventId>,
     canonical_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StoredEventIndex {
+    pub timestamp: u64,
+    pub scope: EventScope,
+    pub status: EventStatus,
 }
 
 pub fn insert_event(
@@ -300,6 +307,14 @@ pub fn event_label_rows(labels: Vec<EventLabel>) -> Vec<TableRow> {
         .collect()
 }
 
+pub(crate) fn decode_stored_event_index(value: &[u8]) -> rusqlite::Result<StoredEventIndex> {
+    decode_event_row_value(value).map(|event| StoredEventIndex {
+        timestamp: event.timestamp,
+        scope: event.scope,
+        status: event.status,
+    })
+}
+
 pub fn event_labels(store: &Store, event_id: &EventId) -> Result<Vec<Vec<u8>>, String> {
     store
         .table_rows_with_key_prefix(EVENT_LABELS, event_id, MAX_LABELS_PER_EVENT)
@@ -487,14 +502,14 @@ fn read_id(bytes: &[u8], offset: &mut usize) -> rusqlite::Result<EventId> {
     Ok(out)
 }
 
-fn ready_key(timestamp: u64, event_id: &EventId) -> Vec<u8> {
+pub(crate) fn ready_key(timestamp: u64, event_id: &EventId) -> Vec<u8> {
     let mut key = Vec::with_capacity(8 + event_id.len());
     key.extend_from_slice(&timestamp.to_be_bytes());
     key.extend_from_slice(event_id);
     key
 }
 
-fn timestamp_key(timestamp: u64, event_id: &EventId) -> Vec<u8> {
+pub(crate) fn timestamp_key(timestamp: u64, event_id: &EventId) -> Vec<u8> {
     let mut key = Vec::with_capacity(8 + event_id.len());
     key.extend_from_slice(&timestamp.to_be_bytes());
     key.extend_from_slice(event_id);
@@ -549,14 +564,14 @@ fn decode_workspace_index_value(value: &[u8]) -> rusqlite::Result<Option<EventId
     read_optional_id(value, &mut offset)
 }
 
-fn edge_key(first: &EventId, second: &EventId) -> Vec<u8> {
+pub(crate) fn edge_key(first: &EventId, second: &EventId) -> Vec<u8> {
     let mut key = Vec::with_capacity(64);
     key.extend_from_slice(first);
     key.extend_from_slice(second);
     key
 }
 
-fn split_edge_key(key: &[u8]) -> rusqlite::Result<(EventId, EventId)> {
+pub(crate) fn split_edge_key(key: &[u8]) -> rusqlite::Result<(EventId, EventId)> {
     if key.len() != 64 {
         return Err(table_error(format!(
             "dependency key should be 64 bytes, got {}",

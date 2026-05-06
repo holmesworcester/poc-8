@@ -19,7 +19,7 @@ fn connect_handshake_does_not_create_durable_events() {
 
     let _daemon = spawn_daemon(&bob, port);
     let connected = connect_with_retry(&alice, &bob_invite);
-    assert!(connected.contains("connection requested:"));
+    assert!(connected.contains("connected:"), "{connected}");
     wait_for_connection_count(&bob, 1);
     wait_for_connection_event_count(&bob, 1);
 
@@ -42,7 +42,7 @@ fn wrong_invite_private_key_does_not_project_receiver_connection() {
 
     let _daemon = spawn_daemon(&bob, port);
     let connected = connect_with_retry(&alice, &wrong_invite);
-    assert!(connected.contains("connection requested:"));
+    assert!(connected.contains("connected:"), "{connected}");
     thread::sleep(Duration::from_millis(500));
 
     assert_eq!(count(&alice), 0);

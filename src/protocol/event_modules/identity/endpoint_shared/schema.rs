@@ -5,7 +5,7 @@
 //! can reject joining the same workspace twice from one endpoint.
 
 use crate::core::store::{Schema, Store, TableName, TableRow};
-use crate::protocol::event_modules::identity::endpoint::types::EndpointId;
+use crate::protocol::event_modules::identity::endpoint::types::{EndpointId, EndpointRole};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::wire::{Reader, Writer};
 use std::collections::HashSet;
@@ -97,6 +97,7 @@ pub fn decode_endpoint_shared_row(key: &[u8], value: &[u8]) -> Result<EndpointSh
     let created_at_ms = reader.u64()?;
     let endpoint_id = reader.id()?;
     let signing_public_key = reader.id()?;
+    let endpoint_role = EndpointRole::from_u8(reader.u8()?)?;
     let user_authority_event_id = reader.id()?;
     let device_invite_id = reader.id()?;
     let device_name =
@@ -109,6 +110,7 @@ pub fn decode_endpoint_shared_row(key: &[u8], value: &[u8]) -> Result<EndpointSh
         created_at_ms,
         endpoint_id,
         signing_public_key,
+        endpoint_role,
         user_authority_event_id,
         device_invite_id,
         device_name,
@@ -132,6 +134,7 @@ pub fn decode_endpoint_membership_row(
     let user_authority_event_id = reader.id()?;
     let device_invite_id = reader.id()?;
     let signing_public_key = reader.id()?;
+    let endpoint_role = EndpointRole::from_u8(reader.u8()?)?;
     let created_at_ms = reader.u64()?;
     reader.finish()?;
 
@@ -142,6 +145,7 @@ pub fn decode_endpoint_membership_row(
         user_authority_event_id,
         device_invite_id,
         signing_public_key,
+        endpoint_role,
         created_at_ms,
     })
 }
@@ -183,10 +187,11 @@ fn encode_endpoint_shared_value(
 ) -> Result<Vec<u8>, String> {
     let device_name = codec::encode_device_name(&event.device_name)?;
     let mut out =
-        Writer::with_capacity(8 + 32 + 32 + 32 + 32 + super::types::ENDPOINT_DEVICE_NAME_BYTES);
+        Writer::with_capacity(8 + 32 + 32 + 1 + 32 + 32 + super::types::ENDPOINT_DEVICE_NAME_BYTES);
     out.u64(event.created_at_ms);
     out.id(&event.endpoint_id);
     out.id(&event.signing_public_key);
+    out.u8(event.endpoint_role.as_u8());
     out.id(&event.user_authority_event_id);
     out.id(&device_invite_id);
     out.raw(&device_name);
@@ -198,11 +203,12 @@ fn encode_endpoint_membership_value(
     device_invite_id: EventId,
     event: &EndpointSharedEvent,
 ) -> Vec<u8> {
-    let mut out = Writer::with_capacity(32 + 32 + 32 + 32 + 8);
+    let mut out = Writer::with_capacity(32 + 32 + 32 + 32 + 1 + 8);
     out.id(&endpoint_shared_id);
     out.id(&event.user_authority_event_id);
     out.id(&device_invite_id);
     out.id(&event.signing_public_key);
+    out.u8(event.endpoint_role.as_u8());
     out.u64(event.created_at_ms);
     out.finish()
 }
@@ -220,6 +226,7 @@ mod tests {
             user_authority_event_id: [2; 32],
             endpoint_id: [3; 32],
             signing_public_key: [6; 32],
+            endpoint_role: EndpointRole::Device,
             device_name: "phone".to_string(),
         }
     }
@@ -242,6 +249,7 @@ mod tests {
                 created_at_ms: 77,
                 endpoint_id: [3; 32],
                 signing_public_key: [6; 32],
+                endpoint_role: EndpointRole::Device,
                 user_authority_event_id: [2; 32],
                 device_invite_id: [5; 32],
                 device_name: "phone".to_string(),
@@ -257,6 +265,7 @@ mod tests {
                 user_authority_event_id: [2; 32],
                 device_invite_id: [5; 32],
                 signing_public_key: [6; 32],
+                endpoint_role: EndpointRole::Device,
                 created_at_ms: 77,
             }
         );

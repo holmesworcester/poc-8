@@ -16,8 +16,12 @@
 use crate::core::daemon::Worker;
 use crate::core::store::Store;
 
+pub mod bootstrap_exchange;
+pub(crate) mod common;
 pub mod common_event_pipeline;
+pub mod content_purge;
 pub mod dependency_unblock;
+pub mod encryption;
 pub mod event_admission;
 pub mod event_projection;
 pub mod schema;
@@ -40,6 +44,7 @@ where
         event_admission::daemon_worker(),
         event_projection::daemon_worker(),
         dependency_unblock::daemon_worker(),
+        content_purge::daemon_worker(),
         sync::daemon_worker(),
         transit_out::daemon_worker(),
     ]

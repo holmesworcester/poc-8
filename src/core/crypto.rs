@@ -4,6 +4,8 @@
 //! The facade owns primitive selection and low-level library calls, keeping
 //! event modules from growing their own hash or signature implementations.
 
+use std::io::{Cursor, Read, Write};
+
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -18,7 +20,9 @@ pub const ED25519_PUBLIC_KEY_BYTES: usize = 32;
 pub const ED25519_SIGNATURE_BYTES: usize = 64;
 pub const X25519_PRIVATE_KEY_BYTES: usize = 32;
 pub const X25519_PUBLIC_KEY_BYTES: usize = 32;
+pub const XCHACHA20_POLY1305_KEY_BYTES: usize = 32;
 pub const XCHACHA20_POLY1305_NONCE_BYTES: usize = 24;
+pub const XCHACHA20_POLY1305_TAG_BYTES: usize = 16;
 
 pub type Hash = [u8; HASH_BYTES];
 pub type Ed25519PrivateKey = [u8; ED25519_PRIVATE_KEY_BYTES];
@@ -26,6 +30,7 @@ pub type Ed25519PublicKey = [u8; ED25519_PUBLIC_KEY_BYTES];
 pub type Ed25519Signature = [u8; ED25519_SIGNATURE_BYTES];
 pub type X25519PrivateKey = [u8; X25519_PRIVATE_KEY_BYTES];
 pub type X25519PublicKey = [u8; X25519_PUBLIC_KEY_BYTES];
+pub type XChaCha20Poly1305Key = [u8; XCHACHA20_POLY1305_KEY_BYTES];
 pub type XChaCha20Poly1305Nonce = [u8; XCHACHA20_POLY1305_NONCE_BYTES];
 
 pub fn hash(bytes: &[u8]) -> Hash {
@@ -74,6 +79,58 @@ pub fn random_xchacha20poly1305_nonce() -> XChaCha20Poly1305Nonce {
     let mut nonce = [0; XCHACHA20_POLY1305_NONCE_BYTES];
     OsRng.fill_bytes(&mut nonce);
     nonce
+}
+
+pub fn random_xchacha20poly1305_key() -> XChaCha20Poly1305Key {
+    random_bytes_32()
+}
+
+pub fn hkdf_sha256_key(
+    input_key_material: &[u8],
+    purpose: &[u8],
+    associated_data: &[u8],
+) -> Result<XChaCha20Poly1305Key, String> {
+    let hkdf = Hkdf::<Sha256>::new(Some(purpose), input_key_material);
+    let mut key = [0; XCHACHA20_POLY1305_KEY_BYTES];
+    hkdf.expand(associated_data, &mut key)
+        .map_err(|_| "derive hkdf sha256 key".to_string())?;
+    Ok(key)
+}
+
+pub fn xchacha20poly1305_encrypt(
+    key: &XChaCha20Poly1305Key,
+    associated_data: &[u8],
+    nonce: &XChaCha20Poly1305Nonce,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, String> {
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    cipher
+        .encrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: plaintext,
+                aad: associated_data,
+            },
+        )
+        .map_err(|_| "encrypt xchacha20poly1305 payload".to_string())
+}
+
+pub fn xchacha20poly1305_decrypt(
+    key: &XChaCha20Poly1305Key,
+    associated_data: &[u8],
+    nonce: &XChaCha20Poly1305Nonce,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, String> {
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    cipher
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: associated_data,
+            },
+        )
+        .map_err(|_| "decrypt xchacha20poly1305 payload".to_string())
 }
 
 pub fn x25519_xchacha20poly1305_encrypt(
@@ -133,6 +190,64 @@ fn x25519_hkdf_sha256_key(
     Ok(key)
 }
 
+/// BLAKE3 verified streaming root hash + outboard for the given plaintext.
+///
+/// The outboard carries the BLAKE3 tree nodes that prove any slice of the
+/// plaintext belongs to the returned root hash. Senders compute this once;
+/// receivers verify each slice independently against the root.
+pub fn bao_outboard(plaintext: &[u8]) -> Result<(Hash, Vec<u8>), String> {
+    let mut outboard = Vec::new();
+    let mut encoder = bao::encode::Encoder::new_outboard(Cursor::new(&mut outboard));
+    encoder
+        .write_all(plaintext)
+        .map_err(|err| format!("bao encode: {err}"))?;
+    let hash = encoder
+        .finalize()
+        .map_err(|err| format!("bao finalize: {err}"))?;
+    Ok((*hash.as_bytes(), outboard))
+}
+
+/// Extract a self-contained BAO slice proof for `[slice_start, slice_start + slice_len)`.
+///
+/// The returned bytes contain both the verified plaintext and the tree nodes
+/// needed to verify it against `root_hash`. They are what slice events should
+/// carry on the wire.
+pub fn bao_extract_slice(
+    plaintext: &[u8],
+    outboard: &[u8],
+    slice_start: u64,
+    slice_len: u64,
+) -> Result<Vec<u8>, String> {
+    let mut extractor = bao::encode::SliceExtractor::new_outboard(
+        Cursor::new(plaintext),
+        Cursor::new(outboard),
+        slice_start,
+        slice_len,
+    );
+    let mut proof = Vec::new();
+    extractor
+        .read_to_end(&mut proof)
+        .map_err(|err| format!("bao extract: {err}"))?;
+    Ok(proof)
+}
+
+/// Verify a BAO slice proof against `root_hash` and return the slice plaintext.
+pub fn bao_verify_slice(
+    root_hash: &Hash,
+    proof: &[u8],
+    slice_start: u64,
+    slice_len: u64,
+) -> Result<Vec<u8>, String> {
+    let hash = bao::Hash::from(*root_hash);
+    let mut decoder =
+        bao::decode::SliceDecoder::new(Cursor::new(proof), &hash, slice_start, slice_len);
+    let mut output = Vec::new();
+    decoder
+        .read_to_end(&mut output)
+        .map_err(|err| format!("bao verify: {err}"))?;
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +285,54 @@ mod tests {
             ed25519_sign(&private_key, bytes),
             ed25519_sign(&private_key, bytes)
         );
+    }
+
+    #[test]
+    fn xchacha20poly1305_roundtrips_and_rejects_tamper() {
+        let key = random_xchacha20poly1305_key();
+        let nonce = random_xchacha20poly1305_nonce();
+        let aad = b"topo test symmetric aad";
+        let plaintext = b"phase-one local epoch secret bytes";
+
+        let ciphertext = xchacha20poly1305_encrypt(&key, aad, &nonce, plaintext).expect("encrypt");
+
+        assert_eq!(
+            xchacha20poly1305_decrypt(&key, aad, &nonce, &ciphertext).expect("decrypt"),
+            plaintext
+        );
+        assert!(xchacha20poly1305_decrypt(
+            &random_xchacha20poly1305_key(),
+            aad,
+            &nonce,
+            &ciphertext
+        )
+        .is_err());
+        assert!(xchacha20poly1305_decrypt(&key, b"wrong aad", &nonce, &ciphertext).is_err());
+
+        let mut tampered_nonce = nonce;
+        tampered_nonce[0] ^= 1;
+        assert!(xchacha20poly1305_decrypt(&key, aad, &tampered_nonce, &ciphertext).is_err());
+
+        let mut tampered_ciphertext = ciphertext;
+        tampered_ciphertext[0] ^= 1;
+        assert!(xchacha20poly1305_decrypt(&key, aad, &nonce, &tampered_ciphertext).is_err());
+    }
+
+    #[test]
+    fn hkdf_sha256_key_is_deterministic_and_context_bound() {
+        let input = [7; 32];
+        let purpose = b"test-purpose";
+        let associated_data = b"test-associated-data";
+
+        let left = hkdf_sha256_key(&input, purpose, associated_data).expect("derive");
+        let right = hkdf_sha256_key(&input, purpose, associated_data).expect("derive");
+        let wrong_purpose =
+            hkdf_sha256_key(&input, b"other-purpose", associated_data).expect("derive");
+        let wrong_data = hkdf_sha256_key(&input, purpose, b"other-data").expect("derive");
+
+        assert_eq!(left, right);
+        assert_ne!(left, wrong_purpose);
+        assert_ne!(left, wrong_data);
     }
 
     #[test]
@@ -221,5 +384,41 @@ mod tests {
             &ciphertext,
         )
         .is_err());
+    }
+
+    #[test]
+    fn bao_round_trips_each_slice_against_root_hash() {
+        let plaintext: Vec<u8> = (0..600_000u32).map(|byte| byte as u8).collect();
+        let (root_hash, outboard) = bao_outboard(&plaintext).expect("outboard");
+
+        let slice_size = 256 * 1024;
+        let mut start = 0u64;
+        while (start as usize) < plaintext.len() {
+            let len = (plaintext.len() as u64 - start).min(slice_size as u64);
+            let proof =
+                bao_extract_slice(&plaintext, &outboard, start, len).expect("extract slice");
+            let verified = bao_verify_slice(&root_hash, &proof, start, len).expect("verify slice");
+            assert_eq!(
+                verified.as_slice(),
+                &plaintext[start as usize..(start + len) as usize]
+            );
+            start += slice_size as u64;
+        }
+    }
+
+    #[test]
+    fn bao_verify_rejects_tampered_proof_and_wrong_root_hash() {
+        let plaintext = b"important payload bytes".to_vec();
+        let (root_hash, outboard) = bao_outboard(&plaintext).expect("outboard");
+        let mut proof = bao_extract_slice(&plaintext, &outboard, 0, plaintext.len() as u64)
+            .expect("extract slice");
+
+        let last = proof.len() - 1;
+        proof[last] ^= 1;
+        assert!(bao_verify_slice(&root_hash, &proof, 0, plaintext.len() as u64).is_err());
+
+        proof[last] ^= 1;
+        let wrong_hash = [0xff; HASH_BYTES];
+        assert!(bao_verify_slice(&wrong_hash, &proof, 0, plaintext.len() as u64).is_err());
     }
 }

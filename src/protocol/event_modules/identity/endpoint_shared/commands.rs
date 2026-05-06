@@ -2,7 +2,7 @@
 
 use crate::core::crypto::Ed25519PrivateKey;
 use crate::core::crypto::Ed25519PublicKey;
-use crate::protocol::event_modules::identity::endpoint::types::EndpointId;
+use crate::protocol::event_modules::identity::endpoint::types::{EndpointId, EndpointRole};
 use crate::protocol::event_modules::identity::signed;
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker::CommandOutput;
@@ -25,6 +25,7 @@ pub struct ShareEndpoint {
     pub user_authority_event_id: EventId,
     pub endpoint_id: EndpointId,
     pub signing_public_key: Ed25519PublicKey,
+    pub endpoint_role: EndpointRole,
     pub device_name: String,
     pub device_invite_id: EventId,
     pub device_invite_private_key: Ed25519PrivateKey,
@@ -58,6 +59,7 @@ pub fn share_endpoint(
         user_authority_event_id: input.user_authority_event_id,
         endpoint_id: input.endpoint_id,
         signing_public_key: input.signing_public_key,
+        endpoint_role: input.endpoint_role,
         device_name: input.device_name,
     })?;
     let signed = signed::commands::sign_payload(
@@ -114,6 +116,7 @@ mod tests {
             user_authority_event_id: [2; 32],
             endpoint_id: [3; 32],
             signing_public_key: [4; 32],
+            endpoint_role: EndpointRole::Device,
             device_name: "laptop".to_string(),
             device_invite_id,
             device_invite_private_key: private_key,
@@ -171,6 +174,7 @@ mod tests {
         assert_eq!(inner.user_authority_event_id, [2; 32]);
         assert_eq!(inner.endpoint_id, [3; 32]);
         assert_eq!(inner.signing_public_key, [4; 32]);
+        assert_eq!(inner.endpoint_role, EndpointRole::Device);
         assert_eq!(inner.device_name, "laptop");
     }
 

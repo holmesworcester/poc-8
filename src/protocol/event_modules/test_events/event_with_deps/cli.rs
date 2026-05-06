@@ -6,6 +6,7 @@
 //! module so black-box tests can stay small.
 
 use crate::core::cli::{CliArgs, CliCommand, CliOutput};
+use crate::core::logical_clock;
 use crate::protocol::cli::Context;
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::types::EventIndexEntry;
@@ -263,9 +264,10 @@ struct EventWithDepsContext {
 
 impl EventWithDepsContext {
     fn new(store: &crate::core::store::Store) -> Result<Self, String> {
+        let max_timestamp = event_schema::max_timestamp(store)
+            .map_err(|err| format!("load max timestamp: {err}"))?;
         Ok(Self {
-            max_timestamp: event_schema::max_timestamp(store)
-                .map_err(|err| format!("load max timestamp: {err}"))?,
+            max_timestamp: logical_clock::max_timestamp_for_next(store, max_timestamp)?,
             event_index_entries: event_schema::event_index_entries_in_timestamp_range(
                 store,
                 0,

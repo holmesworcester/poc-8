@@ -11,6 +11,7 @@ pub mod cli;
 pub mod crux_runner;
 pub mod crypto;
 pub mod daemon;
+pub mod logical_clock;
 pub mod network_queues;
 pub mod runtime;
 pub mod store;

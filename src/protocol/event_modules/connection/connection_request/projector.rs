@@ -84,15 +84,53 @@ pub fn project(envelope: &EventWithContext<'_>) -> Result<ProjectionOutput, Stri
                 receive.origin(),
             ));
         }
+        if let Some(workspace_id) = invite_secret.workspace_id {
+            // A scoped invite proves a temporary workspace boundary for this
+            // endpoint pair. That lets the invitee send the identity bootstrap
+            // facts needed to become a normal mutually joined endpoint; after
+            // membership projects, ordinary connection workspace checks take
+            // over.
+            rows.push(projection::bootstrap_workspace_row(
+                connection_id,
+                workspace_id,
+            ));
+            rows.push(projection::bootstrap_endpoint_workspace_row(
+                receive.local_endpoint(),
+                event.from_endpoint,
+                workspace_id,
+            ));
+        }
     } else {
         // Local requests have no receive metadata because this node created
         // them. Admission has already applied the invite-secret dependency, so
         // projection can learn the local view of the connection to the invite
-        // endpoint without another network round trip.
-        rows.push(projection::connection_row(
-            types::connection_id(&request_id, &event.to_endpoint),
-            event.to_endpoint,
-        ));
+        // endpoint without another network round trip. Scoped identity invites
+        // also authorize bootstrap identity facts in the opposite direction:
+        // after sending the request, the requester may receive the inviter's
+        // workspace/user/admin facts over bootstrap transit before ordinary
+        // endpoint membership has projected on both sides.
+        let connection_id = types::connection_id(&request_id, &event.to_endpoint);
+        rows.push(projection::connection_row(connection_id, event.to_endpoint));
+        let invite_secret = envelope
+            .context
+            .dependency(&event.invite_secret_event_id)
+            .ok_or_else(|| "connection request missing invite secret dependency".to_string())?;
+        let invite_secret = invite::codec::decode(&invite_secret.canonical_bytes)
+            .map_err(|_| "connection request dependency is not an invite secret".to_string())?;
+        if invite_secret.bootstrap_hash != event.bootstrap_hash {
+            return Err("connection request bootstrap hash is not authorized".to_string());
+        }
+        if let Some(workspace_id) = invite_secret.workspace_id {
+            rows.push(projection::bootstrap_workspace_row(
+                connection_id,
+                workspace_id,
+            ));
+            rows.push(projection::bootstrap_endpoint_workspace_row(
+                event.from_endpoint,
+                event.to_endpoint,
+                workspace_id,
+            ));
+        }
     }
 
     Ok(ProjectionOutput::rows(rows))
@@ -123,12 +161,19 @@ mod tests {
         .expect("request record")
     }
 
-    fn context_for(record: &Record) -> EventWithContext<'_> {
+    fn context_with_dependency<'a>(
+        record: &'a Record,
+        invite_secret_event_id: [u8; 32],
+        invite_record: Record,
+    ) -> EventWithContext<'a> {
         EventWithContext {
             record,
             context: EventContext {
                 event_id: types::event_id(&record.canonical_bytes),
-                dependencies: Vec::new(),
+                dependencies: vec![DependencyContext {
+                    event_id: invite_secret_event_id,
+                    record: invite_record,
+                }],
                 labels: Vec::new(),
                 receive: None,
             },
@@ -136,7 +181,18 @@ mod tests {
     }
 
     fn authorized_request_record() -> (Record, [u8; 32], Record) {
-        let invite_secret = invite::types::InviteSecretEvent::new([7; 32]);
+        authorized_request_record_for(invite::types::InviteSecretEvent::new([7; 32]))
+    }
+
+    fn scoped_authorized_request_record() -> (Record, [u8; 32], Record) {
+        authorized_request_record_for(invite::types::InviteSecretEvent::scoped(
+            [7; 32], [6; 32], [5; 32],
+        ))
+    }
+
+    fn authorized_request_record_for(
+        invite_secret: invite::types::InviteSecretEvent,
+    ) -> (Record, [u8; 32], Record) {
         let invite_record = invite::codec::record_from_bytes(invite::codec::encode(&invite_secret))
             .expect("invite record");
         let invite_secret_event_id = types::event_id(&invite_record.canonical_bytes);
@@ -153,8 +209,13 @@ mod tests {
 
     #[test]
     fn projects_request_bytes_without_receive_metadata() {
-        let record = request_record();
-        let output = project(&context_for(&record)).expect("project request");
+        let (record, invite_secret_event_id, invite_record) = authorized_request_record();
+        let output = project(&context_with_dependency(
+            &record,
+            invite_secret_event_id,
+            invite_record,
+        ))
+        .expect("project request");
 
         assert_eq!(output.rows.len(), 2);
         assert_eq!(output.rows[0].table, schema::CONNECTION_EVENTS);
@@ -166,6 +227,24 @@ mod tests {
             types::connection_id(&types::event_id(&record.canonical_bytes), &[9; 32])
         );
         assert_eq!(output.rows[1].value, [9; 32]);
+    }
+
+    #[test]
+    fn local_scoped_request_authorizes_bootstrap_identity_facts() {
+        let (record, invite_secret_event_id, invite_record) = scoped_authorized_request_record();
+        let output = project(&context_with_dependency(
+            &record,
+            invite_secret_event_id,
+            invite_record,
+        ))
+        .expect("project local scoped request");
+
+        assert_eq!(output.rows.len(), 4);
+        assert_eq!(output.rows[0].table, schema::CONNECTION_EVENTS);
+        assert_eq!(output.rows[1].table, schema::CONNECTIONS);
+        assert_eq!(output.rows[2].table, schema::BOOTSTRAP_WORKSPACES);
+        assert_eq!(output.rows[3].table, schema::BOOTSTRAP_ENDPOINT_WORKSPACES);
+        assert_eq!(output.rows[2].value, [6; 32]);
     }
 
     #[test]

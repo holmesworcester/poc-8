@@ -6,6 +6,7 @@
 //! into the content command explicitly.
 
 use crate::core::cli::{CliArgs, CliCommand, CliOutput};
+use crate::core::logical_clock;
 use crate::protocol::cli::Context;
 use crate::protocol::event_modules::identity::{endpoint, endpoint_shared};
 use crate::protocol::event_modules::types::EventId;
@@ -79,8 +80,10 @@ fn run_generate_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliO
         return Err("local endpoint signing key does not match workspace membership".to_string());
     }
 
-    let start =
-        schema::max_timestamp_for_workspace(&context.store, workspace_id)?.saturating_add(1);
+    let start = logical_clock::next_timestamp(
+        &context.store,
+        schema::max_timestamp_for_workspace(&context.store, workspace_id)?,
+    )?;
     let output = super::commands::generate(
         workspace_id,
         membership.endpoint_shared_id,

@@ -64,7 +64,7 @@ pub struct CanonicalIn {
     pub provenance: Option<TransitProvenance>,
 }
 
-type DecodedCanonicalIn = (Vec<u8>, Option<ReceiveMetadata>, Option<TransitProvenance>);
+pub(crate) type DecodedCanonicalIn = (Vec<u8>, Option<ReceiveMetadata>, Option<TransitProvenance>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransitProvenance {
@@ -349,7 +349,7 @@ fn encode_canonical_in(
     writer.finish()
 }
 
-fn decode_canonical_in(bytes: &[u8]) -> Result<DecodedCanonicalIn, String> {
+pub(crate) fn decode_canonical_in(bytes: &[u8]) -> Result<DecodedCanonicalIn, String> {
     let mut reader = Reader::new(bytes, "canonical in row");
     let canonical_bytes = reader.sized_bytes()?;
     let receive = decode_receive(&mut reader)?;

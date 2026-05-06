@@ -38,6 +38,27 @@ fn source_text(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
 }
 
+fn module_doc_text(text: &str) -> String {
+    let mut docs = Vec::new();
+    for line in text.lines() {
+        if let Some(doc) = line.strip_prefix("//!") {
+            docs.push(doc.trim().to_string());
+            continue;
+        }
+        if line.trim().is_empty() && !docs.is_empty() {
+            continue;
+        }
+        break;
+    }
+    docs.join("\n")
+}
+
+fn production_text_before_unit_tests(text: &str) -> &str {
+    text.find("#[cfg(test)]")
+        .map(|idx| &text[..idx])
+        .unwrap_or(text)
+}
+
 fn worker_implementation_files(root: &Path) -> Vec<std::path::PathBuf> {
     rust_files(&root.join("src/workers"))
         .into_iter()
@@ -118,6 +139,7 @@ fn core_file_set_stays_small_and_named() {
         "crypto.rs",
         "crux_runner.rs",
         "daemon.rs",
+        "logical_clock.rs",
         "mod.rs",
         "network_queues.rs",
         "runtime.rs",
@@ -581,6 +603,7 @@ fn workers_folder_has_standard_catalog_shape() {
     let required = [
         "mod.rs",
         "README.md",
+        "common",
         "common_event_pipeline.rs",
         "transit_in.rs",
         "event_admission.rs",
@@ -811,6 +834,49 @@ fn cli_harness_is_process_only() {
     assert!(
         violations.is_empty(),
         "tests/cli_harness must stay process-only; scenario files own command params, retries, invite syntax, output keys, and expected results:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn functional_cli_and_network_tests_use_black_box_setup() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let test_files = [
+        "tests/black_box_sync_test.rs",
+        "tests/cascade_cli_test.rs",
+        "tests/content_cli_test.rs",
+        "tests/encryption_cli_test.rs",
+        "tests/generate_cli_test.rs",
+        "tests/invite_accept_cli_test.rs",
+    ];
+    let forbidden = [
+        "use topo::core::",
+        "use topo::protocol::",
+        "topo::core::",
+        "topo::protocol::",
+        "Protocol::",
+        "worker::run",
+        "open_store",
+        "insert_table_rows",
+        "install_workspace_graph",
+        "workspace_graph",
+        "EventRecord",
+        "CommandOutput",
+    ];
+    let mut violations = Vec::new();
+
+    for file in test_files {
+        let text = source_text(&root.join(file));
+        for needle in forbidden {
+            if text.contains(needle) {
+                violations.push(format!("{file} contains {needle}"));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "functional CLI/network tests must set up initial state through public CLI/process/network boundaries, not protocol/store internals:\n{}",
         violations.join("\n")
     );
 }
@@ -1091,6 +1157,24 @@ fn protocol_event_schema_owns_common_fact_indexes() {
             "protocol/event_modules/schema.rs should own common protocol fact/index storage: missing {required}"
         );
     }
+}
+
+#[test]
+fn local_retention_purge_is_worker_owned_not_schema_owned() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let protocol_schema = source_text(&root.join("src/protocol/event_modules/schema.rs"));
+    assert!(
+        !protocol_schema.contains("purge_event"),
+        "protocol/event_modules/schema.rs declares event-store rows and codecs; local retention purge belongs in workers"
+    );
+
+    let worker_common = source_text(&root.join("src/workers/common/mod.rs"));
+    assert!(
+        worker_common.contains("fn purge_event_storage_in_tx")
+            && worker_common.contains("local retention cleanup only")
+            && worker_common.contains("not a protocol deletion event"),
+        "workers/common should own and document event-byte retention cleanup"
+    );
 }
 
 #[test]
@@ -1470,9 +1554,10 @@ fn event_module_projectors_do_not_do_transit_or_crypto_work() {
     let mut violations = Vec::new();
     for path in files {
         let text = source_text(&path);
+        let production_text = production_text_before_unit_tests(&text);
         let relative = path.strip_prefix(root).unwrap_or(&path);
         for needle in forbidden {
-            if text.contains(needle) {
+            if production_text.contains(needle) {
                 violations.push(format!("{} contains {needle}", relative.display()));
             }
         }
@@ -1598,6 +1683,76 @@ fn schema_files_are_not_empty_placeholders() {
 }
 
 #[test]
+fn new_poc8_modules_document_responsibility_boundaries() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = vec![
+        root.join("src/core/logical_clock.rs"),
+        root.join("src/protocol/event_modules/content/cli.rs"),
+        root.join("src/protocol/event_modules/identity/cli.rs"),
+        root.join("src/workers/bootstrap_exchange.rs"),
+        root.join("src/workers/common/mod.rs"),
+        root.join("src/workers/content_purge.rs"),
+        root.join("src/workers/encryption.rs"),
+        root.join("tests/content_cli_test.rs"),
+        root.join("tests/encryption_cli_test.rs"),
+        root.join("tests/invite_accept_cli_test.rs"),
+    ];
+    for relative in [
+        "src/protocol/event_modules/content/file",
+        "src/protocol/event_modules/content/file_slice",
+        "src/protocol/event_modules/content/message",
+        "src/protocol/event_modules/content/message_deletion",
+        "src/protocol/event_modules/content/reaction",
+        "src/protocol/event_modules/encryption",
+        "src/protocol/event_modules/identity/invite_server",
+    ] {
+        files.extend(rust_files(&root.join(relative)));
+    }
+
+    let mut violations = Vec::new();
+    for path in files {
+        let text = source_text(&path);
+        let docs = module_doc_text(&text);
+        let doc_lines = docs.lines().filter(|line| !line.is_empty()).count();
+        let names_boundary = [
+            "does not",
+            "do not",
+            "not ",
+            "relies",
+            "owns",
+            "Inputs:",
+            "authority",
+            "belongs",
+            "canonical",
+            "dependency",
+            "depends",
+            "invariant",
+            "local",
+            "must",
+            "only",
+            "projection",
+            "scope",
+            "shared",
+            "worker",
+        ]
+        .iter()
+        .any(|needle| docs.contains(needle));
+        if doc_lines < 4 || !names_boundary {
+            violations.push(format!(
+                "{} has weak module docs",
+                path.strip_prefix(root).unwrap().display()
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "new modules should document purpose, invariants, dependencies, and non-responsibilities:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
 fn projector_files_are_not_empty_placeholders() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let event_root = root.join("src/protocol/event_modules");
@@ -1607,13 +1762,16 @@ fn projector_files_are_not_empty_placeholders() {
         .filter(|path| path.file_name().is_some_and(|name| name == "projector.rs"))
     {
         let text = source_text(&path);
-        if !text.contains("ProjectionOutput::rows") && !text.contains("ProjectionOutput::with") {
+        if !text.contains("ProjectionOutput::rows")
+            && !text.contains("ProjectionOutput::deletes")
+            && !text.contains("ProjectionOutput::with")
+        {
             violations.push(path.strip_prefix(root).unwrap().display().to_string());
         }
     }
     assert!(
         violations.is_empty(),
-        "omit projector.rs when a module has no row/label projection; projector files must write real projection output:\n{}",
+        "omit projector.rs when a module has no row/label/delete projection; projector files must write real projection output:\n{}",
         violations.join("\n")
     );
 }
@@ -1745,7 +1903,7 @@ fn proposed_event_carries_deterministic_id_and_record() {
 }
 
 #[test]
-fn projection_output_contains_rows_and_labels_not_events() {
+fn projection_output_contains_rows_deletes_and_labels_not_events() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(root.join("src/workers/common_event_pipeline.rs"))
         .expect("read worker");
@@ -1755,10 +1913,11 @@ fn projection_output_contains_rows_and_labels_not_events() {
     let body = &text[start..text[start..].find("impl ProjectionOutput").unwrap() + start];
     assert!(
         body.contains("pub rows: Vec<TableRow>")
+            && body.contains("pub deletes: Vec<TableDelete>")
             && body.contains("pub labels: Vec<schema::EventLabel>")
             && !body.contains("EventRecord")
             && !body.contains("events"),
-        "ProjectionOutput is projector-facing and must carry rows/labels only, not events"
+        "ProjectionOutput is projector-facing and must carry rows/labels/deletes only, not events"
     );
 }
 

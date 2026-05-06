@@ -61,7 +61,7 @@ the rule is still prose/review only.
 | `types.rs` does not store encoded/canonical artifacts as semantic fields. | static | `event_module_types_do_not_store_encoded_event_artifacts`. |
 | Production shared events require authority. | partial | Durable shared-state events must be signed by an authorized dependency unless they are self-authenticating root events such as `workspace`. Local-only secrets, connection-scoped protocol work, and test-only event modules are explicit carveouts. Raw `device_invite` and raw content are rejected by registry dispatch; signed identity/content projectors validate signer authority from event context. |
 | Crypto behavior must be real where claimed and primitive implementations live in core crypto. | static + partial | `source_does_not_contain_fake_crypto_claims`; transit uses `core::crypto` X25519/XChaCha helpers while keeping associated-data and purpose policy in connection code. Cryptographic correctness still needs implementation review and tests. |
-| Functional proof comes from black-box CLI/network tests, except pure projector/command tests. | partial | Existing tests spawn the real `topo` binary for sync/generate/cascade paths; this remains a process/testing rule, not a type guarantee. |
+| Functional proof comes from black-box CLI/network tests, except pure projector/command tests. | static + partial | Existing tests spawn the real `topo` binary for sync/generate/cascade/content paths. `functional_cli_and_network_tests_use_black_box_setup` rejects protocol/store imports and known seeding shortcuts in functional CLI/network tests so initial setup cannot install domain rows or identity graphs directly. |
 | Workers with bounded calls, fairness limits, and explicit inputs are the control loop. | partial | Described in [src/workers/README.md](src/workers/README.md); event admission/projection/dependency unblock, transit out, and sync expose explicit worker entrypoints and queues. The caller chooses the next worker step. |
 | Rust idiom and common correctness lints pass. | static | Run `cargo clippy --all-targets -- -D warnings` in addition to `cargo test`; Clippy complements but does not replace [rules_boundary_test.rs](tests/rules_boundary_test.rs). |
 
@@ -98,7 +98,8 @@ The following rules should stay mechanically enforced where practical:
   effects, or storage writes. `ProposedEvent` is constructed from an
   `EventRecord` and carries both the deterministic `event_id` and that
   canonical record.
-- Projectors return `ProjectionOutput` with `Vec<TableRow>`, not events.
+- Projectors return `ProjectionOutput` with rows, exact row deletes, and labels,
+  not events.
 - `commands.rs` is reserved for event modules. CLI adapters live in
   module-local or domain-local `cli.rs`; `src/protocol/cli.rs` only aggregates
   scoped command specs, and `src/core/cli.rs` only dispatches generic command
@@ -244,12 +245,13 @@ not return rows or effects. The API that runs a command is responsible for
 admitting those proposed events through the worker; admission returns the
 event ids for chaining.
 
-Projectors return `ProjectionOutput` with table rows and generic event labels
-only. They cannot emit events. If projection discovers follow-on work, it writes
-a module-owned queue row; a module worker reads that queue, queries context,
-runs a command, and sends the command's proposed events back through the worker.
-Generic event labels are protocol event-module state declared under
-`protocol/event_modules/schema.rs`; they are not a core store concept.
+Projectors return `ProjectionOutput` with table rows, exact row deletes, and
+generic event labels only. They cannot emit events. If projection discovers
+follow-on work, it writes a module-owned queue row; a module worker reads that
+queue, queries context, runs a command, and sends the command's proposed events
+back through the worker. Generic event labels are protocol event-module state
+declared under `protocol/event_modules/schema.rs`; they are not a core store
+concept.
 
 Workers are the active boundary. A worker implementation under `src/workers`
 exports exactly one public free function, `run`; work/output types may be
@@ -835,6 +837,10 @@ Use these rules:
 
 - Functional tests are black-box by default. They should drive the public
   `topo` binary and assert observable behavior.
+- Initial setup for functional tests must also be black-box. If a test needs
+  workspaces, users, endpoints, invites, routes, or initial content, create them
+  through the public CLI/process/network path being claimed rather than seeding
+  core tables, copying rows, or installing domain graphs directly.
 - CLI tests run the actual `topo` binary.
 - Networking tests use real networking through the CLI. If a test claims sync,
   transport, or multi-node behavior, it must move bytes across real sockets with

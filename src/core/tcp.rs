@@ -20,9 +20,9 @@
 //! `NetworkSource` observed from the socket before any worker sees the bytes. A
 //! frame is first written to a core queue row and then left for admission. The
 //! same shape is used on send: callers provide opaque rows, this pump writes
-//! frames, and then calls back so the caller can update its own send
-//! bookkeeping. Keep this file boring; cleverness here usually means a domain
-//! worker is missing.
+//! those rows in caller order, and then calls back so the caller can update its
+//! own send bookkeeping. Keep this file boring; cleverness here usually means a
+//! domain worker is missing.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -46,6 +46,14 @@ pub struct StreamReport {
 /// Result of polling a reusable listener once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptReport<T> {
+    pub accepted_connections: usize,
+    pub value: T,
+}
+
+/// Result of serving a fixed number of inbound streams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeReport<T> {
+    pub local_addr: SocketAddr,
     pub accepted_connections: usize,
     pub value: T,
 }
@@ -84,6 +92,50 @@ impl Listener {
             .set_nodelay(true)
             .map_err(|err| format!("set stream nodelay: {err}"))?;
         let value = read_inbound_frames(store, &mut stream, NetworkSource::new(source_addr))?;
+        Ok(AcceptReport {
+            accepted_connections: 1,
+            value,
+        })
+    }
+
+    /// Accept and pump at most one available inbound stream with caller replies.
+    ///
+    /// This is still an opaque byte pump. The caller receives queued inbound
+    /// rows and may return queued outbound rows for the same route; core only
+    /// moves bytes and invokes the send hook after rows are written.
+    pub fn accept_exchange_available<T>(
+        &self,
+        store: &Store,
+        value: T,
+        on_inbound: impl FnMut(InboundNetworkRow, &mut T) -> Result<Vec<OutboundNetworkRow>, String>,
+        on_sent: impl FnMut(&[OutboundNetworkRow], &mut T) -> Result<(), String>,
+    ) -> Result<AcceptReport<T>, String> {
+        let (mut stream, source_addr) = match self.listener.accept() {
+            Ok(accepted) => accepted,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(AcceptReport {
+                    accepted_connections: 0,
+                    value,
+                })
+            }
+            Err(err) => return Err(format!("accept tcp stream: {err}")),
+        };
+        stream
+            .set_nonblocking(false)
+            .map_err(|err| format!("set stream blocking: {err}"))?;
+        stream
+            .set_nodelay(true)
+            .map_err(|err| format!("set stream nodelay: {err}"))?;
+        let target = NetworkTarget::new(source_addr);
+        let (_, value) = pump_stream(
+            store,
+            &mut stream,
+            target,
+            Vec::new(),
+            value,
+            on_inbound,
+            on_sent,
+        )?;
         Ok(AcceptReport {
             accepted_connections: 1,
             value,
@@ -137,6 +189,128 @@ pub fn send_once<T>(
     Ok(value)
 }
 
+/// Open a stream, send initial opaque rows, then let the caller answer rows.
+pub fn connect_exchange<T>(
+    store: &Store,
+    target: NetworkTarget,
+    initial_outbound: Vec<OutboundNetworkRow>,
+    value: T,
+    on_inbound: impl FnMut(InboundNetworkRow, &mut T) -> Result<Vec<OutboundNetworkRow>, String>,
+    on_sent: impl FnMut(&[OutboundNetworkRow], &mut T) -> Result<(), String>,
+) -> Result<T, String> {
+    let mut stream = connect(target.addr()).map_err(|err| format!("open tcp stream: {err}"))?;
+    pump_stream(
+        store,
+        &mut stream,
+        target,
+        initial_outbound,
+        value,
+        on_inbound,
+        on_sent,
+    )
+    .map(|(_, value)| value)
+}
+
+/// Serve a fixed number of incoming streams with caller-produced replies.
+pub fn serve<T>(
+    store: &Store,
+    listen: SocketAddr,
+    accept_count: usize,
+    mut value: T,
+    mut on_inbound: impl FnMut(InboundNetworkRow, &mut T) -> Result<Vec<OutboundNetworkRow>, String>,
+    mut on_sent: impl FnMut(&[OutboundNetworkRow], &mut T) -> Result<(), String>,
+) -> Result<ServeReport<T>, String> {
+    let listener = TcpListener::bind(listen).map_err(|err| format!("listen: {err}"))?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|err| format!("listener local addr: {err}"))?;
+
+    let mut accepted_connections = 0;
+    for _ in 0..accept_count {
+        let (mut stream, source_addr) = listener
+            .accept()
+            .map_err(|err| format!("accept tcp stream: {err}"))?;
+        stream
+            .set_nodelay(true)
+            .map_err(|err| format!("set stream nodelay: {err}"))?;
+        let target = NetworkTarget::new(source_addr);
+        let (_, next_value) = pump_stream(
+            store,
+            &mut stream,
+            target,
+            Vec::new(),
+            value,
+            &mut on_inbound,
+            &mut on_sent,
+        )?;
+        value = next_value;
+        accepted_connections += 1;
+    }
+
+    Ok(ServeReport {
+        local_addr,
+        accepted_connections,
+        value,
+    })
+}
+
+fn pump_stream<T>(
+    store: &Store,
+    stream: &mut TcpStream,
+    target: NetworkTarget,
+    initial_outbound: Vec<OutboundNetworkRow>,
+    mut value: T,
+    mut on_inbound: impl FnMut(InboundNetworkRow, &mut T) -> Result<Vec<OutboundNetworkRow>, String>,
+    mut on_sent: impl FnMut(&[OutboundNetworkRow], &mut T) -> Result<(), String>,
+) -> Result<(StreamReport, T), String> {
+    let mut report = StreamReport::default();
+    let mut write_open = true;
+    write_outbound(
+        store,
+        stream,
+        target,
+        initial_outbound,
+        &mut value,
+        &mut on_sent,
+        &mut report,
+    )?;
+
+    loop {
+        let bytes = match read_frame(stream) {
+            Ok(bytes) => bytes,
+            Err(err) if is_stream_closed(&err) => break,
+            Err(err) => return Err(format!("read frame: {err}")),
+        };
+        report.received_frames += 1;
+
+        let inbound = InboundNetworkRow::new(NetworkSource::new(target.addr()), bytes);
+        network_queues::enqueue_inbound(store, std::slice::from_ref(&inbound))?;
+        let outbound = on_inbound(inbound.clone(), &mut value)?;
+        network_queues::delete_inbound(store, std::slice::from_ref(&inbound))?;
+
+        if outbound.is_empty() {
+            if write_open {
+                stream
+                    .shutdown(Shutdown::Write)
+                    .map_err(|err| format!("shutdown stream write: {err}"))?;
+                write_open = false;
+            }
+        } else {
+            write_outbound(
+                store,
+                stream,
+                target,
+                outbound,
+                &mut value,
+                &mut on_sent,
+                &mut report,
+            )?;
+        }
+    }
+
+    Ok((report, value))
+}
+
 // Drive one inbound stream until the remote side closes it. Every frame is
 // queued before the admission worker sees it, which keeps the core/protocol
 // handoff visible and retryable.
@@ -163,6 +337,9 @@ fn read_inbound_frames(
 
 // Commit rows to the outbound queue before writing them. The caller's `on_sent`
 // hook runs only after the rows were written and removed from the core queue.
+// The provided order is the stream order. Some protocol handshakes need an
+// authorization frame before later frames on the same stream; the generic queue
+// key is deterministic for idempotence, not an ordering primitive.
 fn write_outbound<T>(
     store: &Store,
     stream: &mut TcpStream,
@@ -177,13 +354,19 @@ fn write_outbound<T>(
     }
     ensure_target(target, &rows)?;
     network_queues::enqueue_outbound(store, &rows)?;
-    let queued = network_queues::claim_outbound_for_target(store, target, rows.len())?;
-    for row in &queued {
+    let claimed = network_queues::claim_outbound_for_target(store, target, rows.len())?;
+    if rows
+        .iter()
+        .any(|row| !claimed.iter().any(|claimed| claimed.key == row.key))
+    {
+        return Err("queued outbound network row was not claimable for stream target".to_string());
+    }
+    for row in &rows {
         write_frame(stream, &row.bytes).map_err(|err| format!("write frame: {err}"))?;
     }
-    network_queues::delete_outbound(store, &queued)?;
-    on_sent(&queued, value)?;
-    report.sent_frames += queued.len();
+    network_queues::delete_outbound(store, &rows)?;
+    on_sent(&rows, value)?;
+    report.sent_frames += rows.len();
     Ok(())
 }
 

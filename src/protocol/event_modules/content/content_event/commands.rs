@@ -5,7 +5,7 @@
 //! fixtures. The command proposes shared events only; storing and projection are
 //! handled by the common worker.
 
-use crate::core::crypto::Ed25519PrivateKey;
+use crate::core::crypto::{self, Ed25519PrivateKey};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker::CommandOutput;
 
@@ -53,16 +53,14 @@ pub fn generate(
 fn payload(timestamp: u64, size: usize) -> Vec<u8> {
     // Derive pseudo-random-looking bytes from the timestamp so large payload
     // tests move nontrivial data while remaining reproducible.
-    let mut seed = blake3::Hasher::new();
-    seed.update(b"content-payload:");
-    seed.update(&timestamp.to_be_bytes());
-    let mut state = *seed.finalize().as_bytes();
+    let mut seed = Vec::with_capacity("content-payload:".len() + std::mem::size_of::<u64>());
+    seed.extend_from_slice(b"content-payload:");
+    seed.extend_from_slice(&timestamp.to_be_bytes());
+    let mut state = crypto::hash(&seed);
     let mut out = Vec::with_capacity(size);
 
     while out.len() < size {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&state);
-        state = *hasher.finalize().as_bytes();
+        state = crypto::hash(&state);
         let remaining = size - out.len();
         out.extend_from_slice(&state[..remaining.min(state.len())]);
     }

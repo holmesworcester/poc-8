@@ -65,7 +65,15 @@ pub fn create(
     // The invite link gives this endpoint local bootstrap authority. Propose
     // that local fact first, then make the request depend on it explicitly.
     let invite = invite::commands::parse(invite_link)?;
-    let invite_secret = invite::types::InviteSecretEvent::new(invite.bootstrap_secret);
+    let invite_secret = if invite.identity_scope {
+        invite::types::InviteSecretEvent::scoped(
+            invite.bootstrap_secret,
+            invite.workspace_id,
+            invite.invite_event_id,
+        )
+    } else {
+        invite::types::InviteSecretEvent::new(invite.bootstrap_secret)
+    };
     let invite_secret_bytes = invite::codec::encode(&invite_secret);
     let invite_secret_event_id = types::event_id(&invite_secret_bytes);
     let invite_secret_record = invite::codec::record_from_bytes(invite_secret_bytes)?;

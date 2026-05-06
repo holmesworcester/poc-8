@@ -15,14 +15,21 @@ pub fn project(bytes: &[u8]) -> Result<ProjectionOutput, String> {
     Ok(ProjectionOutput::rows(invite_secret(
         event.bootstrap_hash,
         event.bootstrap_secret,
+        event.workspace_id,
+        event.invite_event_id,
     )))
 }
 
-pub fn invite_secret(bootstrap_hash: [u8; 32], private_key: [u8; 32]) -> Vec<TableRow> {
+pub fn invite_secret(
+    bootstrap_hash: [u8; 32],
+    private_key: [u8; 32],
+    workspace_id: Option<[u8; 32]>,
+    invite_event_id: Option<[u8; 32]>,
+) -> Vec<TableRow> {
     vec![TableRow {
         table: schema::INVITE_SECRETS,
         key: bootstrap_hash.to_vec(),
-        value: private_key.to_vec(),
+        value: schema::encode_invite_secret_row(private_key, workspace_id, invite_event_id),
     }]
 }
 
@@ -39,6 +46,14 @@ mod tests {
         assert_eq!(output.rows.len(), 1);
         assert_eq!(output.rows[0].table, schema::INVITE_SECRETS);
         assert_eq!(output.rows[0].key, event.bootstrap_hash);
-        assert_eq!(output.rows[0].value, event.bootstrap_secret);
+        assert_eq!(
+            schema::decode_invite_secret_row(&output.rows[0].value)
+                .expect("decode invite secret row"),
+            schema::InviteSecretRow {
+                bootstrap_secret: event.bootstrap_secret,
+                workspace_id: None,
+                invite_event_id: None,
+            }
+        );
     }
 }

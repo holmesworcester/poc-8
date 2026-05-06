@@ -63,6 +63,7 @@ pub fn schemas() -> Vec<Schema> {
     // The concrete protocol owns the full schema set. Core storage is generic;
     // it only receives these declarations during open.
     let mut schemas = event_modules::schemas();
+    schemas.extend_from_slice(crate::core::logical_clock::SCHEMAS);
     schemas.extend_from_slice(crate::workers::schema::SCHEMAS);
     schemas.extend_from_slice(network_queues::SCHEMAS);
     schemas

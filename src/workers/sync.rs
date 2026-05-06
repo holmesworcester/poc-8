@@ -562,12 +562,23 @@ fn response_connection_id(
     inbound_connection_id: connection::types::ConnectionId,
 ) -> Result<connection::types::ConnectionId, String> {
     let remote = connection::schema::remote_endpoint(store, inbound_connection_id)?;
+    let mut fallback = None;
     for connection_id in connection_ids_with_routes(store)? {
-        if connection::schema::remote_endpoint(store, connection_id)? == remote {
+        if connection::schema::remote_endpoint(store, connection_id)? != remote {
+            continue;
+        }
+        if fallback.is_none() {
+            fallback = Some(connection_id);
+        }
+        // Workspace invite bootstrap routes are often short-lived listener
+        // source addresses. Once both endpoints have steady-state membership,
+        // sync replies should prefer an unscoped daemon route to the same
+        // endpoint so old invite routes cannot black-hole responses.
+        if connection::schema::bootstrap_workspace_id(store, connection_id)?.is_none() {
             return Ok(connection_id);
         }
     }
-    Ok(inbound_connection_id)
+    Ok(fallback.unwrap_or(inbound_connection_id))
 }
 
 fn summarize_entries(entries: &[EventIndexEntry]) -> RangeSummary {
@@ -808,6 +819,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tick_prefers_steady_state_route_over_bootstrap_invite_route_for_responses() {
+        let store = Protocol::open_memory_store().expect("open store");
+        let protocol = Protocol::new();
+        let local = endpoint::commands::create_local_keypair().value;
+        let remote = endpoint::commands::create_local_keypair().value;
+        let inbound_connection_id = [1; 32];
+        let bootstrap_route_id = [2; 32];
+        let steady_route_id = [3; 32];
+
+        let workspace = workspace::commands::create(workspace::commands::CreateWorkspace {
+            created_at_ms: 1,
+            public_key: [9; 32],
+            name: "sync-route-choice".to_string(),
+        })
+        .expect("create workspace");
+        let workspace_id = workspace.value.workspace_id;
+        event_worker::run(&store, &protocol, workspace).expect("admit workspace");
+
+        let mut rows = endpoint::projector::local_endpoint(local);
+        rows.extend([
+            connection::schema::connection_row(inbound_connection_id, remote.endpoint),
+            connection::schema::connection_row(bootstrap_route_id, remote.endpoint),
+            connection::schema::connection_row(steady_route_id, remote.endpoint),
+            connection::schema::transport_target_row(
+                bootstrap_route_id,
+                "127.0.0.1:41000".parse().expect("bootstrap route addr"),
+            ),
+            connection::schema::transport_target_row(
+                steady_route_id,
+                "127.0.0.1:42000".parse().expect("steady route addr"),
+            ),
+            connection::schema::bootstrap_workspace_row(bootstrap_route_id, workspace_id),
+            endpoint_membership_row(workspace_id, local.endpoint, local.signing_public_key, 10),
+            endpoint_membership_row(workspace_id, remote.endpoint, remote.signing_public_key, 11),
+        ]);
+        store.insert_table_rows(rows).expect("insert sync context");
+
+        let compare = compare::types::CompareEvent {
+            connection_id: inbound_connection_id,
+            range: compare::types::TimestampRange::ROOT,
+            summary: compare::types::RangeSummary::default(),
+            response_requested: true,
+        };
+        let bytes = compare::codec::encode(&compare);
+        let record = compare::codec::inbound_record_from_wire(bytes).expect("inbound compare");
+        store
+            .insert_table_rows(vec![worker_schema::sync_in_event_row(
+                inbound_connection_id,
+                event_id(&record.canonical_bytes),
+                record.canonical_bytes,
+            )])
+            .expect("insert sync in");
+
+        let index = SyncIndex::default();
+        let output = run(
+            &store,
+            &index,
+            Work::DrainIn {
+                limit: DEFAULT_INBOUND_BATCH,
+            },
+        )
+        .expect("drain sync in");
+        let Output::DrainedIn(output) = output else {
+            panic!("expected sync drain output");
+        };
+
+        assert!(
+            !output.events.is_empty(),
+            "local summary should produce response events"
+        );
+        for event in output.events {
+            assert_eq!(
+                event.scope,
+                EventScope::Connection(ConnectionScope::Outgoing {
+                    connection_id: steady_route_id,
+                })
+            );
+        }
+    }
+
     fn routed_sync_store(
         local: endpoint::types::EndpointKeypair,
         remote: endpoint::types::EndpointKeypair,
@@ -846,6 +938,7 @@ mod tests {
                 user_authority_event_id: [seed.saturating_add(2); 32],
                 endpoint_id,
                 signing_public_key,
+                endpoint_role: endpoint::types::EndpointRole::Device,
                 device_name: format!("endpoint-{seed}"),
             },
         )
