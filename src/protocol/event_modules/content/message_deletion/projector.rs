@@ -13,6 +13,7 @@ use crate::protocol::event_modules::schema::EventLabel;
 use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput, TableDelete};
 
 use super::codec;
+use super::schema::purge_pending_row;
 use super::types::deletion_label;
 
 pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String> {
@@ -60,7 +61,13 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
         return Err("deletion author workspace does not match deletion".to_string());
     }
 
-    Ok(ProjectionOutput::deletes_and_labels(
+    // Mark the deletion target so the post-admission hook can drain the
+    // content purge worker once before this admission call returns. The label
+    // and exact row delete still carry the convergent semantic; the queue row
+    // is a memory-local trigger that lets a synchronous admission path replace
+    // the daemon's tick-based content_purge for forward-secrecy purposes.
+    let mut output = ProjectionOutput::rows(vec![purge_pending_row(deletion.target_message_id)]);
+    output.append(ProjectionOutput::deletes_and_labels(
         vec![TableDelete {
             table: message::schema::MESSAGES,
             key: message::schema::message_key(deletion.workspace_id, deletion.target_message_id),
@@ -69,7 +76,8 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
             event_id: deletion.target_message_id,
             label: deletion_label(&deletion.author_user_id),
         }],
-    ))
+    ));
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -182,7 +190,13 @@ mod tests {
         };
         let output = project(&event).expect("project deletion");
 
-        assert!(output.rows.is_empty());
+        assert_eq!(output.rows.len(), 1);
+        assert_eq!(
+            output.rows[0].table,
+            super::super::schema::CONTENT_PURGE_PENDING
+        );
+        assert_eq!(output.rows[0].key, target_id.to_vec());
+        assert!(output.rows[0].value.is_empty());
         assert_eq!(output.deletes.len(), 1);
         assert_eq!(output.deletes[0].table, message::schema::MESSAGES);
         assert_eq!(

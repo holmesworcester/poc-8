@@ -353,6 +353,24 @@ pub trait EventRegistry {
         store: &Store,
         event: &EventWithContext<'_>,
     ) -> Result<ProjectionOutput, String>;
+
+    /// Run any protocol-specific post-admission drains.
+    ///
+    /// Called by the common pipeline after any admission path finishes its
+    /// own `drain_until_idle`. Protocols may use this hook to fire bounded,
+    /// row-triggered worker drains so an in-process CLI admission path
+    /// reaches the same end state as a daemon tick before returning to the
+    /// caller. The default is a no-op so most protocols pay nothing for the
+    /// hook.
+    ///
+    /// The hook must be bounded and pure operational work: it observes
+    /// projector-emitted indicator rows and dispatches to a worker. It must
+    /// not invent new semantic events or branch on event type. The pipeline
+    /// is intentionally generic: it does not know which workers a protocol
+    /// might want to drain here.
+    fn post_admission_hook(&self, _store: &Store) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Unit of work accepted by the worker runner.
@@ -531,6 +549,9 @@ where
             }
         }
     }
+    if total.inserted_events > 0 || total.applied_events > 0 {
+        registry.post_admission_hook(store)?;
+    }
     Ok(total)
 }
 
@@ -587,7 +608,11 @@ pub(crate) fn drain_ready_events<R>(
 where
     R: EventRegistry,
 {
-    drain_ready(store, registry, limit)
+    let report = drain_ready(store, registry, limit)?;
+    if report.applied_events > 0 {
+        registry.post_admission_hook(store)?;
+    }
+    Ok(report)
 }
 
 pub(crate) fn drain_recently_valid_events(
@@ -665,6 +690,12 @@ where
         let value = self.output.value;
         let report = enqueue_and_drain(store, registry, self.output.events)?;
         let drained = drain_until_idle(store, registry, self.batch_size)?;
+        // Re-run the post-admission hook once after the post-drain since a
+        // dependent event may have only become Applied as the closure
+        // unblocked it. This keeps in-process CLI paths (delete-message,
+        // scripted batches, one-shot admission flows) at the same end state
+        // as a long-running daemon.
+        registry.post_admission_hook(store)?;
         let drained = ApplyReadyReport {
             applied_events: report.drained.applied_events + drained.applied_events,
             unblocked_events: report.drained.unblocked_events + drained.unblocked_events,
@@ -719,7 +750,11 @@ where
     type Output = ApplyReadyReport;
 
     fn execute(self, store: &Store, registry: &R) -> Result<Self::Output, String> {
-        drain_until_idle(store, registry, self.batch_size)
+        let report = drain_until_idle(store, registry, self.batch_size)?;
+        if report.applied_events > 0 {
+            registry.post_admission_hook(store)?;
+        }
+        Ok(report)
     }
 }
 
@@ -733,6 +768,9 @@ where
         let mut report = drain_ready(store, registry, self.batch_size)?;
         let unblock = drain_recently_valid_events(store, self.batch_size)?;
         report.unblocked_events += unblock.unblocked_events;
+        if report.applied_events > 0 {
+            registry.post_admission_hook(store)?;
+        }
         Ok(report)
     }
 }

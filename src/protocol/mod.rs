@@ -102,6 +102,10 @@ impl EventRegistry for Protocol {
     ) -> Result<ProjectionOutput, String> {
         self.modules.project_record(store, event)
     }
+
+    fn post_admission_hook(&self, store: &Store) -> Result<(), String> {
+        self.modules.post_admission_hook(store)
+    }
 }
 
 // Core daemon integration: the runner owns scheduling and lifecycle, while the

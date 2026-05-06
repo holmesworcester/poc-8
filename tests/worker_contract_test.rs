@@ -395,6 +395,148 @@ fn worker_never_surfaces_failed_projection_as_dependency_context() {
     );
 }
 
+#[test]
+fn admit_and_drain_calls_post_admission_hook_once_per_admission_run() {
+    // Property: every admission entry point asks the protocol's registry to
+    // run any bounded post-admission drains it owns. This is the contract
+    // that lets a deletion-fact admission trigger the content-purge worker
+    // inside the same admission call: without it, in-process callers would
+    // depend on a separate daemon tick for the purge to land on disk.
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Protocol::open_store(tmp.path().join("post-admit-hook.db")).unwrap();
+
+    let event_bytes = b"post-hook-event".to_vec();
+    let event_event_id = event_id(&event_bytes);
+    let registry = HookCountingRegistry {
+        event_id: event_event_id,
+        event_bytes: event_bytes.clone(),
+        hook_calls: Cell::new(0),
+    };
+
+    let proposed = registry.record_for(event_bytes).unwrap();
+    let report = worker::run(
+        &store,
+        &registry,
+        worker::AdmitAndDrain {
+            output: CommandOutput::with_events("done".to_string(), vec![proposed]),
+            batch_size: 16,
+        },
+    )
+    .expect("admit and drain");
+
+    assert_eq!(report.value, "done");
+    assert_eq!(report.admitted.applied_events, 1);
+    assert!(
+        registry.hook_calls.get() >= 1,
+        "post_admission_hook must fire when admission applies any event; saw {} calls",
+        registry.hook_calls.get()
+    );
+}
+
+#[test]
+fn event_admission_drain_calls_post_admission_hook_when_events_admit() {
+    // The daemon admission worker exposes `event_admission::run`, which
+    // drains queued canonical bytes. Bytes admitted through this path must
+    // also see the registry's post-admission hook so daemon-driven and
+    // CLI-driven flows reach the same end state. This proves a deletion
+    // event admitted from a sync round trip would still trigger
+    // content_purge inside the same admission step.
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Protocol::open_store(tmp.path().join("post-admit-hook-canonical-in.db")).unwrap();
+
+    let event_bytes = b"post-hook-canonical-in-event".to_vec();
+    let event_event_id = event_id(&event_bytes);
+    let registry = HookCountingRegistry {
+        event_id: event_event_id,
+        event_bytes: event_bytes.clone(),
+        hook_calls: Cell::new(0),
+    };
+
+    let proposed = registry.record_for(event_bytes).unwrap();
+    store
+        .insert_table_rows(vec![worker_schema::canonical_in_row(proposed, None)])
+        .expect("enqueue canonical in");
+
+    let report = event_admission::run(&store, &registry, event_admission::Work::Drain { limit: 1 })
+        .expect("admit queued event");
+    assert_eq!(report.applied_events, 1);
+    assert!(
+        registry.hook_calls.get() >= 1,
+        "event_admission::run must call post_admission_hook when admitting work; saw {} calls",
+        registry.hook_calls.get()
+    );
+}
+
+#[test]
+fn post_admission_hook_is_skipped_when_admission_finds_no_new_work() {
+    // A no-op admission (empty queue or duplicate) should not waste effort
+    // running protocol-defined drains. The hook is bounded but each call
+    // does at least one queue lookup, so the pipeline calls the hook only
+    // when something actually admitted.
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Protocol::open_store(tmp.path().join("post-admit-hook-noop.db")).unwrap();
+
+    let registry = HookCountingRegistry {
+        event_id: [0; 32],
+        event_bytes: Vec::new(),
+        hook_calls: Cell::new(0),
+    };
+
+    let report = event_admission::run(&store, &registry, event_admission::Work::Drain { limit: 4 })
+        .expect("drain empty canonical in");
+    assert_eq!(report.inserted_events, 0);
+    assert_eq!(report.applied_events, 0);
+    assert_eq!(
+        registry.hook_calls.get(),
+        0,
+        "no admission work should not trigger the post-admission hook"
+    );
+}
+
+struct HookCountingRegistry {
+    event_id: EventId,
+    event_bytes: Vec<u8>,
+    hook_calls: Cell<usize>,
+}
+
+impl HookCountingRegistry {
+    fn record_for(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
+        if bytes == self.event_bytes {
+            return Ok(EventRecord {
+                timestamp: 1,
+                body_len: bytes.len(),
+                canonical_bytes: bytes,
+                dependencies: Vec::new(),
+                workspace_id: None,
+                scope: EventScope::Shared,
+            });
+        }
+        Err("unknown hook-counting event".to_string())
+    }
+}
+
+impl EventRegistry for HookCountingRegistry {
+    fn record_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
+        self.record_for(bytes)
+    }
+
+    fn project_record(
+        &self,
+        _store: &Store,
+        event: &EventWithContext<'_>,
+    ) -> Result<ProjectionOutput, String> {
+        if event.context.event_id == self.event_id {
+            return Ok(ProjectionOutput::default());
+        }
+        Err("unknown hook-counting projection".to_string())
+    }
+
+    fn post_admission_hook(&self, _store: &Store) -> Result<(), String> {
+        self.hook_calls.set(self.hook_calls.get().saturating_add(1));
+        Ok(())
+    }
+}
+
 struct ContextRegistry {
     dep_id: EventId,
     child_id: EventId,

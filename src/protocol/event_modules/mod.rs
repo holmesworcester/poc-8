@@ -95,6 +95,7 @@ pub fn schemas() -> Vec<Schema> {
     out.extend_from_slice(identity::workspace::schema::SCHEMAS);
     out.extend_from_slice(content::content_event::schema::SCHEMAS);
     out.extend_from_slice(content::message::schema::SCHEMAS);
+    out.extend_from_slice(content::message_deletion::schema::SCHEMAS);
     out.extend_from_slice(content::reaction::schema::SCHEMAS);
     out.extend_from_slice(content::file::schema::SCHEMAS);
     out.extend_from_slice(content::file_slice::schema::SCHEMAS);
@@ -140,6 +141,14 @@ impl EventRegistry for Modules {
         event: &EventWithContext<'_>,
     ) -> Result<ProjectionOutput, String> {
         self.project_record(store, event)
+    }
+
+    fn post_admission_hook(&self, store: &Store) -> Result<(), String> {
+        // Bounded post-admission drains for this protocol live in the worker
+        // catalog. The catalog observes projector-emitted indicator rows and
+        // dispatches to the right worker, so this registry stays narrow: it
+        // does not branch on event type or own worker dispatch logic.
+        crate::workers::drain_post_admission_purge_pending(store)
     }
 }
 

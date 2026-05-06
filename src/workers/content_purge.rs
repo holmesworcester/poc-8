@@ -22,6 +22,8 @@ use crate::protocol::event_modules::types::EventId;
 use crate::workers::common::retention;
 use crate::workers::DaemonWorkerContext;
 
+use message_deletion::schema as message_deletion_schema;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Work {
     Drain { limit: usize },
@@ -95,6 +97,11 @@ fn drain_in_tx(store: &Store, limit: usize) -> Result<PurgeReport, String> {
             _ => {}
         }
     }
+    // The drain ran a full scan, so the purge_pending trigger queue is now
+    // satisfied for whatever projection wrote into it. Clearing it keeps the
+    // post-admission hook from looping on the same trigger forever.
+    message_deletion_schema::delete_all_purge_pending_in_tx(store)
+        .map_err(|err| format!("clear purge pending: {err}"))?;
     Ok(report)
 }
 
