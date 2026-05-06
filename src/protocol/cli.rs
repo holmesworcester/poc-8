@@ -47,6 +47,7 @@ pub fn commands() -> Vec<CliCommand<Context>> {
     out.extend(event_modules::content::message_deletion::cli::commands());
     out.extend(event_modules::content::file::cli::commands());
     out.extend(event_modules::content::cli::commands());
+    out.extend(event_modules::encryption::cli::commands());
     out.extend(event_modules::sync::cli::commands());
     out.extend(event_modules::test_events::event_with_deps::cli::commands());
     out.extend([

@@ -57,12 +57,12 @@ Expected module shape:
 ```text
 src/protocol/event_modules/encryption/
   mod.rs
-  schema.rs
+  cli.rs
   worker.rs
   recipient_key/
   local_recipient_key/
-  key_epoch/
-  local_epoch_secret/
+  removal_frontier/
+  local_key_secret/
   key_wrap/
   key_wrap_receipt/
   encrypted_message/          # or encrypted content leaf; exact shape TBD
@@ -80,12 +80,14 @@ Initial phase-one terms:
   the `endpoint_shared_id`.
 - `local_recipient_key`: a local-only private encryption key corresponding to a
   recipient key.
-- `key_epoch`: a shared workspace-scoped group/content epoch. Phase one creates
-  epochs for workspace creation and later removals. Removal is documented here
-  but should not be implemented before basic availability works.
-- `local_epoch_secret`: local-only symmetric secret material for one epoch.
-- `key_wrap`: a shared event carrying an encrypted epoch secret for one
-  recipient key.
+- `removal_frontier`: a shared workspace-scoped frontier event. The event id is
+  the `removal_frontier_id`; there is no separate frontier hash or key-period
+  term.
+- `local_key_secret`: local-only symmetric secret material for exactly one
+  `removal_frontier_id`. Its event id is the `local_key_secret_id` named by
+  wraps and later content events.
+- `key_wrap`: a shared event carrying sealed key-secret bytes for one
+  `recipient_key` and one `removal_frontier_id`.
 - `key_wrap_receipt`: a shared signed acknowledgement that an endpoint decrypted
   a key wrap. The receipt does not expose or depend on local secret material.
 - `encrypted_message`: a shared encrypted content event whose projection depends
@@ -110,10 +112,10 @@ encrypted_message record dependencies:
   workspace_id
   author user/admin/auth deps
   signer endpoint_shared_id
-  local_epoch_secret_event_id
+  local_key_secret_id
 ```
 
-If `local_epoch_secret_event_id` is absent, the common worker stores the event as
+If `local_key_secret_id` is absent, the common worker stores the event as
 Blocked. When a local-only event with that id is later admitted and projected,
 the common worker unblocks and reprojects the encrypted content.
 
@@ -134,7 +136,7 @@ key_wrap projects
 encryption worker sees:
   key_wrap row + local_recipient_key row
   -> decrypts with core crypto
-  -> command creates deterministic local_epoch_secret event
+  -> command creates deterministic local_key_secret event
   -> common worker admits local event
   -> blocked encrypted content unblocks normally
   -> command may create signed key_wrap_receipt event
@@ -144,12 +146,12 @@ encryption worker sees:
 For outbound availability:
 
 ```text
-key_epoch / recipient_key / key_wrap_receipt project
+removal_frontier / recipient_key / key_wrap_receipt project
   -> write public rows and labels
   -> write or refresh key_wrap_obligation rows
 
 encryption worker sees:
-  key_wrap_obligation + local_epoch_secret
+  key_wrap_obligation + local_key_secret
   -> command creates key_wrap event using real AEAD
   -> common worker admits shared key_wrap
 ```
@@ -169,13 +171,14 @@ Use real, reviewed constructions only:
 - domain-separated associated data for every encrypted event type
 - Ed25519 signatures for shared authority claims
 
-The older plan discussed deterministic key-wrap bytes. That is not the default
-implementation direction here. We should dedupe by deterministic semantic
-obligation keys such as `(epoch_id, recipient_key_id, node_prefix)`, while
-`key_wrap` ciphertext may use a random nonce. Projection can accept the first
-valid wrap for an obligation and ignore or reject conflicting duplicates by
-semantic key. Do not force deterministic encryption just to make event ids
-stable.
+The older plan discussed deterministic key-wrap bytes. That is not the current
+implementation direction. We dedupe by deterministic semantic keys such as
+`(workspace_id, removal_frontier_id, recipient_key_id)`, while `key_wrap`
+ciphertext uses a random nonce. Projection also writes a frontier-level
+`(workspace_id, removal_frontier_id) -> local_key_secret_id` commitment row so
+all wraps for one frontier agree on the same key-secret event id. Conflicting
+semantic duplicates are rejected by row conflict instead of forcing
+deterministic encryption just to make event ids stable.
 
 Required crypto tests:
 
@@ -192,7 +195,7 @@ Phase one proves encrypted key availability without history-tree puncturing.
 
 1. Add core symmetric AEAD helpers and tests.
 2. Add `recipient_key` and `local_recipient_key`.
-3. Add `key_epoch` and `local_epoch_secret`.
+3. Add `removal_frontier` and `local_key_secret`.
 4. Add `key_wrap` and `key_wrap_receipt`.
 5. Add the bounded encryption derivation worker.
 6. Add encrypted content for one narrow content type, likely message text.
@@ -203,8 +206,8 @@ Phase-one success criteria:
 - Replaying the same shared event set plus local secret events converges.
 - Missing local key material blocks encrypted content through the common worker.
 - Receiving a key wrap plus having a local recipient private key derives a local
-  epoch secret through normal event admission.
-- Receipt projection stops retry/projection for that epoch/recipient without
+  key secret through normal event admission.
+- Receipt projection stops retry/projection for that frontier/recipient without
   erasing the semantic receipt fact.
 - Restart after clearing memory work still derives pending key wraps from
   projected facts and local-only secret events.
@@ -224,7 +227,7 @@ Rules retained from the old plan:
   labels/summaries/retained-node commitments preserve the semantic facts.
 - New recipients receive only the retained nodes authorized by invite/grant
   policy.
-- Removed recipients are excluded from future epochs and future retained-node
+- Removed recipients are excluded from future frontiers and future retained-node
   wraps.
 
 ## Implementation Order
@@ -232,7 +235,7 @@ Rules retained from the old plan:
 1. Import this plan and keep rules honest.
 2. Add only real core crypto helpers needed for phase one.
 3. Add encryption module skeleton with one local-only secret event.
-4. Add recipient key and key epoch facts with pure projector tests.
+4. Add recipient key and removal frontier facts with pure projector tests.
 5. Add key wrap codec/commands/projector using real AEAD.
 6. Add derivation worker with bounded fuel and restart tests.
 7. Add encrypted message projection that blocks on a local key event.

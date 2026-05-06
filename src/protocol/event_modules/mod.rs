@@ -100,8 +100,11 @@ pub fn schemas() -> Vec<Schema> {
     out.extend_from_slice(content::reaction::schema::SCHEMAS);
     out.extend_from_slice(content::file::schema::SCHEMAS);
     out.extend_from_slice(content::file_slice::schema::SCHEMAS);
+    out.extend_from_slice(encryption::key_wrap::schema::SCHEMAS);
+    out.extend_from_slice(encryption::local_key_secret::schema::SCHEMAS);
     out.extend_from_slice(encryption::local_recipient_key::schema::SCHEMAS);
     out.extend_from_slice(encryption::recipient_key::schema::SCHEMAS);
+    out.extend_from_slice(encryption::removal_frontier::schema::SCHEMAS);
     out.extend_from_slice(connection::schema::SCHEMAS);
     out.extend_from_slice(sync::schema::SCHEMAS);
     out.extend_from_slice(test_events::event_with_deps::schema::SCHEMAS);
@@ -184,12 +187,23 @@ pub fn record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
         encryption::local_recipient_key::codec::TYPE_LOCAL_RECIPIENT_KEY => {
             encryption::record_from_bytes(bytes)
         }
+        encryption::local_key_secret::codec::TYPE_LOCAL_KEY_SECRET => {
+            encryption::record_from_bytes(bytes)
+        }
         encryption::recipient_key::codec::TYPE_RECIPIENT_KEY => {
             Err("recipient_key must be signed".to_string())
         }
         encryption::recipient_key::codec::TYPE_SIGNED_RECIPIENT_KEY => {
             encryption::record_from_bytes(bytes)
         }
+        encryption::removal_frontier::codec::TYPE_REMOVAL_FRONTIER => {
+            Err("removal_frontier must be signed".to_string())
+        }
+        encryption::removal_frontier::codec::TYPE_SIGNED_REMOVAL_FRONTIER => {
+            encryption::record_from_bytes(bytes)
+        }
+        encryption::key_wrap::codec::TYPE_KEY_WRAP => Err("key_wrap must be signed".to_string()),
+        encryption::key_wrap::codec::TYPE_SIGNED_KEY_WRAP => encryption::record_from_bytes(bytes),
         test_events::event_with_deps::codec::TYPE_EVENT_WITH_DEPS => {
             test_events::event_with_deps::codec::record_from_bytes(bytes)
         }
