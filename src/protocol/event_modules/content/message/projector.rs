@@ -64,13 +64,28 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
             .unwrap_or(false)
     });
     if is_deleted_by_author {
-        return Ok(ProjectionOutput::deletes(vec![TableDelete {
-            table: schema::MESSAGES,
-            key: schema::message_key(message.workspace_id, event.context.event_id),
-        }]));
+        let key = schema::message_key(message.workspace_id, event.context.event_id);
+        return Ok(ProjectionOutput {
+            rows: vec![schema::message_tombstone_row(
+                message.workspace_id,
+                event.context.event_id,
+                message.author_user_id,
+            )],
+            deletes: vec![
+                TableDelete {
+                    table: schema::MESSAGES,
+                    key: key.clone(),
+                },
+                TableDelete {
+                    table: schema::SEALED_MESSAGES,
+                    key,
+                },
+            ],
+            labels: Vec::new(),
+        });
     }
 
-    Ok(ProjectionOutput::rows(vec![schema::message_row(
+    Ok(ProjectionOutput::rows(vec![schema::sealed_message_row(
         event.context.event_id,
         envelope.signer_endpoint_shared_id,
         &message,
@@ -89,6 +104,12 @@ mod tests {
     use super::*;
 
     type Record = crate::protocol::event_modules::types::EventRecord;
+    const KEY_SECRET: [u8; 32] = [77; 32];
+
+    struct BuiltMessage {
+        record: Record,
+        message_id: [u8; 32],
+    }
 
     fn signing_public_key_for(private_key: &[u8; 32]) -> [u8; 32] {
         codec::sign([0; 32], private_key, vec![codec::TYPE_MESSAGE]).signer_public_key
@@ -134,32 +155,37 @@ mod tests {
         author_user_id: [u8; 32],
         signer_private_key: &[u8; 32],
         signer_endpoint_shared_id: [u8; 32],
-    ) -> (Record, [u8; 32]) {
-        let payload = codec::encode(&MessageEvent {
+    ) -> BuiltMessage {
+        let output = super::super::commands::send(super::super::commands::SendMessage {
             workspace_id,
             created_at_ms: 5,
             author_user_id,
+            signer_endpoint_shared_id,
+            signer_private_key: *signer_private_key,
+            removal_frontier_id: [30; 32],
+            local_key_secret_id: [31; 32],
+            key_secret: KEY_SECRET,
             text: "hello".to_string(),
         })
-        .expect("encode message");
-        let envelope = codec::sign(signer_endpoint_shared_id, signer_private_key, payload);
-        let bytes = codec::encode_signed(&envelope);
-        let id = event_id(&bytes);
-        (codec::signed_record_from_bytes(bytes).expect("record"), id)
+        .expect("send");
+        let record = output.events[0].record().clone();
+        BuiltMessage {
+            record,
+            message_id: output.value.message_id,
+        }
     }
 
     fn context_for<'a>(
-        record: &'a Record,
-        message_id: [u8; 32],
+        built: &'a BuiltMessage,
         signer_id: [u8; 32],
         signer_record: Record,
         author_id: [u8; 32],
         author_record: Record,
     ) -> EventWithContext<'a> {
         EventWithContext {
-            record,
+            record: &built.record,
             context: EventContext {
-                event_id: message_id,
+                event_id: built.message_id,
                 dependencies: vec![
                     DependencyContext {
                         event_id: signer_id,
@@ -186,26 +212,18 @@ mod tests {
         let signer_record = endpoint_shared_record(workspace_id, author_id, signer_pubkey);
         let signer_id = event_id(&signer_record.canonical_bytes);
 
-        let (record, message_id) = build(workspace_id, author_id, &signer_private_key, signer_id);
-        let event = context_for(
-            &record,
-            message_id,
-            signer_id,
-            signer_record,
-            author_id,
-            author_record,
-        );
+        let built = build(workspace_id, author_id, &signer_private_key, signer_id);
+        let event = context_for(&built, signer_id, signer_record, author_id, author_record);
 
         let output = project(&event).expect("project message");
         assert_eq!(output.rows.len(), 1);
-        assert_eq!(output.rows[0].table, schema::MESSAGES);
-        let row = schema::decode_message_row(&output.rows[0].key, &output.rows[0].value)
-            .expect("decode row");
+        assert_eq!(output.rows[0].table, schema::SEALED_MESSAGES);
+        let row = schema::decode_sealed_message_row(&output.rows[0].key, &output.rows[0].value)
+            .expect("decode sealed row");
         assert_eq!(row.workspace_id, workspace_id);
-        assert_eq!(row.message_id, message_id);
+        assert_eq!(row.message_id, built.message_id);
         assert_eq!(row.author_user_id, author_id);
         assert_eq!(row.signer_endpoint_shared_id, signer_id);
-        assert_eq!(row.text, "hello");
     }
 
     #[test]
@@ -218,17 +236,9 @@ mod tests {
         let signer_record = endpoint_shared_record(workspace_id, author_id, signer_pubkey);
         let signer_id = event_id(&signer_record.canonical_bytes);
 
-        let (mut record, message_id) =
-            build(workspace_id, author_id, &signer_private_key, signer_id);
-        record.workspace_id = Some([8; 32]);
-        let event = context_for(
-            &record,
-            message_id,
-            signer_id,
-            signer_record,
-            author_id,
-            author_record,
-        );
+        let mut built = build(workspace_id, author_id, &signer_private_key, signer_id);
+        built.record.workspace_id = Some([8; 32]);
+        let event = context_for(&built, signer_id, signer_record, author_id, author_record);
 
         assert_eq!(
             project(&event).expect_err("workspace mismatch must fail"),
@@ -247,15 +257,8 @@ mod tests {
         let signer_record = endpoint_shared_record(other_workspace_id, author_id, signer_pubkey);
         let signer_id = event_id(&signer_record.canonical_bytes);
 
-        let (record, message_id) = build(workspace_id, author_id, &signer_private_key, signer_id);
-        let event = context_for(
-            &record,
-            message_id,
-            signer_id,
-            signer_record,
-            author_id,
-            author_record,
-        );
+        let built = build(workspace_id, author_id, &signer_private_key, signer_id);
+        let event = context_for(&built, signer_id, signer_record, author_id, author_record);
 
         assert_eq!(
             project(&event).expect_err("workspace mismatch must fail"),
@@ -273,15 +276,8 @@ mod tests {
         let signer_record = endpoint_shared_record(workspace_id, author_id, other_pubkey);
         let signer_id = event_id(&signer_record.canonical_bytes);
 
-        let (record, message_id) = build(workspace_id, author_id, &signer_private_key, signer_id);
-        let event = context_for(
-            &record,
-            message_id,
-            signer_id,
-            signer_record,
-            author_id,
-            author_record,
-        );
+        let built = build(workspace_id, author_id, &signer_private_key, signer_id);
+        let event = context_for(&built, signer_id, signer_record, author_id, author_record);
 
         assert_eq!(
             project(&event).expect_err("pubkey mismatch must fail"),
@@ -300,15 +296,8 @@ mod tests {
         let signer_record = endpoint_shared_record(workspace_id, other_user_id, signer_pubkey);
         let signer_id = event_id(&signer_record.canonical_bytes);
 
-        let (record, message_id) = build(workspace_id, author_id, &signer_private_key, signer_id);
-        let event = context_for(
-            &record,
-            message_id,
-            signer_id,
-            signer_record,
-            author_id,
-            author_record,
-        );
+        let built = build(workspace_id, author_id, &signer_private_key, signer_id);
+        let event = context_for(&built, signer_id, signer_record, author_id, author_record);
 
         assert_eq!(
             project(&event).expect_err("author mismatch must fail"),
@@ -328,25 +317,24 @@ mod tests {
         let signer_record = endpoint_shared_record(workspace_id, author_id, signer_pubkey);
         let signer_id = event_id(&signer_record.canonical_bytes);
 
-        let (record, message_id) = build(workspace_id, author_id, &signer_private_key, signer_id);
-        let mut event = context_for(
-            &record,
-            message_id,
-            signer_id,
-            signer_record,
-            author_id,
-            author_record,
-        );
+        let built = build(workspace_id, author_id, &signer_private_key, signer_id);
+        let mut event = context_for(&built, signer_id, signer_record, author_id, author_record);
         event.context.labels.push(deletion_label(&author_id));
 
         let output = project(&event).expect("project deleted message");
-        assert!(output.rows.is_empty());
+        assert_eq!(output.rows.len(), 1);
+        assert_eq!(output.rows[0].table, schema::MESSAGE_TOMBSTONES);
         assert!(output.labels.is_empty());
-        assert_eq!(output.deletes.len(), 1);
+        assert_eq!(output.deletes.len(), 2);
         assert_eq!(output.deletes[0].table, schema::MESSAGES);
         assert_eq!(
             output.deletes[0].key,
-            schema::message_key(workspace_id, message_id)
+            schema::message_key(workspace_id, built.message_id)
+        );
+        assert_eq!(output.deletes[1].table, schema::SEALED_MESSAGES);
+        assert_eq!(
+            output.deletes[1].key,
+            schema::message_key(workspace_id, built.message_id)
         );
     }
 
@@ -362,15 +350,8 @@ mod tests {
         let signer_record = endpoint_shared_record(workspace_id, author_id, signer_pubkey);
         let signer_id = event_id(&signer_record.canonical_bytes);
 
-        let (record, message_id) = build(workspace_id, author_id, &signer_private_key, signer_id);
-        let mut event = context_for(
-            &record,
-            message_id,
-            signer_id,
-            signer_record,
-            author_id,
-            author_record,
-        );
+        let built = build(workspace_id, author_id, &signer_private_key, signer_id);
+        let mut event = context_for(&built, signer_id, signer_record, author_id, author_record);
         event.context.labels.push(deletion_label(&[42; 32]));
 
         let output = project(&event).expect("project not-by-author label");
@@ -384,9 +365,11 @@ mod tests {
             workspace_id: [7; 32],
             created_at_ms: 5,
             author_user_id: [2; 32],
-            text: "hello".to_string(),
-        })
-        .expect("encode message");
+            removal_frontier_id: [3; 32],
+            local_key_secret_id: [4; 32],
+            nonce: [5; 24],
+            ciphertext: [6; super::super::types::MESSAGE_CIPHERTEXT_BYTES],
+        });
 
         assert_eq!(
             crate::protocol::event_modules::record_from_bytes(payload)

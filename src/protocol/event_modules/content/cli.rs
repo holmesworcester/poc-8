@@ -15,6 +15,7 @@ use crate::protocol::event_modules::content::{file, file_slice, message};
 use crate::protocol::event_modules::identity::endpoint;
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker::{self, CommandOutput, ProposedEvent};
+use crate::workers::content_decrypt;
 
 const SEND_FILE_USAGE: &str = "send-file WORKSPACE_ID_HEX TEXT --file PATH [--mime MIME]";
 
@@ -91,6 +92,7 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
 
     let starting_timestamp = message::cli::next_timestamp(&context.store, parsed.workspace_id)?;
     let mut timestamp = starting_timestamp;
+    let content_key = message::cli::require_content_key(&context.store, parsed.workspace_id)?;
 
     let send = message::commands::send(message::commands::SendMessage {
         workspace_id: parsed.workspace_id,
@@ -98,6 +100,9 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
         author_user_id: membership.user_authority_event_id,
         signer_endpoint_shared_id: membership.endpoint_shared_id,
         signer_private_key: local.signing_secret,
+        removal_frontier_id: content_key.removal_frontier_id,
+        local_key_secret_id: content_key.local_key_secret_id,
+        key_secret: content_key.key_secret,
         text: parsed.text,
     })?;
     let message_id = send.value.message_id;
@@ -173,6 +178,12 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
     if report.admitted.inserted_events == 0 {
         return Err("send-file bundle was not admitted".to_string());
     }
+    content_decrypt::run(
+        &context.store,
+        content_decrypt::Work::Drain {
+            limit: worker::DEFAULT_READY_BATCH,
+        },
+    )?;
     Ok(CliOutput::lines(report.value.lines()))
 }
 

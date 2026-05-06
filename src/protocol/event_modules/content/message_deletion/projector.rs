@@ -61,10 +61,22 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
     }
 
     Ok(ProjectionOutput::deletes_and_labels(
-        vec![TableDelete {
-            table: message::schema::MESSAGES,
-            key: message::schema::message_key(deletion.workspace_id, deletion.target_message_id),
-        }],
+        vec![
+            TableDelete {
+                table: message::schema::MESSAGES,
+                key: message::schema::message_key(
+                    deletion.workspace_id,
+                    deletion.target_message_id,
+                ),
+            },
+            TableDelete {
+                table: message::schema::SEALED_MESSAGES,
+                key: message::schema::message_key(
+                    deletion.workspace_id,
+                    deletion.target_message_id,
+                ),
+            },
+        ],
         vec![EventLabel {
             event_id: deletion.target_message_id,
             label: deletion_label(&deletion.author_user_id),
@@ -183,10 +195,15 @@ mod tests {
         let output = project(&event).expect("project deletion");
 
         assert!(output.rows.is_empty());
-        assert_eq!(output.deletes.len(), 1);
+        assert_eq!(output.deletes.len(), 2);
         assert_eq!(output.deletes[0].table, message::schema::MESSAGES);
         assert_eq!(
             output.deletes[0].key,
+            message::schema::message_key(workspace_id, target_id)
+        );
+        assert_eq!(output.deletes[1].table, message::schema::SEALED_MESSAGES);
+        assert_eq!(
+            output.deletes[1].key,
             message::schema::message_key(workspace_id, target_id)
         );
         assert_eq!(output.labels.len(), 1);

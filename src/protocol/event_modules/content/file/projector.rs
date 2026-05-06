@@ -133,9 +133,11 @@ mod tests {
             workspace_id,
             created_at_ms: 1,
             author_user_id,
-            text: "see attached".to_string(),
-        })
-        .expect("encode message");
+            removal_frontier_id: [30; 32],
+            local_key_secret_id: [31; 32],
+            nonce: [32; 24],
+            ciphertext: [33; message::types::MESSAGE_CIPHERTEXT_BYTES],
+        });
         let envelope = message::codec::sign([42; 32], &[43; 32], payload);
         let bytes = message::codec::encode_signed(&envelope);
         message::codec::signed_record_from_bytes(bytes).expect("record")

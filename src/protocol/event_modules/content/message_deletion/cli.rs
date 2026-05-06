@@ -6,6 +6,7 @@ use crate::protocol::event_modules::content::message;
 use crate::protocol::event_modules::identity::endpoint;
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker;
+use crate::workers::content_purge;
 
 use super::commands;
 
@@ -70,6 +71,12 @@ fn run_delete_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOut
     if report.admitted.inserted_events == 0 {
         return Err("deletion was not admitted".to_string());
     }
+    content_purge::run(
+        &context.store,
+        content_purge::Work::Drain {
+            limit: worker::DEFAULT_READY_BATCH,
+        },
+    )?;
     Ok(CliOutput::lines(
         DeleteSummary {
             event_id: report.value.deletion_id,

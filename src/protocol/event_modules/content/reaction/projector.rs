@@ -68,7 +68,7 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
         return Err("reaction target message workspace does not match reaction".to_string());
     }
 
-    Ok(ProjectionOutput::rows(vec![schema::reaction_row(
+    Ok(ProjectionOutput::rows(vec![schema::sealed_reaction_row(
         event.context.event_id,
         envelope.signer_endpoint_shared_id,
         &reaction,
@@ -88,6 +88,12 @@ mod tests {
     use super::*;
 
     type Record = crate::protocol::event_modules::types::EventRecord;
+    const KEY_SECRET: [u8; 32] = [77; 32];
+
+    struct BuiltReaction {
+        record: Record,
+        reaction_id: [u8; 32],
+    }
 
     fn signing_public_key_for(private_key: &[u8; 32]) -> [u8; 32] {
         codec::sign([0; 32], private_key, vec![codec::TYPE_REACTION]).signer_public_key
@@ -133,43 +139,55 @@ mod tests {
             workspace_id,
             created_at_ms: 1,
             author_user_id,
-            text: "hello".to_string(),
-        })
-        .expect("encode message");
+            removal_frontier_id: [30; 32],
+            local_key_secret_id: [31; 32],
+            nonce: [32; 24],
+            ciphertext: [33; message::types::MESSAGE_CIPHERTEXT_BYTES],
+        });
         let envelope = message::codec::sign([42; 32], &[43; 32], payload);
         let bytes = message::codec::encode_signed(&envelope);
         message::codec::signed_record_from_bytes(bytes).expect("record")
     }
 
-    #[test]
-    fn projects_one_reaction_row() {
-        let workspace_id = [7; 32];
-        let signer_private_key = [9; 32];
-        let signer_pubkey = signing_public_key_for(&signer_private_key);
-        let author_record = user_record(workspace_id);
-        let author_id = event_id(&author_record.canonical_bytes);
-        let signer_record = endpoint_shared_record(workspace_id, author_id, signer_pubkey);
-        let signer_id = event_id(&signer_record.canonical_bytes);
-        let target_record = target_message_record(workspace_id, author_id);
-        let target_id = event_id(&target_record.canonical_bytes);
-
-        let payload = codec::encode(&ReactionEvent {
+    fn build_reaction(
+        workspace_id: [u8; 32],
+        target_id: [u8; 32],
+        author_id: [u8; 32],
+        signer_id: [u8; 32],
+        signer_private_key: [u8; 32],
+    ) -> BuiltReaction {
+        let output = super::super::commands::post(super::super::commands::PostReaction {
             workspace_id,
             created_at_ms: 5,
             target_message_id: target_id,
             author_user_id: author_id,
+            signer_endpoint_shared_id: signer_id,
+            signer_private_key,
+            removal_frontier_id: [34; 32],
+            local_key_secret_id: [35; 32],
+            key_secret: KEY_SECRET,
             emoji: "🔥".to_string(),
         })
-        .expect("encode");
-        let envelope = codec::sign(signer_id, &signer_private_key, payload);
-        let bytes = codec::encode_signed(&envelope);
-        let reaction_id = event_id(&bytes);
-        let record = codec::signed_record_from_bytes(bytes).expect("record");
+        .expect("post reaction");
+        BuiltReaction {
+            record: output.events[0].record().clone(),
+            reaction_id: output.value.reaction_id,
+        }
+    }
 
-        let event = EventWithContext {
-            record: &record,
+    fn event_with_context<'a>(
+        built: &'a BuiltReaction,
+        signer_id: [u8; 32],
+        signer_record: Record,
+        author_id: [u8; 32],
+        author_record: Record,
+        target_id: [u8; 32],
+        target_record: Record,
+    ) -> EventWithContext<'a> {
+        EventWithContext {
+            record: &built.record,
             context: EventContext {
-                event_id: reaction_id,
+                event_id: built.reaction_id,
                 dependencies: vec![
                     DependencyContext {
                         event_id: signer_id,
@@ -187,18 +205,47 @@ mod tests {
                 labels: Vec::new(),
                 receive: None,
             },
-        };
+        }
+    }
+
+    #[test]
+    fn projects_one_reaction_row() {
+        let workspace_id = [7; 32];
+        let signer_private_key = [9; 32];
+        let signer_pubkey = signing_public_key_for(&signer_private_key);
+        let author_record = user_record(workspace_id);
+        let author_id = event_id(&author_record.canonical_bytes);
+        let signer_record = endpoint_shared_record(workspace_id, author_id, signer_pubkey);
+        let signer_id = event_id(&signer_record.canonical_bytes);
+        let target_record = target_message_record(workspace_id, author_id);
+        let target_id = event_id(&target_record.canonical_bytes);
+        let built = build_reaction(
+            workspace_id,
+            target_id,
+            author_id,
+            signer_id,
+            signer_private_key,
+        );
+
+        let event = event_with_context(
+            &built,
+            signer_id,
+            signer_record,
+            author_id,
+            author_record,
+            target_id,
+            target_record,
+        );
         let output = project(&event).expect("project reaction");
 
         assert_eq!(output.rows.len(), 1);
-        assert_eq!(output.rows[0].table, schema::REACTIONS);
-        let row = schema::decode_reaction_row(&output.rows[0].key, &output.rows[0].value)
-            .expect("decode row");
+        assert_eq!(output.rows[0].table, schema::SEALED_REACTIONS);
+        let row = schema::decode_sealed_reaction_row(&output.rows[0].key, &output.rows[0].value)
+            .expect("decode sealed row");
         assert_eq!(row.workspace_id, workspace_id);
-        assert_eq!(row.reaction_id, reaction_id);
+        assert_eq!(row.reaction_id, built.reaction_id);
         assert_eq!(row.target_message_id, target_id);
         assert_eq!(row.author_user_id, author_id);
-        assert_eq!(row.emoji, "🔥");
     }
 
     #[test]
@@ -214,41 +261,22 @@ mod tests {
         let target_record = target_message_record(other_workspace, author_id);
         let target_id = event_id(&target_record.canonical_bytes);
 
-        let payload = codec::encode(&ReactionEvent {
+        let built = build_reaction(
             workspace_id,
-            created_at_ms: 5,
-            target_message_id: target_id,
-            author_user_id: author_id,
-            emoji: "🔥".to_string(),
-        })
-        .expect("encode");
-        let envelope = codec::sign(signer_id, &signer_private_key, payload);
-        let bytes = codec::encode_signed(&envelope);
-        let reaction_id = event_id(&bytes);
-        let record = codec::signed_record_from_bytes(bytes).expect("record");
-
-        let event = EventWithContext {
-            record: &record,
-            context: EventContext {
-                event_id: reaction_id,
-                dependencies: vec![
-                    DependencyContext {
-                        event_id: signer_id,
-                        record: signer_record,
-                    },
-                    DependencyContext {
-                        event_id: author_id,
-                        record: author_record,
-                    },
-                    DependencyContext {
-                        event_id: target_id,
-                        record: target_record,
-                    },
-                ],
-                labels: Vec::new(),
-                receive: None,
-            },
-        };
+            target_id,
+            author_id,
+            signer_id,
+            signer_private_key,
+        );
+        let event = event_with_context(
+            &built,
+            signer_id,
+            signer_record,
+            author_id,
+            author_record,
+            target_id,
+            target_record,
+        );
 
         assert_eq!(
             project(&event).expect_err("workspace mismatch must fail"),
@@ -259,20 +287,23 @@ mod tests {
     #[test]
     fn record_exposes_signer_workspace_author_target_dependencies() {
         let workspace_id = [7; 32];
-        let payload = codec::encode(&ReactionEvent {
+        let event = ReactionEvent {
             workspace_id,
             created_at_ms: 5,
             target_message_id: [10; 32],
             author_user_id: [11; 32],
-            emoji: "🔥".to_string(),
-        })
-        .expect("encode");
+            removal_frontier_id: [14; 32],
+            local_key_secret_id: [15; 32],
+            nonce: [16; 24],
+            ciphertext: [17; super::super::types::REACTION_CIPHERTEXT_BYTES],
+        };
+        let payload = codec::encode(&event);
         let envelope = codec::sign([12; 32], &[13; 32], payload);
         let bytes = codec::encode_signed(&envelope);
         let record = codec::signed_record_from_bytes(bytes).expect("record");
         assert_eq!(
             record.dependencies,
-            vec![[12; 32], [7; 32], [11; 32], [10; 32]]
+            vec![[12; 32], [7; 32], [11; 32], [10; 32], [14; 32], [15; 32]]
         );
         assert_eq!(record.scope, EventScope::Shared);
     }
@@ -284,9 +315,11 @@ mod tests {
             created_at_ms: 5,
             target_message_id: [2; 32],
             author_user_id: [3; 32],
-            emoji: "🔥".to_string(),
-        })
-        .expect("encode");
+            removal_frontier_id: [4; 32],
+            local_key_secret_id: [5; 32],
+            nonce: [6; 24],
+            ciphertext: [7; super::super::types::REACTION_CIPHERTEXT_BYTES],
+        });
 
         assert_eq!(
             crate::protocol::event_modules::record_from_bytes(payload)

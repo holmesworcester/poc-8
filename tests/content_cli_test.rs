@@ -21,6 +21,7 @@ fn cli_send_then_messages_lists_authored_messages() {
     let tmp = tempfile::tempdir().unwrap();
     let db = temp_db(&tmp, "alice.db");
     let workspace_id = create_workspace(&db, "Content", "alice", "alice-laptop");
+    assert_success(topo(&["--db", &db, "key-frontier", &workspace_id]));
 
     let send1 = assert_success(topo(&["--db", &db, "send", &workspace_id, "first message"]));
     assert!(send1.contains("text: first message"), "{send1}");
@@ -45,6 +46,7 @@ fn cli_react_appears_in_messages_listing() {
     let tmp = tempfile::tempdir().unwrap();
     let db = temp_db(&tmp, "alice.db");
     let workspace_id = create_workspace(&db, "Content", "alice", "alice-laptop");
+    assert_success(topo(&["--db", &db, "key-frontier", &workspace_id]));
 
     assert_success(topo(&["--db", &db, "send", &workspace_id, "hello"]));
     let react = assert_success(topo(&["--db", &db, "react", &workspace_id, "#1", "+1"]));
@@ -59,6 +61,7 @@ fn cli_delete_message_purges_target_from_listing() {
     let tmp = tempfile::tempdir().unwrap();
     let db = temp_db(&tmp, "alice.db");
     let workspace_id = create_workspace(&db, "Content", "alice", "alice-laptop");
+    assert_success(topo(&["--db", &db, "key-frontier", &workspace_id]));
 
     assert_success(topo(&["--db", &db, "send", &workspace_id, "regret"]));
     assert_success(topo(&["--db", &db, "react", &workspace_id, "#1", "ack"]));
@@ -80,6 +83,7 @@ fn cli_send_file_then_save_file_round_trips_bytes_through_real_binary() {
     let tmp = tempfile::tempdir().unwrap();
     let db = temp_db(&tmp, "alice.db");
     let workspace_id = create_workspace(&db, "Content", "alice", "alice-laptop");
+    assert_success(topo(&["--db", &db, "key-frontier", &workspace_id]));
 
     let payload: Vec<u8> = (0..8192u32).map(|byte| byte as u8).collect();
     let in_path = tmp.path().join("input.bin");
@@ -159,6 +163,7 @@ fn cli_messages_and_reactions_sync_between_two_peers() {
     let _alice_daemon = spawn_daemon(&alice, alice_port);
     let _bob_daemon = spawn_daemon(&bob, bob_port);
     connect_daemon_pair(&alice, alice_port, &bob, bob_port);
+    grant_content_key_to_peer(&alice, &bob, &workspace_id);
 
     assert_success(topo(&["--db", &alice, "send", &workspace_id, "from alice"]));
     assert_success(topo(&[
@@ -192,6 +197,7 @@ fn cli_send_file_syncs_bytes_to_peer_for_save() {
     let _alice_daemon = spawn_daemon(&alice, alice_port);
     let _bob_daemon = spawn_daemon(&bob, bob_port);
     connect_daemon_pair(&alice, alice_port, &bob, bob_port);
+    grant_content_key_to_peer(&alice, &bob, &workspace_id);
 
     let payload: Vec<u8> = (0..4096u32).map(|byte| byte as u8).collect();
     let in_path = tmp.path().join("payload.bin");
@@ -456,6 +462,60 @@ fn connect_with_retry(db: &str, invite: &str) -> String {
         thread::sleep(Duration::from_millis(50));
     }
     panic!("connect never succeeded: {last}");
+}
+
+fn grant_content_key_to_peer(alice: &str, peer: &str, workspace_id: &str) {
+    let recipient = assert_success(topo(&["--db", peer, "key-recipient", workspace_id]));
+    let recipient_key_id = line_value(&recipient, "recipient_key_id");
+    let frontier = assert_success(topo(&["--db", alice, "key-frontier", workspace_id]));
+    let removal_frontier_id = line_value(&frontier, "removal_frontier_id");
+    let wrapped = key_wrap_with_retry(alice, workspace_id, &removal_frontier_id, &recipient_key_id);
+    assert_eq!(line_value(&wrapped, "recipient_key_id"), recipient_key_id);
+    let derived = wait_for_key_derive(peer, "1");
+    assert_eq!(line_value(&derived, "derived_key_secrets"), "1");
+}
+
+fn key_wrap_with_retry(
+    db: &str,
+    workspace_id: &str,
+    removal_frontier_id: &str,
+    recipient_key_id: &str,
+) -> String {
+    let mut last = String::new();
+    for _ in 0..300 {
+        let output = topo(&[
+            "--db",
+            db,
+            "key-wrap",
+            workspace_id,
+            removal_frontier_id,
+            recipient_key_id,
+        ]);
+        if output.status.success() {
+            return stdout(&output);
+        }
+        last = stderr(&output);
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("key-wrap never succeeded: {last}");
+}
+
+fn wait_for_key_derive(db: &str, expected: &str) -> String {
+    let mut last = String::new();
+    for _ in 0..300 {
+        let output = topo(&["--db", db, "key-derive"]);
+        if output.status.success() {
+            let out = stdout(&output);
+            if line_value(&out, "derived_key_secrets") == expected {
+                return out;
+            }
+            last = out;
+        } else {
+            last = stderr(&output);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("key derive did not reach {expected}: {last}");
 }
 
 fn invite_link_from_output(output: &str) -> String {

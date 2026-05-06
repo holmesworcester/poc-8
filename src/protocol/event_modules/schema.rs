@@ -289,6 +289,42 @@ pub fn event_bytes(store: &Store, event_id: &EventId) -> rusqlite::Result<Option
     read_event(store, event_id).map(|event| event.map(|event| event.canonical_bytes))
 }
 
+pub fn purge_event(store: &Store, event_id: &EventId) -> rusqlite::Result<bool> {
+    let Some(event) = read_event(store, event_id)? else {
+        return Ok(false);
+    };
+
+    let mut deleted_any = false;
+    if event.status == EventStatus::Ready {
+        deleted_any |= store
+            .delete_table_rows_in_tx(READY_EVENTS, vec![ready_key(event.timestamp, event_id)])?
+            > 0;
+    }
+    if event.scope.is_shared() {
+        deleted_any |= store.delete_table_rows_in_tx(
+            TIMESTAMP_EVENTS,
+            vec![timestamp_key(event.timestamp, event_id)],
+        )? > 0;
+    }
+
+    let missing_edges = store.table_rows_with_key_prefix(
+        MISSING_DEPS_BY_BLOCKED_EVENT,
+        event_id,
+        MAX_DEPENDENCY_ROWS_PER_EVENT,
+    )?;
+    let mut reverse_keys = Vec::with_capacity(missing_edges.len());
+    let mut forward_keys = Vec::with_capacity(missing_edges.len());
+    for (key, _) in missing_edges {
+        let (blocked_event_id, missing_dep_id) = split_edge_key(&key)?;
+        reverse_keys.push(key);
+        forward_keys.push(edge_key(&missing_dep_id, &blocked_event_id));
+    }
+    deleted_any |= store.delete_table_rows_in_tx(MISSING_DEPS_BY_BLOCKED_EVENT, reverse_keys)? > 0;
+    deleted_any |= store.delete_table_rows_in_tx(BLOCKED_EVENTS_BY_MISSING_DEP, forward_keys)? > 0;
+    deleted_any |= store.delete_table_rows_in_tx(EVENTS, vec![event_id.to_vec()])? > 0;
+    Ok(deleted_any)
+}
+
 pub fn event_label_rows(labels: Vec<EventLabel>) -> Vec<TableRow> {
     labels
         .into_iter()

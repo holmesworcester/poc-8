@@ -10,10 +10,12 @@ use crate::core::store::Store;
 use crate::protocol::cli::Context;
 use crate::protocol::clock;
 use crate::protocol::event_modules::content::message_deletion::types::deletion_label_author;
+use crate::protocol::event_modules::encryption::{local_key_secret, removal_frontier};
 use crate::protocol::event_modules::identity::{endpoint, endpoint_shared, user};
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker;
+use crate::workers::content_decrypt;
 
 use super::{commands, schema};
 
@@ -94,12 +96,16 @@ fn run_send_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
     }
 
     let timestamp = next_timestamp(&context.store, workspace_id)?;
+    let content_key = require_content_key(&context.store, workspace_id)?;
     let send = commands::send(commands::SendMessage {
         workspace_id,
         created_at_ms: timestamp,
         author_user_id: membership.user_authority_event_id,
         signer_endpoint_shared_id: membership.endpoint_shared_id,
         signer_private_key: local.signing_secret,
+        removal_frontier_id: content_key.removal_frontier_id,
+        local_key_secret_id: content_key.local_key_secret_id,
+        key_secret: content_key.key_secret,
         text,
     })?;
     let report = worker::run(
@@ -114,6 +120,12 @@ fn run_send_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
     if report.admitted.inserted_events == 0 {
         return Err("message was not admitted".to_string());
     }
+    content_decrypt::run(
+        &context.store,
+        content_decrypt::Work::Drain {
+            limit: worker::DEFAULT_READY_BATCH,
+        },
+    )?;
     Ok(CliOutput::lines(
         SendSummary {
             event_id: report.value.message_id,
@@ -258,6 +270,40 @@ pub(crate) fn require_membership(
         return Err("local endpoint signing key does not match workspace membership".to_string());
     }
     Ok(row)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContentKey {
+    pub removal_frontier_id: EventId,
+    pub local_key_secret_id: EventId,
+    pub key_secret: local_key_secret::types::KeySecret,
+}
+
+pub(crate) fn require_content_key(
+    store: &Store,
+    workspace_id: EventId,
+) -> Result<ContentKey, String> {
+    let mut candidates = Vec::new();
+    for frontier in removal_frontier::schema::list_for_workspace(store, workspace_id)? {
+        let Some(secret) =
+            local_key_secret::schema::get(store, workspace_id, frontier.removal_frontier_id)?
+        else {
+            continue;
+        };
+        candidates.push((frontier.created_at_ms, frontier.removal_frontier_id, secret));
+    }
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let Some((_, removal_frontier_id, secret)) = candidates.pop() else {
+        return Err(
+            "local content key is missing for workspace; run key-frontier or key-derive"
+                .to_string(),
+        );
+    };
+    Ok(ContentKey {
+        removal_frontier_id,
+        local_key_secret_id: secret.local_key_secret_id,
+        key_secret: secret.key_secret,
+    })
 }
 
 pub(crate) fn next_timestamp(store: &Store, workspace_id: EventId) -> Result<u64, String> {

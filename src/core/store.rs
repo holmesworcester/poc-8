@@ -153,7 +153,7 @@ impl Store {
 
     fn from_connection(conn: SqliteConnection, schemas: &[Schema]) -> rusqlite::Result<Self> {
         conn.busy_timeout(Duration::from_secs(5))?;
-        conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA secure_delete = ON;")?;
         let table_storage = table_storage_map(schemas)?;
         let memory_tables = table_storage
             .iter()

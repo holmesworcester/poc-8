@@ -6,6 +6,7 @@ use crate::protocol::event_modules::content::message;
 use crate::protocol::event_modules::identity::endpoint;
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker;
+use crate::workers::content_decrypt;
 
 use super::commands;
 
@@ -53,6 +54,7 @@ fn run_react_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutp
         .ok_or_else(|| "local endpoint is missing".to_string())?;
 
     let timestamp = message::cli::next_timestamp(&context.store, workspace_id)?;
+    let content_key = message::cli::require_content_key(&context.store, workspace_id)?;
     let post = commands::post(commands::PostReaction {
         workspace_id,
         created_at_ms: timestamp,
@@ -60,6 +62,9 @@ fn run_react_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutp
         author_user_id: membership.user_authority_event_id,
         signer_endpoint_shared_id: membership.endpoint_shared_id,
         signer_private_key: local.signing_secret,
+        removal_frontier_id: content_key.removal_frontier_id,
+        local_key_secret_id: content_key.local_key_secret_id,
+        key_secret: content_key.key_secret,
         emoji,
     })?;
     let report = worker::run(
@@ -74,6 +79,12 @@ fn run_react_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutp
     if report.admitted.inserted_events == 0 {
         return Err("reaction was not admitted".to_string());
     }
+    content_decrypt::run(
+        &context.store,
+        content_decrypt::Work::Drain {
+            limit: worker::DEFAULT_READY_BATCH,
+        },
+    )?;
     Ok(CliOutput::lines(
         ReactSummary {
             event_id: report.value.reaction_id,

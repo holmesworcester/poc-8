@@ -5,15 +5,22 @@
 //! follow the same authority rule: the signer must be a workspace endpoint
 //! membership and the named author must be a workspace member.
 
-use crate::core::crypto::{self, Ed25519PrivateKey, ED25519_SIGNATURE_BYTES};
+use crate::core::crypto::{
+    self, Ed25519PrivateKey, ED25519_SIGNATURE_BYTES, XCHACHA20_POLY1305_NONCE_BYTES,
+};
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
 use crate::protocol::wire::{Reader, Writer};
 
-use super::types::{ReactionEvent, SignedReactionEnvelope, REACTION_EMOJI_BYTES};
+use super::types::{
+    ReactionCiphertext, ReactionEvent, SignedReactionEnvelope, REACTION_CIPHERTEXT_BYTES,
+    REACTION_EMOJI_BYTES,
+};
 
 pub const TYPE_REACTION: u8 = 7;
 pub const TYPE_SIGNED_REACTION: u8 = 8;
-pub const REACTION_WIRE_SIZE: usize = 1 + 32 + 8 + 32 + 32 + REACTION_EMOJI_BYTES;
+pub const REACTION_ENCRYPTION_PURPOSE: &[u8] = b"topo reaction emoji v1";
+pub const REACTION_WIRE_SIZE: usize =
+    1 + 32 + 8 + 32 + 32 + 32 + 32 + XCHACHA20_POLY1305_NONCE_BYTES + REACTION_CIPHERTEXT_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReactionMetadata {
@@ -21,18 +28,22 @@ struct ReactionMetadata {
     created_at_ms: u64,
     target_message_id: EventId,
     author_user_id: EventId,
+    removal_frontier_id: EventId,
+    local_key_secret_id: EventId,
 }
 
-pub fn encode(event: &ReactionEvent) -> Result<Vec<u8>, String> {
-    let emoji = encode_emoji_slot(&event.emoji)?;
+pub fn encode(event: &ReactionEvent) -> Vec<u8> {
     let mut out = Writer::with_capacity(REACTION_WIRE_SIZE);
     out.u8(TYPE_REACTION);
     out.id(&event.workspace_id);
     out.u64(event.created_at_ms);
     out.id(&event.target_message_id);
     out.id(&event.author_user_id);
-    out.raw(&emoji);
-    Ok(out.finish())
+    out.id(&event.removal_frontier_id);
+    out.id(&event.local_key_secret_id);
+    out.raw(&event.nonce);
+    out.raw(&event.ciphertext);
+    out.finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<ReactionEvent, String> {
@@ -45,15 +56,23 @@ pub fn decode(bytes: &[u8]) -> Result<ReactionEvent, String> {
     let created_at_ms = reader.u64()?;
     let target_message_id = reader.id()?;
     let author_user_id = reader.id()?;
-    let emoji = decode_emoji_slot(reader.slice(REACTION_EMOJI_BYTES)?)?;
+    let removal_frontier_id = reader.id()?;
+    let local_key_secret_id = reader.id()?;
+    let nonce = fixed_nonce(reader.bytes(XCHACHA20_POLY1305_NONCE_BYTES)?)?;
+    let ciphertext = fixed_ciphertext(reader.bytes(REACTION_CIPHERTEXT_BYTES)?)?;
     reader.finish()?;
-    Ok(ReactionEvent {
+    let event = ReactionEvent {
         workspace_id,
         created_at_ms,
         target_message_id,
         author_user_id,
-        emoji,
-    })
+        removal_frontier_id,
+        local_key_secret_id,
+        nonce,
+        ciphertext,
+    };
+    validate_event(&event)?;
+    Ok(event)
 }
 
 pub fn sign(
@@ -117,11 +136,13 @@ pub fn signing_bytes(event: &SignedReactionEnvelope) -> Vec<u8> {
 pub fn signed_record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
     let envelope = decode_signed(&bytes)?;
     let metadata = metadata(&envelope.payload)?;
-    let mut dependencies = Vec::with_capacity(4);
+    let mut dependencies = Vec::with_capacity(6);
     push_unique(&mut dependencies, envelope.signer_endpoint_shared_id);
     push_unique(&mut dependencies, metadata.workspace_id);
     push_unique(&mut dependencies, metadata.author_user_id);
     push_unique(&mut dependencies, metadata.target_message_id);
+    push_unique(&mut dependencies, metadata.removal_frontier_id);
+    push_unique(&mut dependencies, metadata.local_key_secret_id);
     Ok(EventRecord {
         timestamp: metadata.created_at_ms,
         body_len: REACTION_WIRE_SIZE - 1,
@@ -142,14 +163,45 @@ fn metadata(bytes: &[u8]) -> Result<ReactionMetadata, String> {
     let created_at_ms = reader.u64()?;
     let target_message_id = reader.id()?;
     let author_user_id = reader.id()?;
-    let _emoji = reader.slice(REACTION_EMOJI_BYTES)?;
+    let removal_frontier_id = reader.id()?;
+    let local_key_secret_id = reader.id()?;
+    let _nonce = reader.bytes(XCHACHA20_POLY1305_NONCE_BYTES)?;
+    let _ciphertext = reader.bytes(REACTION_CIPHERTEXT_BYTES)?;
     reader.finish()?;
-    Ok(ReactionMetadata {
+    let metadata = ReactionMetadata {
         workspace_id,
         created_at_ms,
         target_message_id,
         author_user_id,
-    })
+        removal_frontier_id,
+        local_key_secret_id,
+    };
+    validate_id("reaction workspace", &metadata.workspace_id)?;
+    validate_id("reaction target_message_id", &metadata.target_message_id)?;
+    validate_id("reaction author_user_id", &metadata.author_user_id)?;
+    validate_id(
+        "reaction removal_frontier_id",
+        &metadata.removal_frontier_id,
+    )?;
+    validate_id(
+        "reaction local_key_secret_id",
+        &metadata.local_key_secret_id,
+    )?;
+    Ok(metadata)
+}
+
+pub fn associated_data(event: &ReactionEvent, signer_endpoint_shared_id: EventId) -> Vec<u8> {
+    let mut out = Writer::with_capacity(1 + 8 + (32 * 6) + XCHACHA20_POLY1305_NONCE_BYTES);
+    out.u8(TYPE_REACTION);
+    out.id(&event.workspace_id);
+    out.u64(event.created_at_ms);
+    out.id(&event.target_message_id);
+    out.id(&event.author_user_id);
+    out.id(&event.removal_frontier_id);
+    out.id(&event.local_key_secret_id);
+    out.raw(&event.nonce);
+    out.id(&signer_endpoint_shared_id);
+    out.finish()
 }
 
 fn validate_signed_payload(event: &SignedReactionEnvelope) -> Result<(), String> {
@@ -177,6 +229,34 @@ fn fixed_signature(bytes: Vec<u8>) -> Result<[u8; ED25519_SIGNATURE_BYTES], Stri
     bytes
         .try_into()
         .map_err(|_| "signed reaction signature length mismatch".to_string())
+}
+
+fn fixed_nonce(bytes: Vec<u8>) -> Result<[u8; XCHACHA20_POLY1305_NONCE_BYTES], String> {
+    bytes
+        .try_into()
+        .map_err(|_| "reaction nonce length mismatch".to_string())
+}
+
+fn fixed_ciphertext(bytes: Vec<u8>) -> Result<ReactionCiphertext, String> {
+    bytes
+        .try_into()
+        .map_err(|_| "reaction ciphertext length mismatch".to_string())
+}
+
+fn validate_event(event: &ReactionEvent) -> Result<(), String> {
+    validate_id("reaction workspace", &event.workspace_id)?;
+    validate_id("reaction target_message_id", &event.target_message_id)?;
+    validate_id("reaction author_user_id", &event.author_user_id)?;
+    validate_id("reaction removal_frontier_id", &event.removal_frontier_id)?;
+    validate_id("reaction local_key_secret_id", &event.local_key_secret_id)?;
+    Ok(())
+}
+
+fn validate_id(name: &str, id: &EventId) -> Result<(), String> {
+    if id.iter().all(|byte| *byte == 0) {
+        return Err(format!("{name} cannot be empty"));
+    }
+    Ok(())
 }
 
 fn push_unique(out: &mut Vec<EventId>, id: EventId) {
@@ -227,27 +307,30 @@ mod tests {
             created_at_ms: 99,
             target_message_id: [2; 32],
             author_user_id: [3; 32],
-            emoji: "👍".to_string(),
+            removal_frontier_id: [4; 32],
+            local_key_secret_id: [5; 32],
+            nonce: [6; XCHACHA20_POLY1305_NONCE_BYTES],
+            ciphertext: [7; REACTION_CIPHERTEXT_BYTES],
         }
     }
 
     #[test]
     fn roundtrips_inner_reaction_event() {
-        let bytes = encode(&event()).expect("encode");
+        let bytes = encode(&event());
         assert_eq!(bytes.len(), REACTION_WIRE_SIZE);
         assert_eq!(decode(&bytes).expect("decode"), event());
     }
 
     #[test]
     fn signed_envelope_record_dependencies_are_unique() {
-        let payload = encode(&event()).expect("encode");
-        let envelope = sign([4; 32], &[5; 32], payload);
+        let payload = encode(&event());
+        let envelope = sign([9; 32], &[5; 32], payload);
         let bytes = encode_signed(&envelope);
         let record = signed_record_from_bytes(bytes.clone()).expect("record");
 
         assert_eq!(
             record.dependencies,
-            vec![[4; 32], [1; 32], [3; 32], [2; 32]]
+            vec![[9; 32], [1; 32], [3; 32], [2; 32], [4; 32], [5; 32]]
         );
         assert_eq!(record.timestamp, 99);
         assert_eq!(record.scope, EventScope::Shared);
@@ -256,19 +339,11 @@ mod tests {
     #[test]
     fn rejects_empty_emoji_and_nul() {
         assert_eq!(
-            encode(&ReactionEvent {
-                emoji: String::new(),
-                ..event()
-            })
-            .expect_err("empty emoji must fail"),
+            encode_emoji_slot("").expect_err("empty emoji must fail"),
             "reaction emoji must not be empty"
         );
         assert_eq!(
-            encode(&ReactionEvent {
-                emoji: "bad\0".to_string(),
-                ..event()
-            })
-            .expect_err("nul emoji must fail"),
+            encode_emoji_slot("bad\0").expect_err("nul emoji must fail"),
             "reaction emoji cannot contain NUL"
         );
     }
