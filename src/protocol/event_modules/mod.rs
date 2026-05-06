@@ -11,6 +11,7 @@
 
 pub mod connection;
 pub mod content;
+pub mod encryption;
 pub mod identity;
 pub mod schema;
 pub mod sync;
@@ -63,6 +64,9 @@ impl Modules {
         if let Some(output) = content::project_record(event)? {
             return Ok(output);
         }
+        if let Some(output) = encryption::project_record(event)? {
+            return Ok(output);
+        }
         if let Some(output) = test_events::project_record(bytes)? {
             return Ok(output);
         }
@@ -96,6 +100,8 @@ pub fn schemas() -> Vec<Schema> {
     out.extend_from_slice(content::reaction::schema::SCHEMAS);
     out.extend_from_slice(content::file::schema::SCHEMAS);
     out.extend_from_slice(content::file_slice::schema::SCHEMAS);
+    out.extend_from_slice(encryption::local_recipient_key::schema::SCHEMAS);
+    out.extend_from_slice(encryption::recipient_key::schema::SCHEMAS);
     out.extend_from_slice(connection::schema::SCHEMAS);
     out.extend_from_slice(sync::schema::SCHEMAS);
     out.extend_from_slice(test_events::event_with_deps::schema::SCHEMAS);
@@ -174,6 +180,15 @@ pub fn record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
         content::file_slice::codec::TYPE_FILE_SLICE => Err("file slice must be signed".to_string()),
         content::file_slice::codec::TYPE_SIGNED_FILE_SLICE => {
             content::file_slice::codec::signed_record_from_bytes(bytes)
+        }
+        encryption::local_recipient_key::codec::TYPE_LOCAL_RECIPIENT_KEY => {
+            encryption::record_from_bytes(bytes)
+        }
+        encryption::recipient_key::codec::TYPE_RECIPIENT_KEY => {
+            Err("recipient_key must be signed".to_string())
+        }
+        encryption::recipient_key::codec::TYPE_SIGNED_RECIPIENT_KEY => {
+            encryption::record_from_bytes(bytes)
         }
         test_events::event_with_deps::codec::TYPE_EVENT_WITH_DEPS => {
             test_events::event_with_deps::codec::record_from_bytes(bytes)
