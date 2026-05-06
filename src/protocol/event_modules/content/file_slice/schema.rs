@@ -2,9 +2,12 @@
 //!
 //! Slot rows are keyed by `workspace_id || file_id || slice_number(BE)` so a
 //! single bounded prefix scan returns slices in order. The value carries the
-//! event id, signer, timestamp, and the actual slice bytes; queries reassemble
-//! a file by scanning the prefix.
+//! event id, signer, timestamp, the local-key-secret reference needed to
+//! decrypt at read time, the plaintext length, and the BAO-verified
+//! ciphertext bytes. Queries reassemble a file by scanning the prefix and
+//! decrypting each slice with the parent message's content key.
 
+use crate::core::crypto::XCHACHA20_POLY1305_TAG_BYTES;
 use crate::core::store::{Schema, Store, TableName, TableRow};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::wire::{Reader, Writer};
@@ -22,18 +25,26 @@ pub fn file_slice_row(
     slice_event_id: EventId,
     signer_endpoint_shared_id: EventId,
     event: &FileSliceEvent,
-    verified_plaintext: Vec<u8>,
-) -> TableRow {
-    TableRow {
+    verified_ciphertext: Vec<u8>,
+) -> Result<TableRow, String> {
+    let expected_len = (event.plaintext_len as usize)
+        .checked_add(XCHACHA20_POLY1305_TAG_BYTES)
+        .ok_or_else(|| "file slice plaintext_len overflows ciphertext length".to_string())?;
+    if verified_ciphertext.len() != expected_len {
+        return Err("file slice ciphertext length does not match plaintext_len + tag".to_string());
+    }
+    Ok(TableRow {
         table: FILE_SLICES,
         key: file_slice_key(event.workspace_id, event.file_id, event.slice_number),
         value: encode_value(
             slice_event_id,
             signer_endpoint_shared_id,
             event.created_at_ms,
-            &verified_plaintext,
+            event.local_key_secret_id,
+            event.plaintext_len,
+            &verified_ciphertext,
         ),
-    }
+    })
 }
 
 pub fn file_slice_key(workspace_id: EventId, file_id: EventId, slice_number: u32) -> Vec<u8> {
@@ -67,7 +78,9 @@ pub fn decode_file_slice_row(key: &[u8], value: &[u8]) -> Result<FileSliceRow, S
     let slice_event_id = reader.id()?;
     let created_at_ms = reader.u64()?;
     let signer_endpoint_shared_id = reader.id()?;
-    let data = reader.sized_bytes()?;
+    let local_key_secret_id = reader.id()?;
+    let plaintext_len = reader.u32()?;
+    let ciphertext = reader.sized_bytes()?;
     reader.finish()?;
     Ok(FileSliceRow {
         workspace_id,
@@ -76,7 +89,9 @@ pub fn decode_file_slice_row(key: &[u8], value: &[u8]) -> Result<FileSliceRow, S
         slice_event_id,
         created_at_ms,
         signer_endpoint_shared_id,
-        data,
+        local_key_secret_id,
+        plaintext_len,
+        ciphertext,
     })
 }
 
@@ -111,12 +126,16 @@ fn encode_value(
     slice_event_id: EventId,
     signer_endpoint_shared_id: EventId,
     created_at_ms: u64,
-    plaintext: &[u8],
+    local_key_secret_id: EventId,
+    plaintext_len: u32,
+    ciphertext: &[u8],
 ) -> Vec<u8> {
-    let mut out = Writer::with_capacity(32 + 8 + 32 + 4 + plaintext.len());
+    let mut out = Writer::with_capacity(32 + 8 + 32 + 32 + 4 + 4 + ciphertext.len());
     out.id(&slice_event_id);
     out.u64(created_at_ms);
     out.id(&signer_endpoint_shared_id);
-    out.sized_bytes(plaintext);
+    out.id(&local_key_secret_id);
+    out.u32(plaintext_len as usize);
+    out.sized_bytes(ciphertext);
     out.finish()
 }

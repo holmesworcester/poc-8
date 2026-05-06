@@ -1,24 +1,44 @@
 //! Codec for signed file slice events.
 //!
-//! The slice carries a self-contained BAO proof for `[slice_start, slice_len)`
-//! that the projector verifies against the descriptor's `root_hash`. The proof
-//! slot is fixed-width with a leading length prefix; the descriptor is named
-//! by `file_id` and pulled into the projector's dependency context. The slice
-//! event also depends on the file descriptor event id so the worker holds the
-//! slice until its descriptor applies, then projects against a real root hash.
+//! The slice carries a self-contained BAO proof for the per-slice ciphertext
+//! bytes that the projector verifies against the descriptor's encrypted-blob
+//! `root_hash`. The proof slot is fixed-width with a leading length prefix;
+//! the descriptor is named by `file_id` and pulled into the projector's
+//! dependency context. The slice event also depends on the file descriptor
+//! event id so the worker holds the slice until its descriptor applies, and
+//! on the parent message's `local_key_secret_id` so AEAD decryption can run
+//! at read time without a separate blocking system.
+//!
+//! Encryption shape: each plaintext slice is encrypted independently with
+//! XChaCha20-Poly1305 under the parent message's content key. The per-slice
+//! nonce is derived deterministically from
+//! `("topo file slice nonce v1", file_id, slice_number)` so the same plaintext
+//! yields the same ciphertext on resend; AAD binds the slice to its file_id,
+//! slice_number, plaintext length, and signer endpoint membership. The
+//! concatenation of all per-slice ciphertexts is the BAO input, so the
+//! descriptor's `root_hash` hashes ciphertext, not plaintext.
 
-use crate::core::crypto::{self, Ed25519PrivateKey, ED25519_SIGNATURE_BYTES};
+use crate::core::crypto::{
+    self, Ed25519PrivateKey, Hash, XChaCha20Poly1305Key, XChaCha20Poly1305Nonce,
+    ED25519_SIGNATURE_BYTES, XCHACHA20_POLY1305_NONCE_BYTES,
+};
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
 use crate::protocol::wire::{Reader, Writer};
 
-use super::types::{BuildSlice, FileSliceEvent, SignedFileSliceEnvelope, FILE_SLICE_PROOF_BYTES};
+use super::types::{
+    BuildSlice, FileSliceEvent, SignedFileSliceEnvelope, FILE_SLICE_PROOF_BYTES,
+};
 
 pub const TYPE_FILE_SLICE: u8 = 16;
 pub const TYPE_SIGNED_FILE_SLICE: u8 = 17;
+pub const FILE_SLICE_NONCE_PURPOSE: &[u8] = b"topo file slice nonce v1";
+pub const FILE_SLICE_ENCRYPTION_PURPOSE: &[u8] = b"topo file slice payload v1";
 
-/// Inner wire size: tag(1) + workspace(32) + ts(8) + file_id(32) + file_event_id(32)
-/// + slice#(4) + proof_len(4) + proof slot.
-pub const FILE_SLICE_WIRE_SIZE: usize = 1 + 32 + 8 + 32 + 32 + 4 + 4 + FILE_SLICE_PROOF_BYTES;
+/// Inner wire size: tag(1) + workspace(32) + ts(8) + file_id(32)
+/// + file_event_id(32) + slice#(4) + local_key_secret_id(32) + plaintext_len(4)
+/// + proof_len(4) + proof slot.
+pub const FILE_SLICE_WIRE_SIZE: usize =
+    1 + 32 + 8 + 32 + 32 + 4 + 32 + 4 + 4 + FILE_SLICE_PROOF_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileSliceMetadata {
@@ -27,17 +47,105 @@ struct FileSliceMetadata {
     file_id: EventId,
     file_event_id: EventId,
     slice_number: u32,
-    proof_len: u32,
+    local_key_secret_id: EventId,
+    plaintext_len: u32,
+}
+
+/// Derive the deterministic per-slice nonce. Combining the static purpose
+/// string with `file_id` and `slice_number` ensures every (file, slice) pair
+/// has a unique nonce, which is the AEAD invariant the cipher requires.
+pub fn derive_slice_nonce(file_id: &EventId, slice_number: u32) -> XChaCha20Poly1305Nonce {
+    let mut input =
+        Vec::with_capacity(FILE_SLICE_NONCE_PURPOSE.len() + 1 + file_id.len() + 4);
+    input.extend_from_slice(FILE_SLICE_NONCE_PURPOSE);
+    input.push(0);
+    input.extend_from_slice(file_id);
+    input.extend_from_slice(&slice_number.to_be_bytes());
+    let hash = crypto::hash(&input);
+    let mut nonce = [0u8; XCHACHA20_POLY1305_NONCE_BYTES];
+    nonce.copy_from_slice(&hash[..XCHACHA20_POLY1305_NONCE_BYTES]);
+    nonce
+}
+
+/// Domain-separated AAD binding the slice's ciphertext to file_id,
+/// slice_number, plaintext length, and signer endpoint membership. AAD
+/// intentionally does NOT include the descriptor's `file_event_id`: that id
+/// is fixed by the descriptor's BLAKE3 over canonical bytes, which include
+/// `root_hash`, which depends on the ciphertexts we're sealing here. Binding
+/// AAD to `file_event_id` would create a chicken-and-egg loop. The
+/// dependency edge from slice → descriptor in the slice's canonical bytes
+/// already binds the slice to one specific descriptor at projection time.
+pub fn slice_associated_data(
+    workspace_id: &EventId,
+    file_id: &EventId,
+    slice_number: u32,
+    plaintext_len: u32,
+    signer_endpoint_shared_id: &EventId,
+) -> Vec<u8> {
+    let mut out =
+        Writer::with_capacity(FILE_SLICE_ENCRYPTION_PURPOSE.len() + 32 + 32 + 4 + 4 + 32);
+    out.raw(FILE_SLICE_ENCRYPTION_PURPOSE);
+    out.id(workspace_id);
+    out.id(file_id);
+    out.u32(slice_number as usize);
+    out.u32(plaintext_len as usize);
+    out.id(signer_endpoint_shared_id);
+    out.finish()
+}
+
+/// Encrypt one plaintext slice into its on-wire ciphertext. The receiver
+/// derives the same nonce from `(file_id, slice_number)` and decrypts using
+/// the parent message's local key-secret.
+pub fn seal_slice(
+    key: &XChaCha20Poly1305Key,
+    workspace_id: &EventId,
+    file_id: &EventId,
+    slice_number: u32,
+    signer_endpoint_shared_id: &EventId,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, String> {
+    let plaintext_len = u32::try_from(plaintext.len())
+        .map_err(|_| "file slice plaintext length overflows u32".to_string())?;
+    let aad = slice_associated_data(
+        workspace_id,
+        file_id,
+        slice_number,
+        plaintext_len,
+        signer_endpoint_shared_id,
+    );
+    let nonce = derive_slice_nonce(file_id, slice_number);
+    crypto::xchacha20poly1305_encrypt(key, &aad, &nonce, plaintext)
+}
+
+/// Decrypt one BAO-verified slice ciphertext to its plaintext.
+pub fn open_slice(
+    key: &XChaCha20Poly1305Key,
+    workspace_id: &EventId,
+    file_id: &EventId,
+    slice_number: u32,
+    plaintext_len: u32,
+    signer_endpoint_shared_id: &EventId,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, String> {
+    let aad = slice_associated_data(
+        workspace_id,
+        file_id,
+        slice_number,
+        plaintext_len,
+        signer_endpoint_shared_id,
+    );
+    let nonce = derive_slice_nonce(file_id, slice_number);
+    crypto::xchacha20poly1305_decrypt(key, &aad, &nonce, ciphertext)
 }
 
 /// Construct a file slice from a descriptor's root hash + outboard.
 ///
-/// The caller has the full plaintext and outboard available and uses the
+/// The caller has the full encrypted blob and outboard available and uses the
 /// descriptor's `slice_bytes` budget to pick the byte range. The result is a
 /// `FileSliceEvent` whose proof is self-verifying against the descriptor.
 pub fn build_slice(input: BuildSlice<'_>) -> Result<FileSliceEvent, String> {
     let proof = crypto::bao_extract_slice(
-        input.plaintext,
+        input.ciphertext,
         input.outboard,
         input.slice_start,
         input.slice_len,
@@ -47,22 +155,19 @@ pub fn build_slice(input: BuildSlice<'_>) -> Result<FileSliceEvent, String> {
         created_at_ms: input.created_at_ms,
         file_id: input.file_id,
         slice_number: input.slice_number,
+        local_key_secret_id: input.local_key_secret_id,
+        plaintext_len: input.plaintext_len,
         proof,
     })
 }
 
 pub fn verify_slice_proof(
-    root_hash: &crypto::Hash,
+    root_hash: &Hash,
     proof: &[u8],
     slice_start: u64,
     slice_len: u64,
 ) -> Result<Vec<u8>, String> {
     crypto::bao_verify_slice(root_hash, proof, slice_start, slice_len)
-}
-
-#[cfg(test)]
-pub(crate) fn outboard_for_plaintext(plaintext: &[u8]) -> Result<(crypto::Hash, Vec<u8>), String> {
-    crypto::bao_outboard(plaintext)
 }
 
 pub fn encode(event: &FileSliceEvent, file_event_id: &EventId) -> Result<Vec<u8>, String> {
@@ -76,6 +181,8 @@ pub fn encode(event: &FileSliceEvent, file_event_id: &EventId) -> Result<Vec<u8>
     out.id(&event.file_id);
     out.id(file_event_id);
     out.u32(event.slice_number as usize);
+    out.id(&event.local_key_secret_id);
+    out.u32(event.plaintext_len as usize);
     out.u32(event.proof.len());
     out.raw(&event.proof);
     out.raw(&vec![0u8; FILE_SLICE_PROOF_BYTES - event.proof.len()]);
@@ -93,6 +200,8 @@ pub fn decode(bytes: &[u8]) -> Result<(FileSliceEvent, EventId), String> {
     let file_id = reader.id()?;
     let file_event_id = reader.id()?;
     let slice_number = reader.u32()?;
+    let local_key_secret_id = reader.id()?;
+    let plaintext_len = reader.u32()?;
     let proof_len = reader.u32()? as usize;
     if proof_len > FILE_SLICE_PROOF_BYTES {
         return Err("file slice declares more proof than the slot holds".to_string());
@@ -110,6 +219,8 @@ pub fn decode(bytes: &[u8]) -> Result<(FileSliceEvent, EventId), String> {
             created_at_ms,
             file_id,
             slice_number,
+            local_key_secret_id,
+            plaintext_len,
             proof,
         },
         file_event_id,
@@ -177,10 +288,11 @@ pub fn signing_bytes(event: &SignedFileSliceEnvelope) -> Vec<u8> {
 pub fn signed_record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
     let envelope = decode_signed(&bytes)?;
     let metadata = metadata(&envelope.payload)?;
-    let mut dependencies = Vec::with_capacity(3);
+    let mut dependencies = Vec::with_capacity(4);
     push_unique(&mut dependencies, envelope.signer_endpoint_shared_id);
     push_unique(&mut dependencies, metadata.workspace_id);
     push_unique(&mut dependencies, metadata.file_event_id);
+    push_unique(&mut dependencies, metadata.local_key_secret_id);
     Ok(EventRecord {
         timestamp: metadata.created_at_ms,
         body_len: FILE_SLICE_WIRE_SIZE - 1,
@@ -202,6 +314,8 @@ fn metadata(bytes: &[u8]) -> Result<FileSliceMetadata, String> {
     let file_id = reader.id()?;
     let file_event_id = reader.id()?;
     let slice_number = reader.u32()?;
+    let local_key_secret_id = reader.id()?;
+    let plaintext_len = reader.u32()?;
     let proof_len = reader.u32()?;
     if (proof_len as usize) > FILE_SLICE_PROOF_BYTES {
         return Err("file slice declares more proof than the slot holds".to_string());
@@ -214,7 +328,8 @@ fn metadata(bytes: &[u8]) -> Result<FileSliceMetadata, String> {
         file_id,
         file_event_id,
         slice_number,
-        proof_len,
+        local_key_secret_id,
+        plaintext_len,
     })
 }
 
@@ -255,24 +370,31 @@ fn push_unique(out: &mut Vec<EventId>, id: EventId) {
 mod tests {
     use super::*;
 
-    fn slice_event(file_event_id: &EventId) -> (FileSliceEvent, Vec<u8>) {
+    fn slice_event(_file_event_id: &EventId) -> (FileSliceEvent, [u8; 32]) {
         let plaintext: Vec<u8> = (0..super::super::types::FILE_SLICE_DATA_BYTES as u32)
             .map(|byte| byte as u8)
             .collect();
-        let (root_hash, outboard) = crypto::bao_outboard(&plaintext).expect("outboard");
+        let key: XChaCha20Poly1305Key = [42; 32];
+        let workspace_id: EventId = [1; 32];
+        let file_id: EventId = [2; 32];
+        let signer: EventId = [3; 32];
+        let ciphertext = seal_slice(&key, &workspace_id, &file_id, 0, &signer, &plaintext)
+            .expect("seal slice");
+        let (root_hash, outboard) = crypto::bao_outboard(&ciphertext).expect("outboard");
         let event = build_slice(BuildSlice {
-            workspace_id: [1; 32],
+            workspace_id,
             created_at_ms: 11,
-            file_id: [2; 32],
+            file_id,
             slice_number: 0,
-            plaintext: &plaintext,
+            local_key_secret_id: [4; 32],
+            plaintext_len: plaintext.len() as u32,
+            ciphertext: &ciphertext,
             outboard: &outboard,
             slice_start: 0,
-            slice_len: plaintext.len() as u64,
+            slice_len: ciphertext.len() as u64,
         })
         .expect("build slice");
-        let _ = file_event_id;
-        (event, root_hash.to_vec())
+        (event, root_hash)
     }
 
     #[test]
@@ -293,20 +415,91 @@ mod tests {
             created_at_ms: 1,
             file_id: [2; 32],
             slice_number: 0,
+            local_key_secret_id: [4; 32],
+            plaintext_len: 0,
             proof: vec![0; FILE_SLICE_PROOF_BYTES + 1],
         };
         assert!(encode(&event, &[3; 32]).is_err());
     }
 
     #[test]
-    fn signed_envelope_dependencies_are_signer_workspace_and_file_event_id() {
+    fn signed_envelope_dependencies_include_local_key_secret_id() {
         let file_event_id = [9; 32];
         let (event, _) = slice_event(&file_event_id);
         let payload = encode(&event, &file_event_id).expect("encode");
-        let envelope = sign([4; 32], &[5; 32], payload);
+        let envelope = sign([5; 32], &[6; 32], payload);
         let bytes = encode_signed(&envelope);
         let record = signed_record_from_bytes(bytes).expect("record");
-        assert_eq!(record.dependencies, vec![[4; 32], [1; 32], file_event_id]);
+        // signer, workspace, file_event_id, local_key_secret_id
+        assert_eq!(record.dependencies, vec![[5; 32], [1; 32], file_event_id, [4; 32]]);
         assert_eq!(record.scope, EventScope::Shared);
+    }
+
+    #[test]
+    fn slice_seal_open_roundtrips_and_rejects_wrong_key_aad_or_nonce() {
+        let key: XChaCha20Poly1305Key = [11; 32];
+        let workspace_id: EventId = [1; 32];
+        let file_id: EventId = [2; 32];
+        let signer: EventId = [4; 32];
+        let plaintext = b"the quick brown fox jumps over the lazy dog".to_vec();
+        let ciphertext =
+            seal_slice(&key, &workspace_id, &file_id, 7, &signer, &plaintext).expect("seal");
+        let recovered = open_slice(
+            &key,
+            &workspace_id,
+            &file_id,
+            7,
+            plaintext.len() as u32,
+            &signer,
+            &ciphertext,
+        )
+        .expect("open");
+        assert_eq!(recovered, plaintext);
+
+        // Wrong key.
+        assert!(open_slice(
+            &[99; 32],
+            &workspace_id,
+            &file_id,
+            7,
+            plaintext.len() as u32,
+            &signer,
+            &ciphertext,
+        )
+        .is_err());
+
+        // AAD mismatch on signer.
+        assert!(open_slice(
+            &key,
+            &workspace_id,
+            &file_id,
+            7,
+            plaintext.len() as u32,
+            &[88; 32],
+            &ciphertext,
+        )
+        .is_err());
+
+        // Nonce mismatch via slice_number drift.
+        assert!(open_slice(
+            &key,
+            &workspace_id,
+            &file_id,
+            8,
+            plaintext.len() as u32,
+            &signer,
+            &ciphertext,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn derived_nonces_are_unique_per_slice_number_for_one_file() {
+        let file_id: EventId = [42; 32];
+        let nonce0 = derive_slice_nonce(&file_id, 0);
+        let nonce1 = derive_slice_nonce(&file_id, 1);
+        let nonce_other_file = derive_slice_nonce(&[43; 32], 0);
+        assert_ne!(nonce0, nonce1);
+        assert_ne!(nonce0, nonce_other_file);
     }
 }

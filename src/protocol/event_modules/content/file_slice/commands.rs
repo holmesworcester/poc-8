@@ -1,9 +1,11 @@
 //! Commands for creating file slices.
 //!
-//! `create` takes a pre-built BAO slice proof and the descriptor's event id.
-//! `slice_from_plaintext` is the convenience wrapper send-file uses with the
-//! full plaintext + outboard already in hand. Both produce one signed file
-//! slice event whose projection verifies against the descriptor.
+//! `create` takes a pre-built BAO slice proof, the descriptor's event id, and
+//! the descriptor's `local_key_secret_id`. `slice_from_ciphertext` is the
+//! convenience wrapper send-file uses with the full encrypted blob and its
+//! BAO outboard already in hand. Both produce one signed file slice event
+//! whose projection verifies the slice's ciphertext bytes against the
+//! descriptor's `root_hash`.
 
 use crate::core::crypto::Ed25519PrivateKey;
 use crate::protocol::event_modules::types::EventId;
@@ -21,6 +23,8 @@ pub struct CreateFileSlice {
     pub slice_number: u32,
     pub signer_endpoint_shared_id: EventId,
     pub signer_private_key: Ed25519PrivateKey,
+    pub local_key_secret_id: EventId,
+    pub plaintext_len: u32,
     pub proof: Vec<u8>,
 }
 
@@ -37,6 +41,8 @@ pub fn create(input: CreateFileSlice) -> Result<CommandOutput<CreateFileSliceOut
         created_at_ms: input.created_at_ms,
         file_id: input.file_id,
         slice_number: input.slice_number,
+        local_key_secret_id: input.local_key_secret_id,
+        plaintext_len: input.plaintext_len,
         proof: input.proof,
     };
     let payload = codec::encode(&event, &input.file_event_id)?;
@@ -59,7 +65,7 @@ pub fn create(input: CreateFileSlice) -> Result<CommandOutput<CreateFileSliceOut
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SliceFromPlaintext<'a> {
+pub struct SliceFromCiphertext<'a> {
     pub workspace_id: EventId,
     pub created_at_ms: u64,
     pub file_id: EventId,
@@ -67,21 +73,28 @@ pub struct SliceFromPlaintext<'a> {
     pub slice_number: u32,
     pub signer_endpoint_shared_id: EventId,
     pub signer_private_key: Ed25519PrivateKey,
-    pub plaintext: &'a [u8],
+    pub local_key_secret_id: EventId,
+    pub plaintext_len: u32,
+    /// Concatenated per-slice ciphertexts; this is the byte stream BAO is
+    /// computed over, so any slice proof verifies against the descriptor's
+    /// encrypted-blob root hash.
+    pub ciphertext: &'a [u8],
     pub outboard: &'a [u8],
     pub slice_start: u64,
     pub slice_len: u64,
 }
 
-pub fn slice_from_plaintext(
-    input: SliceFromPlaintext<'_>,
+pub fn slice_from_ciphertext(
+    input: SliceFromCiphertext<'_>,
 ) -> Result<CommandOutput<CreateFileSliceOutput>, String> {
     let event = codec::build_slice(BuildSlice {
         workspace_id: input.workspace_id,
         created_at_ms: input.created_at_ms,
         file_id: input.file_id,
         slice_number: input.slice_number,
-        plaintext: input.plaintext,
+        local_key_secret_id: input.local_key_secret_id,
+        plaintext_len: input.plaintext_len,
+        ciphertext: input.ciphertext,
         outboard: input.outboard,
         slice_start: input.slice_start,
         slice_len: input.slice_len,
@@ -94,6 +107,8 @@ pub fn slice_from_plaintext(
         slice_number: input.slice_number,
         signer_endpoint_shared_id: input.signer_endpoint_shared_id,
         signer_private_key: input.signer_private_key,
+        local_key_secret_id: input.local_key_secret_id,
+        plaintext_len: input.plaintext_len,
         proof: event.proof,
     })
 }

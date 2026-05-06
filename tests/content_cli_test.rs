@@ -223,6 +223,156 @@ fn cli_send_file_syncs_bytes_to_peer_for_save() {
     assert_eq!(read_back, payload);
 }
 
+#[test]
+fn cli_send_file_keeps_plaintext_off_disk() {
+    // Sentinel must be 32+ bytes, unique enough that a random search across
+    // the SQLite file is meaningful.
+    let sentinel = "sentinel-fs-bytes-keep-this-unique-1234567890";
+    assert!(sentinel.len() >= 32, "sentinel must be 32+ bytes");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db = temp_db(&tmp, "alice.db");
+    let workspace_id = create_workspace(&db, "Sealed", "alice", "alice-laptop");
+    assert_success(topo(&["--db", &db, "key-frontier", &workspace_id]));
+
+    let in_path = tmp.path().join("input.bin");
+    let mut payload = Vec::new();
+    // Pad with non-sentinel bytes so the file is multi-slice-worthy.
+    payload.extend(sentinel.as_bytes());
+    payload.extend(std::iter::repeat_n(0xa5u8, 1024));
+    fs::write(&in_path, &payload).expect("write input");
+
+    let secret_filename = "secret-name-92e1f.bin";
+    let secret_in_path = tmp.path().join(secret_filename);
+    fs::write(&secret_in_path, &payload).expect("write secret named input");
+
+    let sent = assert_success(topo(&[
+        "--db",
+        &db,
+        "send-file",
+        &workspace_id,
+        "subject does not leak filename",
+        "--file",
+        secret_in_path.to_str().expect("path"),
+        "--mime",
+        "application/x-secret-mime-3713",
+    ]));
+    assert!(sent.contains(&format!("filename: {}", secret_filename)), "{sent}");
+
+    // Read the SQLite file and assert sentinel is not present anywhere.
+    let raw = fs::read(&db).expect("read sqlite file");
+    let needle = sentinel.as_bytes();
+    assert!(
+        raw.windows(needle.len()).all(|window| window != needle),
+        "sentinel plaintext leaked to disk despite encryption"
+    );
+
+    // Filename and MIME should also be sealed; neither plaintext should
+    // appear in the SQLite file.
+    assert!(
+        raw.windows(secret_filename.len())
+            .all(|window| window != secret_filename.as_bytes()),
+        "filename plaintext leaked to disk"
+    );
+    let mime_needle = b"application/x-secret-mime-3713";
+    assert!(
+        raw.windows(mime_needle.len()).all(|window| window != mime_needle),
+        "mime plaintext leaked to disk"
+    );
+}
+
+#[test]
+fn cli_delete_message_purges_attached_file_and_slices() {
+    let sentinel = "sentinel-fs-purge-bytes-7777-unique-aaaa-bbbb";
+    assert!(sentinel.len() >= 32);
+    let tmp = tempfile::tempdir().unwrap();
+    let db = temp_db(&tmp, "alice.db");
+    let workspace_id = create_workspace(&db, "Purge", "alice", "alice-laptop");
+    assert_success(topo(&["--db", &db, "key-frontier", &workspace_id]));
+
+    let in_path = tmp.path().join("input.bin");
+    let mut payload = Vec::new();
+    payload.extend(sentinel.as_bytes());
+    payload.extend(std::iter::repeat_n(0x33u8, 1024));
+    fs::write(&in_path, &payload).expect("write input");
+
+    assert_success(topo(&[
+        "--db",
+        &db,
+        "send-file",
+        &workspace_id,
+        "delete me",
+        "--file",
+        in_path.to_str().expect("path"),
+    ]));
+    let files_before = assert_success(topo(&["--db", &db, "files", &workspace_id]));
+    assert_eq!(line_value(&files_before, "files"), "1");
+
+    assert_success(topo(&["--db", &db, "delete-message", &workspace_id, "#1"]));
+
+    // Allow the daemon's content_purge worker time to run; we drive it via
+    // the explicit `start --once` admin entry as the existing tests do.
+    let after_files = assert_success(topo(&["--db", &db, "files", &workspace_id]));
+    assert_eq!(line_value(&after_files, "files"), "0");
+    let after_messages = assert_success(topo(&["--db", &db, "messages", &workspace_id]));
+    assert_eq!(line_value(&after_messages, "messages"), "0");
+
+    let raw = fs::read(&db).expect("read sqlite file");
+    let needle = sentinel.as_bytes();
+    assert!(
+        raw.windows(needle.len()).all(|window| window != needle),
+        "sentinel plaintext survived after delete-message purge"
+    );
+}
+
+#[test]
+fn cli_delete_message_purges_attached_file_on_peer_after_sync() {
+    let sentinel = "sentinel-fs-bytes-peer-purge-c0c0c0c0c0c0c0c0";
+    assert!(sentinel.len() >= 32);
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = temp_db(&tmp, "alice.db");
+    let bob = temp_db(&tmp, "bob.db");
+    let workspace_id = create_workspace(&alice, "PeerPurge", "alice", "alice-laptop");
+    let invite_port = free_port();
+    let alice_port = free_port();
+    let bob_port = free_port();
+
+    join_workspace(&alice, &bob, &workspace_id, invite_port, "bob", "bob-phone");
+    let _alice_daemon = spawn_daemon(&alice, alice_port);
+    let _bob_daemon = spawn_daemon(&bob, bob_port);
+    connect_daemon_pair(&alice, alice_port, &bob, bob_port);
+    grant_content_key_to_peer(&alice, &bob, &workspace_id);
+
+    let in_path = tmp.path().join("input.bin");
+    let mut payload = Vec::new();
+    payload.extend(sentinel.as_bytes());
+    payload.extend(std::iter::repeat_n(0x77u8, 1024));
+    fs::write(&in_path, &payload).expect("write input");
+
+    assert_success(topo(&[
+        "--db",
+        &alice,
+        "send-file",
+        &workspace_id,
+        "peer purge target",
+        "--file",
+        in_path.to_str().expect("path"),
+    ]));
+    wait_for_files_count(&bob, &workspace_id, "1");
+
+    assert_success(topo(&["--db", &alice, "delete-message", &workspace_id, "#1"]));
+
+    // Wait for sync + purge propagation on bob's side.
+    wait_for_messages_count(&bob, &workspace_id, "0");
+    wait_for_files_count(&bob, &workspace_id, "0");
+
+    let raw = fs::read(&bob).expect("read bob db post-delete");
+    assert!(
+        raw.windows(sentinel.len()).all(|w| w != sentinel.as_bytes()),
+        "sentinel survived on peer DB after delete sync; purge not propagated"
+    );
+}
+
 fn create_workspace(db: &str, name: &str, username: &str, device_name: &str) -> String {
     let out = assert_success(topo(&[
         "--db",

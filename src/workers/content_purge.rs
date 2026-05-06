@@ -16,7 +16,7 @@
 
 use crate::core::daemon::{StepContext, Worker};
 use crate::core::store::Store;
-use crate::protocol::event_modules::content::{message, message_deletion, reaction};
+use crate::protocol::event_modules::content::{file, file_slice, message, message_deletion, reaction};
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::types::EventId;
 use crate::workers::common::retention;
@@ -33,6 +33,8 @@ pub struct PurgeReport {
     pub tombstones_written: usize,
     pub message_rows_deleted: usize,
     pub reaction_rows_deleted: usize,
+    pub file_rows_deleted: usize,
+    pub file_slice_rows_deleted: usize,
     pub event_bytes_purged: usize,
 }
 
@@ -91,6 +93,12 @@ fn drain_in_tx(store: &Store, limit: usize) -> Result<PurgeReport, String> {
             }
             Some(reaction::codec::TYPE_SIGNED_REACTION) => {
                 purge_reaction_for_deleted_message(store, entry.event_id, &bytes, &mut report)?;
+            }
+            Some(file::codec::TYPE_SIGNED_FILE) => {
+                purge_file_for_deleted_message(store, entry.event_id, &bytes, &mut report)?;
+            }
+            Some(file_slice::codec::TYPE_SIGNED_FILE_SLICE) => {
+                purge_file_slice_for_deleted_file(store, entry.event_id, &bytes, &mut report)?;
             }
             _ => {}
         }
@@ -159,6 +167,121 @@ fn purge_reaction_for_deleted_message(
         .map_err(|err| format!("delete reaction row: {err}"))?;
     if retention::purge_event_storage_in_tx(store, &reaction_id)
         .map_err(|err| format!("purge reaction event: {err}"))?
+    {
+        report.event_bytes_purged += 1;
+    }
+    Ok(())
+}
+
+fn purge_file_for_deleted_message(
+    store: &Store,
+    file_event_id: EventId,
+    bytes: &[u8],
+    report: &mut PurgeReport,
+) -> Result<(), String> {
+    let envelope = file::codec::decode_signed(bytes)?;
+    let event = file::codec::decode(&envelope.payload)?;
+    if !message::schema::message_tombstone_exists(store, event.workspace_id, event.message_id)? {
+        return Ok(());
+    }
+
+    // Delete projection rows for this file_event_id and file_id.
+    let primary_key = file::schema::file_key(event.workspace_id, file_event_id);
+    let by_message_key =
+        file::schema::file_by_message_key(event.workspace_id, event.message_id, file_event_id);
+    let by_file_id_key =
+        file::schema::file_by_file_id_key(event.workspace_id, event.file_id, file_event_id);
+    report.file_rows_deleted += store
+        .delete_table_rows_in_tx(file::schema::FILES, vec![primary_key])
+        .map_err(|err| format!("delete file row: {err}"))?;
+    let _ = store
+        .delete_table_rows_in_tx(file::schema::FILES_BY_MESSAGE, vec![by_message_key])
+        .map_err(|err| format!("delete files_by_message row: {err}"))?;
+    let _ = store
+        .delete_table_rows_in_tx(file::schema::FILES_BY_FILE_ID, vec![by_file_id_key])
+        .map_err(|err| format!("delete files_by_file_id row: {err}"))?;
+
+    // Delete every slice projection row for this file_id. Slice canonical
+    // bytes are purged when the slice itself is scanned next; the slice's
+    // descriptor lookup will fail and trigger its own purge branch.
+    let slice_keys = store
+        .table_rows_with_key_prefix(
+            file_slice::schema::FILE_SLICES,
+            &file_slice::schema::file_slice_prefix(event.workspace_id, event.file_id),
+            usize::MAX,
+        )
+        .map_err(|err| format!("load file slice rows: {err}"))?;
+    let keys: Vec<Vec<u8>> = slice_keys.iter().map(|(key, _)| key.clone()).collect();
+    if !keys.is_empty() {
+        report.file_slice_rows_deleted += store
+            .delete_table_rows_in_tx(file_slice::schema::FILE_SLICES, keys)
+            .map_err(|err| format!("delete file slice rows: {err}"))?;
+    }
+
+    if retention::purge_event_storage_in_tx(store, &file_event_id)
+        .map_err(|err| format!("purge file event: {err}"))?
+    {
+        report.event_bytes_purged += 1;
+    }
+    Ok(())
+}
+
+fn purge_file_slice_for_deleted_file(
+    store: &Store,
+    slice_event_id: EventId,
+    bytes: &[u8],
+    report: &mut PurgeReport,
+) -> Result<(), String> {
+    let envelope = file_slice::codec::decode_signed(bytes)?;
+    let (slice, file_event_id) = file_slice::codec::decode(&envelope.payload)?;
+    let descriptor_purged =
+        event_schema::event_bytes(store, &file_event_id)
+            .map_err(|err| format!("load descriptor bytes: {err}"))?
+            .is_none();
+    let message_id_tombstoned = if descriptor_purged {
+        // The descriptor was already purged. We rely on the file_id index
+        // also being gone: confirm by looking up by file_id; if the
+        // descriptor row is still present we honor it as live.
+        file::schema::file_event_id_for_file_id(store, slice.workspace_id, slice.file_id)?
+            .is_none()
+    } else {
+        // Descriptor still exists. Look up its message_id and check whether
+        // that message has a tombstone; if yes, this slice should also be
+        // purged on the next scan-after-descriptor path. If the descriptor
+        // exists and message has no tombstone, the slice is live.
+        let Some(descriptor_bytes) = event_schema::event_bytes(store, &file_event_id)
+            .map_err(|err| format!("load descriptor bytes: {err}"))?
+        else {
+            // Race: descriptor was purged between checks. Treat as deleted.
+            return purge_slice_rows_and_event(store, slice_event_id, &slice, report);
+        };
+        let descriptor_envelope = file::codec::decode_signed(&descriptor_bytes)?;
+        let descriptor = file::codec::decode(&descriptor_envelope.payload)?;
+        message::schema::message_tombstone_exists(
+            store,
+            descriptor.workspace_id,
+            descriptor.message_id,
+        )?
+    };
+    if !message_id_tombstoned {
+        return Ok(());
+    }
+    purge_slice_rows_and_event(store, slice_event_id, &slice, report)
+}
+
+fn purge_slice_rows_and_event(
+    store: &Store,
+    slice_event_id: EventId,
+    slice: &file_slice::types::FileSliceEvent,
+    report: &mut PurgeReport,
+) -> Result<(), String> {
+    let slot_key =
+        file_slice::schema::file_slice_key(slice.workspace_id, slice.file_id, slice.slice_number);
+    report.file_slice_rows_deleted += store
+        .delete_table_rows_in_tx(file_slice::schema::FILE_SLICES, vec![slot_key])
+        .map_err(|err| format!("delete file slice row: {err}"))?;
+    if retention::purge_event_storage_in_tx(store, &slice_event_id)
+        .map_err(|err| format!("purge file slice event: {err}"))?
     {
         report.event_bytes_purged += 1;
     }

@@ -167,7 +167,7 @@ pub fn list_for_display(
     let start = total - take;
     messages.drain(..start);
     let reactions = reactions_grouped_by_message_for_display(store, workspace_id)?;
-    let files = super::super::file::schema::files_grouped_by_message(store, workspace_id)?;
+    let files = files_grouped_by_message_for_display(store, workspace_id)?;
     let mut display = Vec::with_capacity(messages.len());
     for (idx, row) in messages.into_iter().enumerate() {
         let author_username = user_name(store, workspace_id, row.author_user_id)?;
@@ -291,6 +291,18 @@ fn open_sealed_message_row(
         signer_endpoint_shared_id: row.signer_endpoint_shared_id,
         text,
     }))
+}
+
+fn files_grouped_by_message_for_display(
+    store: &Store,
+    workspace_id: EventId,
+) -> Result<BTreeMap<EventId, Vec<super::super::file::types::FileRow>>, String> {
+    let rows = super::super::file::cli::visible_file_rows(store, workspace_id)?;
+    let mut grouped: BTreeMap<EventId, Vec<super::super::file::types::FileRow>> = BTreeMap::new();
+    for row in rows {
+        grouped.entry(row.message_id).or_default().push(row);
+    }
+    Ok(grouped)
 }
 
 fn reactions_grouped_by_message_for_display(

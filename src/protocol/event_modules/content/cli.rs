@@ -2,14 +2,19 @@
 //!
 //! `send-file` is the canonical cross-module command: it creates one message
 //! event, one file descriptor event, and N file_slice events in a single
-//! bundle. Leaf-module CLI files own per-event commands; this file is reserved
-//! for flows that can only be described as a join over multiple children.
+//! bundle. The bundle threads the parent message's content key
+//! (`(removal_frontier_id, local_key_secret_id, key_secret)`) into the file
+//! and slice commands so descriptor metadata and slice payloads ride encrypted
+//! over the wire under the same AEAD key as the message text. Leaf-module CLI
+//! files own per-event commands; this file is reserved for flows that can
+//! only be described as a join over multiple children.
 
 use std::fs;
 use std::path::PathBuf;
 
 use crate::core::cli::{CliArgs, CliCommand, CliOutput};
 use crate::core::crypto;
+use crate::core::crypto::XCHACHA20_POLY1305_TAG_BYTES;
 use crate::protocol::cli::Context;
 use crate::protocol::event_modules::content::{file, file_slice, message};
 use crate::protocol::event_modules::identity::endpoint;
@@ -65,16 +70,16 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
         return Err("local endpoint signing key does not match workspace membership".to_string());
     }
 
-    let bytes = fs::read(&parsed.file_path)
+    let plaintext = fs::read(&parsed.file_path)
         .map_err(|err| format!("read {}: {err}", parsed.file_path.display()))?;
-    let blob_bytes = bytes.len() as u64;
+    let blob_bytes = plaintext.len() as u64;
     let slice_bytes = u32::try_from(file_slice::types::FILE_SLICE_DATA_BYTES)
         .map_err(|_| "slice budget overflows u32".to_string())?;
     let total_slices = if blob_bytes == 0 {
         0
     } else {
         u32::try_from(
-            bytes
+            plaintext
                 .len()
                 .div_ceil(file_slice::types::FILE_SLICE_DATA_BYTES),
         )
@@ -87,17 +92,17 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
         .ok_or_else(|| "file path is not valid utf-8".to_string())?
         .to_string();
 
-    let (root_hash, outboard) = crypto::bao_outboard(&bytes)?;
-
     let starting_timestamp = message::cli::next_timestamp(&context.store, parsed.workspace_id)?;
     let mut timestamp = starting_timestamp;
     let content_key = message::cli::require_content_key(&context.store, parsed.workspace_id)?;
+    let signer_endpoint = membership.endpoint_shared_id;
 
+    // Send-message event under the parent's content key.
     let send = message::commands::send(message::commands::SendMessage {
         workspace_id: parsed.workspace_id,
         created_at_ms: timestamp,
         author_user_id: membership.user_authority_event_id,
-        signer_endpoint_shared_id: membership.endpoint_shared_id,
+        signer_endpoint_shared_id: signer_endpoint,
         signer_private_key: local.signing_secret,
         removal_frontier_id: content_key.removal_frontier_id,
         local_key_secret_id: content_key.local_key_secret_id,
@@ -107,17 +112,39 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
     let message_id = send.value.message_id;
     timestamp = timestamp.saturating_add(1);
 
-    let file_id = derive_file_id(
-        &membership.endpoint_shared_id,
-        message_id,
-        starting_timestamp,
+    let file_id = derive_file_id(&signer_endpoint, message_id, starting_timestamp);
+
+    // Encrypt each plaintext slice with the parent's content key. Slice AAD
+    // is independent of file_event_id (see file_slice::codec docs), so a
+    // single seal pass + BAO outboard suffices.
+    let mut ciphertext_total = Vec::with_capacity(
+        plaintext.len() + (total_slices as usize) * XCHACHA20_POLY1305_TAG_BYTES,
     );
+    for slice_number in 0..total_slices {
+        let start = (slice_number as usize) * slice_bytes as usize;
+        let end = ((slice_number + 1) as usize * slice_bytes as usize).min(plaintext.len());
+        let chunk = file_slice::codec::seal_slice(
+            &content_key.key_secret,
+            &parsed.workspace_id,
+            &file_id,
+            slice_number,
+            &signer_endpoint,
+            &plaintext[start..end],
+        )?;
+        ciphertext_total.extend_from_slice(&chunk);
+    }
+    let (root_hash, outboard) = if ciphertext_total.is_empty() {
+        ([0u8; 32], Vec::new())
+    } else {
+        crypto::bao_outboard(&ciphertext_total)?
+    };
+
     let create_file = file::commands::create(file::commands::CreateFile {
         workspace_id: parsed.workspace_id,
         created_at_ms: timestamp,
         message_id,
         author_user_id: membership.user_authority_event_id,
-        signer_endpoint_shared_id: membership.endpoint_shared_id,
+        signer_endpoint_shared_id: signer_endpoint,
         signer_private_key: local.signing_secret,
         file_id,
         blob_bytes,
@@ -126,31 +153,42 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
         root_hash,
         filename: filename.clone(),
         mime_type: parsed.mime_type.clone(),
+        removal_frontier_id: content_key.removal_frontier_id,
+        local_key_secret_id: content_key.local_key_secret_id,
+        key_secret: content_key.key_secret,
     })?;
+    let file_event_id = create_file.value.file_event_id;
     timestamp = timestamp.saturating_add(1);
 
     let mut bundled: Vec<ProposedEvent> = Vec::new();
     bundled.extend(send.events);
-    let file_event_id = create_file.value.file_event_id;
     bundled.extend(create_file.events);
 
     for slice_number in 0..total_slices {
-        let start = u64::from(slice_number) * u64::from(slice_bytes);
-        let len = u64::from(slice_bytes).min(blob_bytes - start);
-        let slice =
-            file_slice::commands::slice_from_plaintext(file_slice::commands::SliceFromPlaintext {
+        let plaintext_start = (slice_number as usize) * slice_bytes as usize;
+        let plaintext_end =
+            ((slice_number + 1) as usize * slice_bytes as usize).min(plaintext.len());
+        let plaintext_len = (plaintext_end - plaintext_start) as u32;
+        let chunk_size = u64::from(slice_bytes) + XCHACHA20_POLY1305_TAG_BYTES as u64;
+        let slice_start = u64::from(slice_number) * chunk_size;
+        let slice_len = u64::from(plaintext_len) + XCHACHA20_POLY1305_TAG_BYTES as u64;
+        let slice = file_slice::commands::slice_from_ciphertext(
+            file_slice::commands::SliceFromCiphertext {
                 workspace_id: parsed.workspace_id,
                 created_at_ms: timestamp,
                 file_id,
                 file_event_id,
                 slice_number,
-                signer_endpoint_shared_id: membership.endpoint_shared_id,
+                signer_endpoint_shared_id: signer_endpoint,
                 signer_private_key: local.signing_secret,
-                plaintext: &bytes,
+                local_key_secret_id: content_key.local_key_secret_id,
+                plaintext_len,
+                ciphertext: &ciphertext_total,
                 outboard: &outboard,
-                slice_start: start,
-                slice_len: len,
-            })?;
+                slice_start,
+                slice_len,
+            },
+        )?;
         bundled.extend(slice.events);
         timestamp = timestamp.saturating_add(1);
     }

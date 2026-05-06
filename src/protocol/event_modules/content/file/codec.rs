@@ -1,24 +1,51 @@
 //! Codec for signed file descriptor events.
 //!
-//! The descriptor names the file_id (random, fixed 32 bytes), total size, and
-//! the per-slice budget. Every slice carries the file_id and slice_number, so
-//! the descriptor is the gluing record that lets workers stream and verify
-//! slice arrival.
+//! The descriptor names the file_id (random, fixed 32 bytes), total size, the
+//! per-slice byte budget, the parent message it is attached to, and the BAO
+//! `root_hash` of the encrypted blob. Filename and mime ride in an
+//! authenticated ciphertext slot keyed by the parent message's content key
+//! (`(removal_frontier_id, local_key_secret_id)`) so canonical bytes never
+//! leak the plaintext name or mime type. The slot is fixed-width so wire
+//! bytes stay deterministic per event type. Slice events depend on this
+//! descriptor's event id and on the same `local_key_secret_id`, so AEAD
+//! decryption can run at read time without a separate blocking system.
 
-use crate::core::crypto::{self, Ed25519PrivateKey, ED25519_SIGNATURE_BYTES};
+use crate::core::crypto::{
+    self, Ed25519PrivateKey, XChaCha20Poly1305Key, XChaCha20Poly1305Nonce,
+    ED25519_SIGNATURE_BYTES, XCHACHA20_POLY1305_NONCE_BYTES,
+};
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
 use crate::protocol::wire::{Reader, Writer};
 
 use super::types::{
-    FileEvent, SignedFileEnvelope, FILE_MIME_BYTES, FILE_NAME_BYTES, MAX_FILE_BYTES,
+    FileDescriptorCiphertext, FileDescriptorPlaintext, FileEvent, SignedFileEnvelope,
+    FILE_DESCRIPTOR_CIPHERTEXT_BYTES, FILE_DESCRIPTOR_PLAINTEXT_BYTES, FILE_MIME_BYTES,
+    FILE_NAME_BYTES, MAX_FILE_BYTES,
 };
 
 pub const TYPE_FILE: u8 = 13;
 pub const TYPE_SIGNED_FILE: u8 = 15;
-/// tag(1) + workspace(32) + ts(8) + message_id(32) + author(32) + file_id(32)
-/// + blob_bytes(8) + total_slices(4) + slice_bytes(4) + root_hash(32) + name + mime
-pub const FILE_WIRE_SIZE: usize =
-    1 + 32 + 8 + 32 + 32 + 32 + 8 + 4 + 4 + 32 + FILE_NAME_BYTES + FILE_MIME_BYTES;
+/// Domain-separated AAD prefix for the descriptor's sealed slot.
+pub const FILE_DESCRIPTOR_ENCRYPTION_PURPOSE: &[u8] = b"topo file descriptor v1";
+
+/// Inner wire size: tag(1) + workspace(32) + ts(8) + message_id(32) +
+/// author(32) + file_id(32) + blob_bytes(8) + total_slices(4) + slice_bytes(4)
+/// + root_hash(32) + removal_frontier(32) + local_key_secret(32) + nonce
+/// + sealed slot.
+pub const FILE_WIRE_SIZE: usize = 1
+    + 32
+    + 8
+    + 32
+    + 32
+    + 32
+    + 8
+    + 4
+    + 4
+    + 32
+    + 32
+    + 32
+    + XCHACHA20_POLY1305_NONCE_BYTES
+    + FILE_DESCRIPTOR_CIPHERTEXT_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileMetadata {
@@ -27,12 +54,11 @@ struct FileMetadata {
     message_id: EventId,
     author_user_id: EventId,
     file_id: EventId,
+    local_key_secret_id: EventId,
 }
 
 pub fn encode(event: &FileEvent) -> Result<Vec<u8>, String> {
     validate(event)?;
-    let filename = encode_text_slot(&event.filename, FILE_NAME_BYTES, "file filename")?;
-    let mime_type = encode_text_slot(&event.mime_type, FILE_MIME_BYTES, "file mime type")?;
     let mut out = Writer::with_capacity(FILE_WIRE_SIZE);
     out.u8(TYPE_FILE);
     out.id(&event.workspace_id);
@@ -44,8 +70,10 @@ pub fn encode(event: &FileEvent) -> Result<Vec<u8>, String> {
     out.u32(event.total_slices as usize);
     out.u32(event.slice_bytes as usize);
     out.id(&event.root_hash);
-    out.raw(&filename);
-    out.raw(&mime_type);
+    out.id(&event.removal_frontier_id);
+    out.id(&event.local_key_secret_id);
+    out.raw(&event.nonce);
+    out.raw(&event.ciphertext);
     Ok(out.finish())
 }
 
@@ -64,8 +92,10 @@ pub fn decode(bytes: &[u8]) -> Result<FileEvent, String> {
     let total_slices = reader.u32()?;
     let slice_bytes = reader.u32()?;
     let root_hash = reader.id()?;
-    let filename = decode_text_slot(reader.slice(FILE_NAME_BYTES)?, "file filename")?;
-    let mime_type = decode_text_slot(reader.slice(FILE_MIME_BYTES)?, "file mime type")?;
+    let removal_frontier_id = reader.id()?;
+    let local_key_secret_id = reader.id()?;
+    let nonce = fixed_nonce(reader.bytes(XCHACHA20_POLY1305_NONCE_BYTES)?)?;
+    let ciphertext = fixed_ciphertext(reader.bytes(FILE_DESCRIPTOR_CIPHERTEXT_BYTES)?)?;
     reader.finish()?;
     let event = FileEvent {
         workspace_id,
@@ -77,8 +107,10 @@ pub fn decode(bytes: &[u8]) -> Result<FileEvent, String> {
         total_slices,
         slice_bytes,
         root_hash,
-        filename,
-        mime_type,
+        removal_frontier_id,
+        local_key_secret_id,
+        nonce,
+        ciphertext,
     };
     validate(&event)?;
     Ok(event)
@@ -145,11 +177,12 @@ pub fn signing_bytes(event: &SignedFileEnvelope) -> Vec<u8> {
 pub fn signed_record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
     let envelope = decode_signed(&bytes)?;
     let metadata = metadata(&envelope.payload)?;
-    let mut dependencies = Vec::with_capacity(4);
+    let mut dependencies = Vec::with_capacity(5);
     push_unique(&mut dependencies, envelope.signer_endpoint_shared_id);
     push_unique(&mut dependencies, metadata.workspace_id);
     push_unique(&mut dependencies, metadata.author_user_id);
     push_unique(&mut dependencies, metadata.message_id);
+    push_unique(&mut dependencies, metadata.local_key_secret_id);
     Ok(EventRecord {
         timestamp: metadata.created_at_ms,
         body_len: FILE_WIRE_SIZE - 1,
@@ -172,6 +205,7 @@ fn metadata(bytes: &[u8]) -> Result<FileMetadata, String> {
         message_id: event.message_id,
         author_user_id: event.author_user_id,
         file_id: event.file_id,
+        local_key_secret_id: event.local_key_secret_id,
     })
 }
 
@@ -179,6 +213,12 @@ fn validate(event: &FileEvent) -> Result<(), String> {
     if event.blob_bytes > MAX_FILE_BYTES {
         return Err("file size exceeds the 10 GiB limit".to_string());
     }
+    validate_id("file workspace", &event.workspace_id)?;
+    validate_id("file message_id", &event.message_id)?;
+    validate_id("file author_user_id", &event.author_user_id)?;
+    validate_id("file file_id", &event.file_id)?;
+    validate_id("file removal_frontier_id", &event.removal_frontier_id)?;
+    validate_id("file local_key_secret_id", &event.local_key_secret_id)?;
     if event.blob_bytes == 0 {
         if event.total_slices != 0 {
             return Err("zero-byte file must declare zero slices".to_string());
@@ -236,6 +276,25 @@ fn fixed_signature(bytes: Vec<u8>) -> Result<[u8; ED25519_SIGNATURE_BYTES], Stri
         .map_err(|_| "signed file signature length mismatch".to_string())
 }
 
+fn fixed_nonce(bytes: Vec<u8>) -> Result<XChaCha20Poly1305Nonce, String> {
+    bytes
+        .try_into()
+        .map_err(|_| "file descriptor nonce length mismatch".to_string())
+}
+
+fn fixed_ciphertext(bytes: Vec<u8>) -> Result<FileDescriptorCiphertext, String> {
+    bytes
+        .try_into()
+        .map_err(|_| "file descriptor ciphertext length mismatch".to_string())
+}
+
+fn validate_id(name: &str, id: &EventId) -> Result<(), String> {
+    if id.iter().all(|byte| *byte == 0) {
+        return Err(format!("{name} cannot be empty"));
+    }
+    Ok(())
+}
+
 fn push_unique(out: &mut Vec<EventId>, id: EventId) {
     if !out.iter().any(|candidate| candidate == &id) {
         out.push(id);
@@ -278,12 +337,120 @@ pub(crate) fn decode_text_slot(bytes: &[u8], label: &str) -> Result<String, Stri
         .map(ToOwned::to_owned)
 }
 
+/// Domain-separated associated data binding the descriptor's sealed slot to
+/// every clear-text field plus the signer endpoint membership. AAD must match
+/// at seal and open time; rebinding any of these fields on the wire flips a
+/// byte in the AAD and AEAD verification fails.
+pub fn descriptor_associated_data(
+    event: &FileEvent,
+    signer_endpoint_shared_id: EventId,
+) -> Vec<u8> {
+    let mut out = Writer::with_capacity(
+        FILE_DESCRIPTOR_ENCRYPTION_PURPOSE.len()
+            + 1
+            + 32
+            + 8
+            + 32
+            + 32
+            + 32
+            + 8
+            + 4
+            + 4
+            + 32
+            + 32
+            + 32
+            + XCHACHA20_POLY1305_NONCE_BYTES
+            + 32,
+    );
+    out.raw(FILE_DESCRIPTOR_ENCRYPTION_PURPOSE);
+    out.u8(TYPE_FILE);
+    out.id(&event.workspace_id);
+    out.u64(event.created_at_ms);
+    out.id(&event.message_id);
+    out.id(&event.author_user_id);
+    out.id(&event.file_id);
+    out.u64(event.blob_bytes);
+    out.u32(event.total_slices as usize);
+    out.u32(event.slice_bytes as usize);
+    out.id(&event.root_hash);
+    out.id(&event.removal_frontier_id);
+    out.id(&event.local_key_secret_id);
+    out.raw(&event.nonce);
+    out.id(&signer_endpoint_shared_id);
+    out.finish()
+}
+
+/// Pack `(filename, mime)` into the fixed-width descriptor plaintext slot.
+pub fn pack_descriptor_plaintext(
+    plaintext: &FileDescriptorPlaintext,
+) -> Result<[u8; FILE_DESCRIPTOR_PLAINTEXT_BYTES], String> {
+    let filename = encode_text_slot(&plaintext.filename, FILE_NAME_BYTES, "file filename")?;
+    let mime = encode_text_slot(&plaintext.mime_type, FILE_MIME_BYTES, "file mime type")?;
+    let mut out = [0u8; FILE_DESCRIPTOR_PLAINTEXT_BYTES];
+    out[..FILE_NAME_BYTES].copy_from_slice(&filename);
+    out[FILE_NAME_BYTES..FILE_NAME_BYTES + FILE_MIME_BYTES].copy_from_slice(&mime);
+    Ok(out)
+}
+
+/// Unpack a fixed-width descriptor plaintext slot into `(filename, mime)`.
+pub fn unpack_descriptor_plaintext(bytes: &[u8]) -> Result<FileDescriptorPlaintext, String> {
+    if bytes.len() != FILE_DESCRIPTOR_PLAINTEXT_BYTES {
+        return Err("file descriptor plaintext length mismatch".to_string());
+    }
+    let filename = decode_text_slot(&bytes[..FILE_NAME_BYTES], "file filename")?;
+    let mime_type = decode_text_slot(
+        &bytes[FILE_NAME_BYTES..FILE_NAME_BYTES + FILE_MIME_BYTES],
+        "file mime type",
+    )?;
+    Ok(FileDescriptorPlaintext {
+        filename,
+        mime_type,
+    })
+}
+
+/// Seal the descriptor's sensitive fields (filename, mime) into the
+/// fixed-width ciphertext slot using XChaCha20-Poly1305 with the parent
+/// message's content key.
+pub fn seal_descriptor_slot(
+    key: &XChaCha20Poly1305Key,
+    nonce: &XChaCha20Poly1305Nonce,
+    associated_data: &[u8],
+    plaintext: &FileDescriptorPlaintext,
+) -> Result<FileDescriptorCiphertext, String> {
+    let packed = pack_descriptor_plaintext(plaintext)?;
+    let bytes = crypto::xchacha20poly1305_encrypt(key, associated_data, nonce, &packed)?;
+    bytes
+        .try_into()
+        .map_err(|_| "file descriptor ciphertext length mismatch".to_string())
+}
+
+/// Reveal the descriptor's sensitive fields from the sealed ciphertext slot.
+/// Returns an error if the AEAD tag, AAD, key, or nonce do not match.
+pub fn open_descriptor_slot(
+    key: &XChaCha20Poly1305Key,
+    nonce: &XChaCha20Poly1305Nonce,
+    associated_data: &[u8],
+    ciphertext: &FileDescriptorCiphertext,
+) -> Result<FileDescriptorPlaintext, String> {
+    let plaintext = crypto::xchacha20poly1305_decrypt(key, associated_data, nonce, ciphertext)?;
+    unpack_descriptor_plaintext(&plaintext)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn descriptor_plaintext() -> FileDescriptorPlaintext {
+        FileDescriptorPlaintext {
+            filename: "photo.jpg".to_string(),
+            mime_type: "image/jpeg".to_string(),
+        }
+    }
+
     fn event() -> FileEvent {
-        FileEvent {
+        let key: XChaCha20Poly1305Key = [9; 32];
+        let nonce: XChaCha20Poly1305Nonce = [1; XCHACHA20_POLY1305_NONCE_BYTES];
+        let mut event = FileEvent {
             workspace_id: [1; 32],
             created_at_ms: 99,
             message_id: [2; 32],
@@ -293,9 +460,15 @@ mod tests {
             total_slices: 1,
             slice_bytes: 1024,
             root_hash: [5; 32],
-            filename: "photo.jpg".to_string(),
-            mime_type: "image/jpeg".to_string(),
-        }
+            removal_frontier_id: [6; 32],
+            local_key_secret_id: [7; 32],
+            nonce,
+            ciphertext: [0; FILE_DESCRIPTOR_CIPHERTEXT_BYTES],
+        };
+        let aad = descriptor_associated_data(&event, [8; 32]);
+        event.ciphertext = seal_descriptor_slot(&key, &nonce, &aad, &descriptor_plaintext())
+            .expect("seal descriptor");
+        event
     }
 
     #[test]
@@ -306,40 +479,87 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_slot_roundtrips_with_matching_key_aad_and_nonce() {
+        let key: XChaCha20Poly1305Key = [9; 32];
+        let nonce: XChaCha20Poly1305Nonce = [1; XCHACHA20_POLY1305_NONCE_BYTES];
+        let event = event();
+        let aad = descriptor_associated_data(&event, [8; 32]);
+        let recovered =
+            open_descriptor_slot(&key, &nonce, &aad, &event.ciphertext).expect("open slot");
+        assert_eq!(recovered, descriptor_plaintext());
+    }
+
+    #[test]
+    fn descriptor_slot_rejects_wrong_key() {
+        let nonce: XChaCha20Poly1305Nonce = [1; XCHACHA20_POLY1305_NONCE_BYTES];
+        let event = event();
+        let aad = descriptor_associated_data(&event, [8; 32]);
+        assert!(open_descriptor_slot(&[10; 32], &nonce, &aad, &event.ciphertext).is_err());
+    }
+
+    #[test]
+    fn descriptor_slot_rejects_wrong_aad_signer_binding() {
+        let key: XChaCha20Poly1305Key = [9; 32];
+        let nonce: XChaCha20Poly1305Nonce = [1; XCHACHA20_POLY1305_NONCE_BYTES];
+        let event = event();
+        let aad_other_signer = descriptor_associated_data(&event, [99; 32]);
+        assert!(open_descriptor_slot(&key, &nonce, &aad_other_signer, &event.ciphertext).is_err());
+    }
+
+    #[test]
+    fn descriptor_slot_rejects_ciphertext_tamper() {
+        let key: XChaCha20Poly1305Key = [9; 32];
+        let nonce: XChaCha20Poly1305Nonce = [1; XCHACHA20_POLY1305_NONCE_BYTES];
+        let mut event = event();
+        let aad = descriptor_associated_data(&event, [8; 32]);
+        event.ciphertext[0] ^= 1;
+        assert!(open_descriptor_slot(&key, &nonce, &aad, &event.ciphertext).is_err());
+    }
+
+    #[test]
     fn rejects_invalid_slice_arithmetic() {
-        assert!(encode(&FileEvent {
-            blob_bytes: 1024,
+        let bad_count = FileEvent {
             total_slices: 0,
-            slice_bytes: 1024,
             ..event()
-        })
-        .is_err());
-        assert!(encode(&FileEvent {
-            blob_bytes: 1024,
-            total_slices: 1,
+        };
+        assert!(encode(&bad_count).is_err());
+
+        let bad_budget = FileEvent {
             slice_bytes: 0,
+            total_slices: 1,
             ..event()
-        })
-        .is_err());
-        assert!(encode(&FileEvent {
+        };
+        assert!(encode(&bad_budget).is_err());
+
+        let bad_ceiling = FileEvent {
             blob_bytes: 1024,
             total_slices: 2,
             slice_bytes: 1024,
             ..event()
-        })
-        .is_err());
+        };
+        assert!(encode(&bad_ceiling).is_err());
     }
 
     #[test]
-    fn signed_envelope_dependencies_are_unique() {
+    fn signed_envelope_dependencies_include_local_key_secret_id() {
         let payload = encode(&event()).expect("encode");
         let envelope = sign([6; 32], &[7; 32], payload);
         let bytes = encode_signed(&envelope);
         let record = signed_record_from_bytes(bytes).expect("record");
+        // signer, workspace, author, message_id, local_key_secret_id
         assert_eq!(
             record.dependencies,
-            vec![[6; 32], [1; 32], [3; 32], [2; 32]]
+            vec![[6; 32], [1; 32], [3; 32], [2; 32], [7; 32]]
         );
         assert_eq!(record.scope, EventScope::Shared);
+    }
+
+    #[test]
+    fn descriptor_canonical_bytes_do_not_carry_filename_or_mime_in_clear() {
+        let bytes = encode(&event()).expect("encode");
+        assert!(!bytes.windows("photo.jpg".len()).any(|w| w == b"photo.jpg"));
+        assert!(!bytes
+            .windows("image/jpeg".len())
+            .any(|w| w == b"image/jpeg"));
     }
 }

@@ -1,11 +1,14 @@
 //! File descriptor projection rows.
 //!
-//! Rows are keyed by `workspace_id || file_event_id`. Two indexes live in their
-//! own tables: `(workspace_id || message_id || file_event_id)` for "files for
-//! this message", and `(workspace_id || file_id || file_event_id)` for "the
-//! descriptor for this slice's file_id". Both indexes carry the canonical
-//! `file_event_id` as the value so workers/queries can dereference the primary
-//! row without scanning the full table.
+//! Sealed rows are keyed by `workspace_id || file_event_id`. Two indexes live
+//! in their own tables: `(workspace_id || message_id || file_event_id)` for
+//! "files for this message", and `(workspace_id || file_id || file_event_id)`
+//! for "the descriptor for this slice's file_id". Both indexes carry the
+//! canonical `file_event_id` as the value so workers/queries can dereference
+//! the primary row without scanning the full table. The sealed row carries
+//! every clear-text field the projector saw plus the AEAD nonce + ciphertext;
+//! the read-side CLI opens the slot using the local key-secret named by
+//! `local_key_secret_id` to reveal filename and mime.
 
 use std::collections::BTreeMap;
 
@@ -13,8 +16,10 @@ use crate::core::store::{Schema, Store, TableName, TableRow};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::wire::{Reader, Writer};
 
-use super::codec;
-use super::types::{FileEvent, FileRow, FILE_MIME_BYTES, FILE_NAME_BYTES};
+use super::types::{
+    FileEvent, SealedFileRow, FILE_DESCRIPTOR_CIPHERTEXT_BYTES,
+};
+use crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES;
 
 pub const FILES: TableName = TableName::new("content.files");
 pub const FILES_BY_MESSAGE: TableName = TableName::new("content.files_by_message");
@@ -32,22 +37,22 @@ pub fn file_rows(
     event: &FileEvent,
 ) -> Result<Vec<TableRow>, String> {
     Ok(vec![
-        file_row(file_event_id, signer_endpoint_shared_id, event)?,
+        sealed_file_row(file_event_id, signer_endpoint_shared_id, event),
         file_by_message_row(file_event_id, event),
         file_by_file_id_row(file_event_id, event),
     ])
 }
 
-pub fn file_row(
+pub fn sealed_file_row(
     file_event_id: EventId,
     signer_endpoint_shared_id: EventId,
     event: &FileEvent,
-) -> Result<TableRow, String> {
-    Ok(TableRow {
+) -> TableRow {
+    TableRow {
         table: FILES,
         key: file_key(event.workspace_id, file_event_id),
-        value: encode_file_value(signer_endpoint_shared_id, event)?,
-    })
+        value: encode_sealed_value(signer_endpoint_shared_id, event),
+    }
 }
 
 pub fn file_by_message_row(file_event_id: EventId, event: &FileEvent) -> TableRow {
@@ -111,7 +116,7 @@ pub fn file_by_file_id_prefix(workspace_id: EventId, file_id: EventId) -> Vec<u8
     key
 }
 
-pub fn decode_file_row(key: &[u8], value: &[u8]) -> Result<FileRow, String> {
+pub fn decode_sealed_file_row(key: &[u8], value: &[u8]) -> Result<SealedFileRow, String> {
     if key.len() != 64 {
         return Err("file row key is malformed".to_string());
     }
@@ -130,10 +135,18 @@ pub fn decode_file_row(key: &[u8], value: &[u8]) -> Result<FileRow, String> {
     let total_slices = reader.u32()?;
     let slice_bytes = reader.u32()?;
     let root_hash = reader.id()?;
-    let filename = codec::decode_text_slot(reader.slice(FILE_NAME_BYTES)?, "file filename")?;
-    let mime_type = codec::decode_text_slot(reader.slice(FILE_MIME_BYTES)?, "file mime type")?;
+    let removal_frontier_id = reader.id()?;
+    let local_key_secret_id = reader.id()?;
+    let nonce = reader
+        .bytes(XCHACHA20_POLY1305_NONCE_BYTES)?
+        .try_into()
+        .map_err(|_| "file row nonce length mismatch".to_string())?;
+    let ciphertext = reader
+        .bytes(FILE_DESCRIPTOR_CIPHERTEXT_BYTES)?
+        .try_into()
+        .map_err(|_| "file row ciphertext length mismatch".to_string())?;
     reader.finish()?;
-    Ok(FileRow {
+    Ok(SealedFileRow {
         workspace_id,
         file_event_id,
         message_id,
@@ -145,17 +158,22 @@ pub fn decode_file_row(key: &[u8], value: &[u8]) -> Result<FileRow, String> {
         total_slices,
         slice_bytes,
         root_hash,
-        filename,
-        mime_type,
+        removal_frontier_id,
+        local_key_secret_id,
+        nonce,
+        ciphertext,
     })
 }
 
-pub fn list_for_workspace(store: &Store, workspace_id: EventId) -> Result<Vec<FileRow>, String> {
+pub fn list_sealed_for_workspace(
+    store: &Store,
+    workspace_id: EventId,
+) -> Result<Vec<SealedFileRow>, String> {
     let mut rows = store
         .table_rows_with_key_prefix(FILES, &workspace_id, usize::MAX)
         .map_err(|err| format!("load files: {err}"))?
         .into_iter()
-        .map(|(key, value)| decode_file_row(&key, &value))
+        .map(|(key, value)| decode_sealed_file_row(&key, &value))
         .collect::<Result<Vec<_>, _>>()?;
     rows.sort_by(|a, b| {
         a.created_at_ms
@@ -172,12 +190,15 @@ pub fn count_for_workspace(store: &Store, workspace_id: EventId) -> Result<usize
         .map_err(|err| format!("count files: {err}"))
 }
 
-pub fn files_grouped_by_message(
+/// Group sealed file rows by their parent message id so callers can join
+/// files into message listings without scanning the descriptor table per
+/// message.
+pub fn sealed_files_grouped_by_message(
     store: &Store,
     workspace_id: EventId,
-) -> Result<BTreeMap<EventId, Vec<FileRow>>, String> {
-    let rows = list_for_workspace(store, workspace_id)?;
-    let mut grouped: BTreeMap<EventId, Vec<FileRow>> = BTreeMap::new();
+) -> Result<BTreeMap<EventId, Vec<SealedFileRow>>, String> {
+    let rows = list_sealed_for_workspace(store, workspace_id)?;
+    let mut grouped: BTreeMap<EventId, Vec<SealedFileRow>> = BTreeMap::new();
     for row in rows {
         grouped.entry(row.message_id).or_default().push(row);
     }
@@ -221,29 +242,35 @@ pub fn file_event_id_for_file_id(
     Ok(chosen.map(|(event_id, _)| event_id))
 }
 
-pub fn file_row_by_id(
+pub fn sealed_file_row_by_id(
     store: &Store,
     workspace_id: EventId,
     file_event_id: EventId,
-) -> Result<Option<FileRow>, String> {
+) -> Result<Option<SealedFileRow>, String> {
     let key = file_key(workspace_id, file_event_id);
     let value = store
         .table_row(FILES, &key)
         .map_err(|err| format!("load file: {err}"))?;
     match value {
-        Some(value) => Ok(Some(decode_file_row(&key, &value)?)),
+        Some(value) => Ok(Some(decode_sealed_file_row(&key, &value)?)),
         None => Ok(None),
     }
 }
 
-fn encode_file_value(
-    signer_endpoint_shared_id: EventId,
-    event: &FileEvent,
-) -> Result<Vec<u8>, String> {
-    let filename = codec::encode_text_slot(&event.filename, FILE_NAME_BYTES, "file filename")?;
-    let mime_type = codec::encode_text_slot(&event.mime_type, FILE_MIME_BYTES, "file mime type")?;
+fn encode_sealed_value(signer_endpoint_shared_id: EventId, event: &FileEvent) -> Vec<u8> {
     let mut out = Writer::with_capacity(
-        8 + 32 + 32 + 32 + 32 + 8 + 4 + 4 + 32 + FILE_NAME_BYTES + FILE_MIME_BYTES,
+        8 + 32
+            + 32
+            + 32
+            + 32
+            + 8
+            + 4
+            + 4
+            + 32
+            + 32
+            + 32
+            + XCHACHA20_POLY1305_NONCE_BYTES
+            + FILE_DESCRIPTOR_CIPHERTEXT_BYTES,
     );
     out.u64(event.created_at_ms);
     out.id(&event.message_id);
@@ -254,7 +281,9 @@ fn encode_file_value(
     out.u32(event.total_slices as usize);
     out.u32(event.slice_bytes as usize);
     out.id(&event.root_hash);
-    out.raw(&filename);
-    out.raw(&mime_type);
-    Ok(out.finish())
+    out.id(&event.removal_frontier_id);
+    out.id(&event.local_key_secret_id);
+    out.raw(&event.nonce);
+    out.raw(&event.ciphertext);
+    out.finish()
 }

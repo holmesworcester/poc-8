@@ -1,9 +1,11 @@
 //! File leaf CLI: `files`, `save-file`.
 //!
 //! Read-only listing and assembly. The `send-file` write path lives at the
-//! content domain root because it spans message + file + file_slice. This file
-//! does not create canonical events; it consumes projected descriptor and slice
-//! rows for operator-facing reads.
+//! content domain root because it spans message + file + file_slice. This
+//! file does not create canonical events; it consumes projected sealed
+//! descriptor and slice rows for operator-facing reads, opening sealed slots
+//! using the local key-secret named by the descriptor's `local_key_secret_id`
+//! to recover plaintext filename, mime, and slice bytes.
 
 use std::fs;
 use std::path::PathBuf;
@@ -12,9 +14,12 @@ use crate::core::cli::{CliArgs, CliCommand, CliOutput};
 use crate::core::store::Store;
 use crate::protocol::cli::Context;
 use crate::protocol::event_modules::content::{file_slice, message};
+use crate::protocol::event_modules::encryption::local_key_secret;
 use crate::protocol::event_modules::types::EventId;
 
+use super::codec;
 use super::schema;
+use super::types::{FileRow, SealedFileRow};
 
 const FILES_USAGE: &str = "files WORKSPACE_ID_HEX [LIMIT]";
 const SAVE_FILE_USAGE: &str = "save-file WORKSPACE_ID_HEX FILE_SELECTOR OUT_PATH";
@@ -110,11 +115,17 @@ fn run_save_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
     )?;
     let out_path = PathBuf::from(args.get(2).expect("length checked"));
 
-    let row = schema::file_row_by_id(&context.store, workspace_id, file_event_id)?
+    let sealed = schema::sealed_file_row_by_id(&context.store, workspace_id, file_event_id)?
         .ok_or_else(|| "file does not exist".to_string())?;
-    if message::cli::is_deleted_by_author(&context.store, &row.message_id, &row.author_user_id)? {
+    if message::cli::is_deleted_by_author(
+        &context.store,
+        &sealed.message_id,
+        &sealed.author_user_id,
+    )? {
         return Err("file does not exist".to_string());
     }
+    let row = open_sealed_file_row(&context.store, &sealed)?
+        .ok_or_else(|| "file local content key is missing; cannot decode".to_string())?;
     let slices = file_slice::schema::list_for_file(&context.store, workspace_id, row.file_id)?;
     if slices.len() < row.total_slices as usize {
         return Err(format!(
@@ -124,9 +135,29 @@ fn run_save_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
         ));
     }
 
+    let secret = local_key_secret::schema::get(
+        &context.store,
+        sealed.workspace_id,
+        sealed.removal_frontier_id,
+    )?
+    .ok_or_else(|| "local content key is missing".to_string())?;
+    if secret.local_key_secret_id != sealed.local_key_secret_id {
+        return Err("file local key secret id mismatch".to_string());
+    }
+
     let mut bytes = Vec::with_capacity(row.blob_bytes as usize);
     for slice in &slices {
-        bytes.extend_from_slice(&slice.data);
+        let plaintext = file_slice::codec::open_slice(
+            &secret.key_secret,
+            &row.workspace_id,
+            &row.file_id,
+            slice.slice_number,
+            slice.plaintext_len,
+            &slice.signer_endpoint_shared_id,
+            &slice.ciphertext,
+        )
+        .map_err(|err| format!("decode slice {}: {err}", slice.slice_number))?;
+        bytes.extend_from_slice(&plaintext);
     }
     if bytes.len() as u64 != row.blob_bytes {
         return Err(format!(
@@ -164,7 +195,7 @@ pub fn list_summaries(
     for (idx, row) in rows.into_iter().enumerate() {
         let slices = file_slice::schema::list_for_file(store, workspace_id, row.file_id)?;
         let slices_received = u32::try_from(slices.len()).unwrap_or(u32::MAX);
-        let bytes_received: u64 = slices.iter().map(|slice| slice.data.len() as u64).sum();
+        let bytes_received: u64 = slices.iter().map(|slice| slice.plaintext_len as u64).sum();
         summaries.push(FileSummary {
             index: start + idx + 1,
             file_event_id: row.file_event_id,
@@ -181,20 +212,83 @@ pub fn list_summaries(
     Ok(summaries)
 }
 
-fn visible_file_rows(
+pub(crate) fn visible_file_rows(
     store: &Store,
     workspace_id: EventId,
-) -> Result<Vec<super::types::FileRow>, String> {
-    schema::list_for_workspace(store, workspace_id)?
-        .into_iter()
-        .filter_map(|row| {
-            match message::cli::is_deleted_by_author(store, &row.message_id, &row.author_user_id) {
-                Ok(false) => Some(Ok(row)),
-                Ok(true) => None,
-                Err(err) => Some(Err(err)),
-            }
-        })
-        .collect()
+) -> Result<Vec<FileRow>, String> {
+    let sealed_rows = schema::list_sealed_for_workspace(store, workspace_id)?;
+    let mut out = Vec::with_capacity(sealed_rows.len());
+    for sealed in sealed_rows {
+        if message::cli::is_deleted_by_author(
+            store,
+            &sealed.message_id,
+            &sealed.author_user_id,
+        )? {
+            continue;
+        }
+        let Some(row) = open_sealed_file_row(store, &sealed)? else {
+            continue;
+        };
+        out.push(row);
+    }
+    Ok(out)
+}
+
+pub(crate) fn open_sealed_file_row(
+    store: &Store,
+    sealed: &SealedFileRow,
+) -> Result<Option<FileRow>, String> {
+    let Some(secret) = local_key_secret::schema::get(
+        store,
+        sealed.workspace_id,
+        sealed.removal_frontier_id,
+    )?
+    else {
+        return Ok(None);
+    };
+    if secret.local_key_secret_id != sealed.local_key_secret_id {
+        return Err("file local key secret id mismatch".to_string());
+    }
+    let event = super::types::FileEvent {
+        workspace_id: sealed.workspace_id,
+        created_at_ms: sealed.created_at_ms,
+        message_id: sealed.message_id,
+        author_user_id: sealed.author_user_id,
+        file_id: sealed.file_id,
+        blob_bytes: sealed.blob_bytes,
+        total_slices: sealed.total_slices,
+        slice_bytes: sealed.slice_bytes,
+        root_hash: sealed.root_hash,
+        removal_frontier_id: sealed.removal_frontier_id,
+        local_key_secret_id: sealed.local_key_secret_id,
+        nonce: sealed.nonce,
+        ciphertext: sealed.ciphertext,
+    };
+    let aad = codec::descriptor_associated_data(&event, sealed.signer_endpoint_shared_id);
+    let plaintext = codec::open_descriptor_slot(
+        &secret.key_secret,
+        &sealed.nonce,
+        &aad,
+        &sealed.ciphertext,
+    )
+    .map_err(|err| format!("decode file descriptor: {err}"))?;
+    Ok(Some(FileRow {
+        workspace_id: sealed.workspace_id,
+        file_event_id: sealed.file_event_id,
+        message_id: sealed.message_id,
+        file_id: sealed.file_id,
+        author_user_id: sealed.author_user_id,
+        signer_endpoint_shared_id: sealed.signer_endpoint_shared_id,
+        created_at_ms: sealed.created_at_ms,
+        blob_bytes: sealed.blob_bytes,
+        total_slices: sealed.total_slices,
+        slice_bytes: sealed.slice_bytes,
+        root_hash: sealed.root_hash,
+        removal_frontier_id: sealed.removal_frontier_id,
+        local_key_secret_id: sealed.local_key_secret_id,
+        filename: plaintext.filename,
+        mime_type: plaintext.mime_type,
+    }))
 }
 
 fn resolve_file_selector(
