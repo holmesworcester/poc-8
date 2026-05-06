@@ -1162,10 +1162,7 @@ fn proposed_records(events: &[worker::ProposedEvent]) -> Vec<EventRecord> {
 }
 
 fn serve_lines(report: &connection_types::ServeReport) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(local_addr) = report.local_addr {
-        lines.push(format!("listening: {local_addr}"));
-    }
+    let mut lines = vec![format!("listening: {}", report.local_addr)];
     lines.extend([
         format!("accepted_connections: {}", report.accepted_connections),
         format!("received_events: {}", report.received_events),

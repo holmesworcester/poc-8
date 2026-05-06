@@ -1,7 +1,7 @@
 use crate::core::crypto;
-use crate::core::store::Store;
 use crate::protocol::event_modules::worker::{self, AdmitRecords, DrainUntilIdle};
 use crate::protocol::event_modules::Modules;
+use crate::protocol::Protocol;
 
 use super::super::{device_invite, user, user_invite, workspace};
 use super::*;
@@ -92,8 +92,7 @@ fn admits_received_device_invite_then_signed_endpoint_shared_join() {
         .chain(shared.events)
         .map(|event| event.into_record())
         .collect();
-    let store = Store::open_memory_with_schemas(&crate::protocol::event_modules::schemas())
-        .expect("open store");
+    let store = Protocol::open_memory_store().expect("open store");
     let modules = Modules::new();
 
     let report = worker::run(

@@ -1,4 +1,4 @@
-//! Protocol-wide schema and row helpers for the common event-module worker.
+//! Protocol-wide schema and row helpers for the common event pipeline.
 //!
 //! Core storage deliberately does not know about Topo events. This file is the
 //! protocol side of that boundary: it names row tables, encodes protocol
@@ -11,8 +11,9 @@
 //! edge tables make admission incremental: inserting a newly applied dependency
 //! only has to inspect events known to be waiting on that dependency.
 //! `TIMESTAMP_EVENTS` gives sync a timestamp-ordered feed of shared event ids
-//! without teaching core what an event is. Labels are generic, bounded context
-//! for projectors; richer read models belong in scoped module schema files.
+//! without teaching core what an event is. Operational worker queues live under
+//! `src/workers/schema.rs`. Labels are generic, bounded context for projectors;
+//! richer read models belong in scoped module schema files.
 
 use crate::core::store::{Schema, Store, TableName, TableRow};
 use crate::protocol::event_modules::types::{

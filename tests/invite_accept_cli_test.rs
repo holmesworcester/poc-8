@@ -24,8 +24,8 @@ fn invite_listens_and_accept_connects_two_cli_processes() {
     assert!(host_out.contains("accepted_connections: 1"), "{host_out}");
     assert_eq!(connection_count(&host), 1);
     assert_eq!(connection_count(&joiner), 1);
-    assert_eq!(connection_event_count(&host), 2);
-    assert_eq!(connection_event_count(&joiner), 2);
+    assert_eq!(connection_event_count(&host), 1);
+    assert_eq!(connection_event_count(&joiner), 1);
 }
 
 #[test]
@@ -49,9 +49,9 @@ fn invite_listens_for_two_separate_accepting_cli_processes() {
     assert_eq!(connection_count(&host), 2);
     assert_eq!(connection_count(&joiner_a), 1);
     assert_eq!(connection_count(&joiner_b), 1);
-    assert_eq!(connection_event_count(&host), 4);
-    assert_eq!(connection_event_count(&joiner_a), 2);
-    assert_eq!(connection_event_count(&joiner_b), 2);
+    assert_eq!(connection_event_count(&host), 2);
+    assert_eq!(connection_event_count(&joiner_a), 1);
+    assert_eq!(connection_event_count(&joiner_b), 1);
 }
 
 #[test]
@@ -398,6 +398,7 @@ fn admin_grant_requires_admin_and_promoted_user_can_invite() {
     let bob = temp_db(&tmp, "bob.db");
     let carol = temp_db(&tmp, "carol.db");
     let alice_invite_port = free_port();
+    let alice_route_port = free_port();
     let bob_route_port = free_port();
     let bob_invite_port = free_port();
 
@@ -440,7 +441,9 @@ fn admin_grant_requires_admin_and_promoted_user_can_invite() {
     assert!(grant.contains("admin_id:"), "{grant}");
 
     connect_pair(&alice, &bob, bob_route_port);
-    sync_once(&alice, &bob, bob_route_port);
+    connect_pair(&bob, &alice, alice_route_port);
+    let _sync = sync_daemons(&alice, alice_route_port, &bob, bob_route_port);
+    wait_until_invite_can_be_created(&bob, &workspace_id, bob_invite_port);
 
     let mut bob_listener = spawn_workspace_invite_listener(&bob, &workspace_id, bob_invite_port, 1);
     let bob_invite = bob_listener.invite_link();
@@ -697,21 +700,6 @@ fn spawn_device_link_listener(
     listening_invite_from_child(child)
 }
 
-fn start_sync_listener(db: &str, port: u16, accept: usize) -> Child {
-    let port = port.to_string();
-    let accept = accept.to_string();
-    spawn_topo(&[
-        "--db",
-        db,
-        "sync",
-        "--listen",
-        "127.0.0.1",
-        &port,
-        "--accept",
-        &accept,
-    ])
-}
-
 fn listening_invite_from_child(mut child: Child) -> ListeningInvite {
     let stdout = child.stdout.take().expect("listener stdout");
     let stderr = child.stderr.take().expect("listener stderr");
@@ -779,22 +767,75 @@ fn connect_pair(initiator_db: &str, listener_db: &str, listener_port: u16) {
     assert!(out.contains("accepted_connections: 1"), "{out}");
 }
 
-fn sync_once(from_db: &str, listener_db: &str, listener_port: u16) {
-    let listener = start_sync_listener(listener_db, listener_port, 1);
+struct RunningDaemon {
+    child: Child,
+}
+
+impl Drop for RunningDaemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn sync_daemons(
+    from_db: &str,
+    from_port: u16,
+    listener_db: &str,
+    listener_port: u16,
+) -> (RunningDaemon, RunningDaemon) {
+    (
+        spawn_daemon(listener_db, listener_port),
+        spawn_daemon(from_db, from_port),
+    )
+}
+
+fn spawn_daemon(db: &str, port: u16) -> RunningDaemon {
+    let port = port.to_string();
+    let mut child = spawn_topo(&[
+        "--db",
+        db,
+        "start",
+        "--listen",
+        "127.0.0.1",
+        &port,
+        "--tick-ms",
+        "50",
+        "--quiet-ms",
+        "50",
+    ]);
+    let stdout = child.stdout.take().expect("daemon stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut first = String::new();
+    reader.read_line(&mut first).expect("daemon first line");
+    assert!(
+        first.starts_with("listening: "),
+        "daemon did not report listening: {first}"
+    );
+    RunningDaemon { child }
+}
+
+fn wait_until_invite_can_be_created(db: &str, workspace_id: &str, port: u16) {
+    let addr = format!("127.0.0.1:{port}");
     let mut last = String::new();
-    let sync_out = (0..100)
-        .find_map(|_| {
-            let output = topo(&["--db", from_db, "sync"]);
-            if output.status.success() {
-                return Some(stdout(&output));
-            }
-            last = stderr(&output);
-            thread::sleep(Duration::from_millis(50));
-            None
-        })
-        .unwrap_or_else(|| panic!("sync never succeeded: {last}"));
-    assert!(sync_out.contains("routes_synced:"), "{sync_out}");
-    wait_success(listener, "sync listener");
+    thread::sleep(Duration::from_millis(1000));
+    for _ in 0..200 {
+        let output = topo(&[
+            "--db",
+            db,
+            "invite",
+            "--workspace",
+            workspace_id,
+            "--public-addr",
+            &addr,
+        ]);
+        if output.status.success() {
+            return;
+        }
+        last = stderr(&output);
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("workspace invite never became available: {last}");
 }
 
 fn create_workspace(db: &str, name: &str, username: &str, device_name: &str) -> String {

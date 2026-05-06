@@ -58,5 +58,9 @@ fn network_queues_are_opaque_and_idempotent_rows() {
         network_queues::enqueue_inbound(&store, &[inbound.clone(), duplicate_inbound]).unwrap(),
         1
     );
+    assert_eq!(
+        network_queues::claim_inbound(&store, 16).unwrap(),
+        vec![inbound.clone()]
+    );
     network_queues::delete_inbound(&store, &[inbound]).expect("delete queued inbound bytes");
 }

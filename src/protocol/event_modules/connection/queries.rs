@@ -1,8 +1,7 @@
 //! Read-only connection CLI views.
 //!
-//! Active connection workers keep their own private reads close to the work they
-//! perform. This file is intentionally just the reporting surface used by CLI
-//! count/status commands.
+//! Workers keep operational reads close to the work they perform. This file is
+//! intentionally just the reporting surface used by CLI count/status commands.
 
 use crate::core::store::Store;
 

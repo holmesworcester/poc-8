@@ -152,10 +152,13 @@ fn cli_messages_and_reactions_sync_between_two_peers() {
     let bob = temp_db(&tmp, "bob.db");
     let workspace_id = create_workspace(&alice, "Shared", "alice", "alice-laptop");
     let invite_port = free_port();
-    let route_port = free_port();
+    let alice_port = free_port();
+    let bob_port = free_port();
 
     join_workspace(&alice, &bob, &workspace_id, invite_port, "bob", "bob-phone");
-    connect_pair(&alice, &bob, route_port);
+    let _alice_daemon = spawn_daemon(&alice, alice_port);
+    let _bob_daemon = spawn_daemon(&bob, bob_port);
+    connect_daemon_pair(&alice, alice_port, &bob, bob_port);
 
     assert_success(topo(&["--db", &alice, "send", &workspace_id, "from alice"]));
     assert_success(topo(&[
@@ -166,8 +169,9 @@ fn cli_messages_and_reactions_sync_between_two_peers() {
         "#1",
         "seen",
     ]));
-    sync_once(&alice, &bob, route_port);
 
+    wait_for_messages_count(&bob, &workspace_id, "1");
+    wait_for_messages_contains(&bob, &workspace_id, "reactions: seen");
     let bob_listing = assert_success(topo(&["--db", &bob, "messages", &workspace_id]));
     assert_eq!(line_value(&bob_listing, "messages"), "1");
     assert!(bob_listing.contains("alice: from alice"), "{bob_listing}");
@@ -181,10 +185,13 @@ fn cli_send_file_syncs_bytes_to_peer_for_save() {
     let bob = temp_db(&tmp, "bob.db");
     let workspace_id = create_workspace(&alice, "Files", "alice", "alice-laptop");
     let invite_port = free_port();
-    let route_port = free_port();
+    let alice_port = free_port();
+    let bob_port = free_port();
 
     join_workspace(&alice, &bob, &workspace_id, invite_port, "bob", "bob-phone");
-    connect_pair(&alice, &bob, route_port);
+    let _alice_daemon = spawn_daemon(&alice, alice_port);
+    let _bob_daemon = spawn_daemon(&bob, bob_port);
+    connect_daemon_pair(&alice, alice_port, &bob, bob_port);
 
     let payload: Vec<u8> = (0..4096u32).map(|byte| byte as u8).collect();
     let in_path = tmp.path().join("payload.bin");
@@ -199,19 +206,12 @@ fn cli_send_file_syncs_bytes_to_peer_for_save() {
         "--file",
         in_path.to_str().expect("path"),
     ]));
-    sync_once(&alice, &bob, route_port);
 
+    wait_for_files_count(&bob, &workspace_id, "1");
     let listing = assert_success(topo(&["--db", &bob, "files", &workspace_id]));
     assert_eq!(line_value(&listing, "files"), "1");
     let out_path = tmp.path().join("out.bin");
-    let saved = assert_success(topo(&[
-        "--db",
-        &bob,
-        "save-file",
-        &workspace_id,
-        "#1",
-        out_path.to_str().expect("path"),
-    ]));
+    let saved = wait_for_save_file(&bob, &workspace_id, "#1", out_path.to_str().expect("path"));
     assert_eq!(line_value(&saved, "filename"), "payload.bin");
     let read_back = fs::read(&out_path).expect("read output");
     assert_eq!(read_back, payload);
@@ -322,22 +322,6 @@ fn spawn_workspace_invite_listener(
     listening_invite_from_child(child)
 }
 
-fn spawn_invite_listener(db: &str, port: u16, accept: usize) -> ListeningInvite {
-    let port = port.to_string();
-    let accept = accept.to_string();
-    let child = spawn_topo(&[
-        "--db",
-        db,
-        "invite",
-        "--listen",
-        "127.0.0.1",
-        &port,
-        "--accept",
-        &accept,
-    ]);
-    listening_invite_from_child(child)
-}
-
 fn listening_invite_from_child(mut child: Child) -> ListeningInvite {
     let stdout = child.stdout.take().expect("listener stdout");
     let stderr = child.stderr.take().expect("listener stderr");
@@ -410,60 +394,121 @@ fn try_accept_with_identity_retry(
     Err(last)
 }
 
-fn connect_pair(initiator_db: &str, listener_db: &str, listener_port: u16) {
-    let mut listener = spawn_invite_listener(listener_db, listener_port, 1);
-    let invite = listener.invite_link();
-    let connected = accept_with_retry(initiator_db, &invite);
-    assert!(connected.contains("connected:"), "{connected}");
-    let out = listener.wait_success("transport invite listener");
-    assert!(out.contains("accepted_connections: 1"), "{out}");
+struct RunningDaemon {
+    child: Child,
 }
 
-fn accept_with_retry(db: &str, invite: &str) -> String {
+impl Drop for RunningDaemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_daemon(db: &str, port: u16) -> RunningDaemon {
+    let port = port.to_string();
+    let mut child = spawn_topo(&[
+        "--db",
+        db,
+        "start",
+        "--listen",
+        "127.0.0.1",
+        &port,
+        "--tick-ms",
+        "50",
+        "--quiet-ms",
+        "50",
+    ]);
+    let stdout = child.stdout.take().expect("daemon stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut first = String::new();
+    reader.read_line(&mut first).expect("daemon first line");
+    assert!(
+        first.starts_with("listening: "),
+        "daemon did not report listening: {first}"
+    );
+    RunningDaemon { child }
+}
+
+fn connect_daemon_pair(left_db: &str, left_port: u16, right_db: &str, right_port: u16) {
+    let left_invite = transport_invite(left_db, left_port);
+    let right_invite = transport_invite(right_db, right_port);
+    let right_to_left = connect_with_retry(right_db, &left_invite);
+    assert!(right_to_left.contains("connected:"), "{right_to_left}");
+    let left_to_right = connect_with_retry(left_db, &right_invite);
+    assert!(left_to_right.contains("connected:"), "{left_to_right}");
+}
+
+fn transport_invite(db: &str, port: u16) -> String {
+    let addr = format!("127.0.0.1:{port}");
+    let out = assert_success(topo(&["--db", db, "invite", "--public-addr", &addr]));
+    invite_link_from_output(&out)
+}
+
+fn connect_with_retry(db: &str, invite: &str) -> String {
     let mut last = String::new();
     for _ in 0..200 {
-        let output = topo(&["--db", db, "accept", invite]);
+        let output = topo(&["--db", db, "connect", invite]);
         if output.status.success() {
             return stdout(&output);
         }
         last = stderr(&output);
-        if !last.contains("open tcp stream") {
-            break;
-        }
         thread::sleep(Duration::from_millis(50));
     }
-    panic!("accept never succeeded: {last}");
+    panic!("connect never succeeded: {last}");
 }
 
-fn sync_once(from_db: &str, listener_db: &str, listener_port: u16) {
-    let listener = start_sync_listener(listener_db, listener_port, 1);
+fn invite_link_from_output(output: &str) -> String {
+    output
+        .lines()
+        .find(|line| line.starts_with("topo://invite/"))
+        .unwrap_or_else(|| panic!("missing invite link in output:\n{output}"))
+        .to_string()
+}
+
+fn wait_for_messages_count(db: &str, workspace_id: &str, expected: &str) {
+    wait_for_count(db, "messages", workspace_id, "messages", expected);
+}
+
+fn wait_for_files_count(db: &str, workspace_id: &str, expected: &str) {
+    wait_for_count(db, "files", workspace_id, "files", expected);
+}
+
+fn wait_for_messages_contains(db: &str, workspace_id: &str, expected: &str) {
     let mut last = String::new();
-    let sync_out = (0..100)
-        .find_map(|_| {
-            let output = topo(&["--db", from_db, "sync"]);
-            if output.status.success() {
-                return Some(stdout(&output));
-            }
-            last = stderr(&output);
-            thread::sleep(Duration::from_millis(50));
-            None
-        })
-        .unwrap_or_else(|| panic!("sync never succeeded: {last}"));
-    assert!(sync_out.contains("routes_synced:"), "{sync_out}");
-    wait_success(listener, "sync listener");
+    for _ in 0..300 {
+        let out = assert_success(topo(&["--db", db, "messages", workspace_id]));
+        if out.contains(expected) {
+            return;
+        }
+        last = out;
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("messages never contained `{expected}`; last output:\n{last}");
 }
 
-fn start_sync_listener(db: &str, port: u16, accept: usize) -> Child {
-    let port = port.to_string();
-    let accept = accept.to_string();
-    spawn_topo(&[
-        "--db",
-        db,
-        "sync",
-        "--listen",
-        "127.0.0.1",
-        &port,
-        "--accept",
-        &accept,
-    ])
+fn wait_for_save_file(db: &str, workspace_id: &str, selector: &str, out_path: &str) -> String {
+    let mut last = String::new();
+    for _ in 0..300 {
+        let output = topo(&["--db", db, "save-file", workspace_id, selector, out_path]);
+        if output.status.success() {
+            return stdout(&output);
+        }
+        last = stderr(&output);
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("save-file never succeeded; last stderr:\n{last}");
+}
+
+fn wait_for_count(db: &str, command: &str, workspace_id: &str, key: &str, expected: &str) {
+    let mut last = String::new();
+    for _ in 0..300 {
+        let out = assert_success(topo(&["--db", db, command, workspace_id]));
+        if line_value(&out, key) == expected {
+            return;
+        }
+        last = out;
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("{command} count did not reach {expected}; last output:\n{last}");
 }

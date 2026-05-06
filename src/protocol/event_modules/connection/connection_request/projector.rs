@@ -1,10 +1,32 @@
 //! Projector for connection request events.
 //!
-//! The projector writes the request bytes for later validation. When the common
-//! worker supplies receive metadata, the same projection also learns the
-//! subjective local connection fact: "this endpoint received the request from
-//! this route." That keeps route learning atomic with connection establishment
-//! without turning socket addresses into separate semantic events.
+//! This projector is the authority boundary for request facts. It has two
+//! valid contexts:
+//!
+//! ```text
+//! local request, no receive metadata
+//!   -> store request bytes
+//!   -> project local connection(request_id, request.to_endpoint)
+//!
+//! received bootstrap request, with receive metadata
+//!   -> verify receive endpoint/sender/authorization
+//!   -> verify invite-secret dependency authorizes bootstrap hash
+//!   -> store request bytes
+//!   -> project local connection(request_id, receive.local_endpoint)
+//!   -> optionally remember the observed route
+//! ```
+//!
+//! The distinction is important. A local request is this node's own intent to
+//! connect to the invite endpoint, so it can project a local connection row
+//! after admission has applied its declared invite-secret dependency. A received
+//! request is untrusted network input until the receive context proves which
+//! endpoint unwrapped it and the dependency context proves that the request
+//! knows a locally stored invite secret.
+//!
+//! This projector does not create response events, send bytes, query storage,
+//! or reconstruct invite dependencies. Transit supplies local receive context;
+//! the codec supplies canonical dependency ids; the common worker supplies only
+//! dependencies that already reached `Applied`.
 
 use super::super::schema as projection;
 use super::super::types;
@@ -18,49 +40,94 @@ pub fn project(envelope: &EventWithContext<'_>) -> Result<ProjectionOutput, Stri
     let receive = envelope.context.receive;
     let event = codec::decode(&bytes)?;
     let request_id = types::event_id(&bytes);
+    // Always cache the canonical request bytes. Later connection response facts
+    // use the request as dependency context to prove they answer this exact
+    // request, not merely the same endpoints.
     let mut rows = vec![projection::connection_event_row(request_id, bytes)];
     if let Some(receive) = receive {
-        // A received request establishes a route only when the connection worker
-        // supplied bootstrap-invite authorization. The canonical request bytes
-        // alone are not enough: anyone can name a bootstrap hash, but only a peer
-        // that proved knowledge of the invite secret over the receive boundary
-        // gets receive metadata naming the local secret event dependency.
+        // Network receive context is subjective and therefore must match the
+        // canonical request fields before it can become local connection state.
         if event.to_endpoint != receive.local_endpoint() {
             return Err("connection request addressed to a different endpoint".to_string());
         }
         if event.from_endpoint != receive.remote_endpoint() {
             return Err("connection request sender does not match receive sender".to_string());
         }
-        let ReceiveAuthorization::BootstrapInvite {
-            invite_secret_event_id,
-            workspace_id,
-        } = receive.authorization()
-        else {
+        if receive.authorization() != ReceiveAuthorization::BootstrapInvite {
             return Err("connection request requires bootstrap invite authorization".to_string());
-        };
+        }
+        // The invite-secret event is deliberately a normal dependency. This is
+        // the same fact-graph rule used elsewhere: projectors read declared
+        // dependencies from context instead of doing side lookups.
         let invite_secret = envelope
             .context
-            .dependency(&invite_secret_event_id)
+            .dependency(&event.invite_secret_event_id)
             .ok_or_else(|| "connection request missing invite secret dependency".to_string())?;
         let invite_secret = invite::codec::decode(&invite_secret.canonical_bytes)
             .map_err(|_| "connection request dependency is not an invite secret".to_string())?;
         if invite_secret.bootstrap_hash != event.bootstrap_hash {
             return Err("connection request bootstrap hash is not authorized".to_string());
         }
+        // Both peers derive the connection id from the request id and accepting
+        // endpoint. On receive, the accepting endpoint is this local endpoint.
         let connection_id = types::connection_id(&request_id, &receive.local_endpoint());
         rows.push(projection::connection_row(
             connection_id,
             event.from_endpoint,
         ));
         if receive.remember_route() {
+            // Route learning is local metadata, not a shared event. The worker
+            // only sets this flag when the observed origin is stable enough to
+            // be used for later sends.
             rows.push(projection::transport_target_row(
                 connection_id,
                 receive.origin(),
             ));
         }
-        if let Some(workspace_id) = workspace_id {
+        if let Some(workspace_id) = invite_secret.workspace_id {
+            // A scoped invite proves a temporary workspace boundary for this
+            // endpoint pair. That lets the invitee send the identity bootstrap
+            // facts needed to become a normal mutually joined endpoint; after
+            // membership projects, ordinary connection workspace checks take
+            // over.
             rows.push(projection::bootstrap_workspace_row(
                 connection_id,
+                workspace_id,
+            ));
+            rows.push(projection::bootstrap_endpoint_workspace_row(
+                receive.local_endpoint(),
+                event.from_endpoint,
+                workspace_id,
+            ));
+        }
+    } else {
+        // Local requests have no receive metadata because this node created
+        // them. Admission has already applied the invite-secret dependency, so
+        // projection can learn the local view of the connection to the invite
+        // endpoint without another network round trip. Scoped identity invites
+        // also authorize bootstrap identity facts in the opposite direction:
+        // after sending the request, the requester may receive the inviter's
+        // workspace/user/admin facts over bootstrap transit before ordinary
+        // endpoint membership has projected on both sides.
+        let connection_id = types::connection_id(&request_id, &event.to_endpoint);
+        rows.push(projection::connection_row(connection_id, event.to_endpoint));
+        let invite_secret = envelope
+            .context
+            .dependency(&event.invite_secret_event_id)
+            .ok_or_else(|| "connection request missing invite secret dependency".to_string())?;
+        let invite_secret = invite::codec::decode(&invite_secret.canonical_bytes)
+            .map_err(|_| "connection request dependency is not an invite secret".to_string())?;
+        if invite_secret.bootstrap_hash != event.bootstrap_hash {
+            return Err("connection request bootstrap hash is not authorized".to_string());
+        }
+        if let Some(workspace_id) = invite_secret.workspace_id {
+            rows.push(projection::bootstrap_workspace_row(
+                connection_id,
+                workspace_id,
+            ));
+            rows.push(projection::bootstrap_endpoint_workspace_row(
+                event.from_endpoint,
+                event.to_endpoint,
                 workspace_id,
             ));
         }
@@ -89,16 +156,24 @@ mod tests {
             to_endpoint: [9; 32],
             nonce: [2; 32],
             bootstrap_hash: [3; 32],
+            invite_secret_event_id: [4; 32],
         }))
         .expect("request record")
     }
 
-    fn context_for(record: &Record) -> EventWithContext<'_> {
+    fn context_with_dependency<'a>(
+        record: &'a Record,
+        invite_secret_event_id: [u8; 32],
+        invite_record: Record,
+    ) -> EventWithContext<'a> {
         EventWithContext {
             record,
             context: EventContext {
                 event_id: types::event_id(&record.canonical_bytes),
-                dependencies: Vec::new(),
+                dependencies: vec![DependencyContext {
+                    event_id: invite_secret_event_id,
+                    record: invite_record,
+                }],
                 labels: Vec::new(),
                 receive: None,
             },
@@ -106,30 +181,70 @@ mod tests {
     }
 
     fn authorized_request_record() -> (Record, [u8; 32], Record) {
-        let invite_secret = invite::types::InviteSecretEvent::new([7; 32]);
+        authorized_request_record_for(invite::types::InviteSecretEvent::new([7; 32]))
+    }
+
+    fn scoped_authorized_request_record() -> (Record, [u8; 32], Record) {
+        authorized_request_record_for(invite::types::InviteSecretEvent::scoped(
+            [7; 32], [6; 32], [5; 32],
+        ))
+    }
+
+    fn authorized_request_record_for(
+        invite_secret: invite::types::InviteSecretEvent,
+    ) -> (Record, [u8; 32], Record) {
         let invite_record = invite::codec::record_from_bytes(invite::codec::encode(&invite_secret))
             .expect("invite record");
         let invite_secret_event_id = types::event_id(&invite_record.canonical_bytes);
-        let mut record = codec::record_from_bytes(codec::encode(&RequestEvent {
+        let record = codec::record_from_bytes(codec::encode(&RequestEvent {
             from_endpoint: [1; 32],
             to_endpoint: [9; 32],
             nonce: [2; 32],
             bootstrap_hash: invite_secret.bootstrap_hash,
+            invite_secret_event_id,
         }))
         .expect("request record");
-        record.dependencies.push(invite_secret_event_id);
         (record, invite_secret_event_id, invite_record)
     }
 
     #[test]
     fn projects_request_bytes_without_receive_metadata() {
-        let record = request_record();
-        let output = project(&context_for(&record)).expect("project request");
+        let (record, invite_secret_event_id, invite_record) = authorized_request_record();
+        let output = project(&context_with_dependency(
+            &record,
+            invite_secret_event_id,
+            invite_record,
+        ))
+        .expect("project request");
 
-        assert_eq!(output.rows.len(), 1);
+        assert_eq!(output.rows.len(), 2);
         assert_eq!(output.rows[0].table, schema::CONNECTION_EVENTS);
         assert_eq!(output.rows[0].key, types::event_id(&record.canonical_bytes));
         assert_eq!(output.rows[0].value, record.canonical_bytes);
+        assert_eq!(output.rows[1].table, schema::CONNECTIONS);
+        assert_eq!(
+            output.rows[1].key,
+            types::connection_id(&types::event_id(&record.canonical_bytes), &[9; 32])
+        );
+        assert_eq!(output.rows[1].value, [9; 32]);
+    }
+
+    #[test]
+    fn local_scoped_request_authorizes_bootstrap_identity_facts() {
+        let (record, invite_secret_event_id, invite_record) = scoped_authorized_request_record();
+        let output = project(&context_with_dependency(
+            &record,
+            invite_secret_event_id,
+            invite_record,
+        ))
+        .expect("project local scoped request");
+
+        assert_eq!(output.rows.len(), 4);
+        assert_eq!(output.rows[0].table, schema::CONNECTION_EVENTS);
+        assert_eq!(output.rows[1].table, schema::CONNECTIONS);
+        assert_eq!(output.rows[2].table, schema::BOOTSTRAP_WORKSPACES);
+        assert_eq!(output.rows[3].table, schema::BOOTSTRAP_ENDPOINT_WORKSPACES);
+        assert_eq!(output.rows[2].value, [6; 32]);
     }
 
     #[test]
@@ -146,12 +261,7 @@ mod tests {
                 }],
                 labels: Vec::new(),
                 receive: Some(ReceiveMetadata::bootstrap_invite(
-                    origin,
-                    [9; 32],
-                    [1; 32],
-                    true,
-                    invite_secret_event_id,
-                    None,
+                    origin, [9; 32], [1; 32], true,
                 )),
             },
         })
@@ -195,7 +305,7 @@ mod tests {
 
     #[test]
     fn rejects_received_request_when_invite_secret_dependency_is_missing() {
-        let (record, invite_secret_event_id, _) = authorized_request_record();
+        let (record, _, _) = authorized_request_record();
 
         assert_eq!(
             project(&EventWithContext {
@@ -209,8 +319,6 @@ mod tests {
                         [9; 32],
                         [1; 32],
                         true,
-                        invite_secret_event_id,
-                        None,
                     )),
                 },
             })
@@ -242,8 +350,6 @@ mod tests {
                         [9; 32],
                         [1; 32],
                         true,
-                        invite_secret_event_id,
-                        None,
                     )),
                 },
             })

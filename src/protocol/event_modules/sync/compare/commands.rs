@@ -4,7 +4,7 @@
 //! this timestamp range have the same count and fingerprint?" If not, the
 //! responder answers with child compares until a timestamp leaf can advertise
 //! concrete ids. Missing ids become need ids; received need ids queue durable
-//! event ids to the connection outbox. The command emits event records and ids
+//! event ids to transit out. The command emits event records and ids
 //! only: transit wrapping and TCP framing are outside sync.
 
 use crate::protocol::event_modules::types::{EventId, EventIndexEntry};
@@ -35,7 +35,7 @@ pub trait ReadContext {
         &self,
         roots: &[EventIndexEntry],
     ) -> Result<Vec<EventIndexEntry>, String>;
-    /// Suppress ids already advertised to this connection in the current worker.
+    /// Return ids that should be advertised in the current response.
     fn fresh_have_entries(
         &self,
         connection_id: EventId,
@@ -55,7 +55,7 @@ pub fn start(
     connection_id: EventId,
     range: TimestampRange,
 ) -> Result<SyncReport, String> {
-    // Manual start sends only one compare over the caller-selected range. The
+    // Start sends one compare over the caller-selected range. The
     // rest of the exchange is driven by projected inbound compare rows.
     let mut report = SyncReport::default();
     report
@@ -66,12 +66,14 @@ pub fn start(
             summary: context.summary(range)?,
             response_requested: true,
         })?);
+    report.sent_events = 1;
     Ok(report)
 }
 
 pub fn handle_inbound_event(
     context: &impl ReadContext,
     expected_connection_id: EventId,
+    response_connection_id: EventId,
     bytes: &[u8],
 ) -> Result<SyncReport, String> {
     let mut report = SyncReport::default();
@@ -82,7 +84,7 @@ pub fn handle_inbound_event(
         if local != event.summary {
             let events = compare_response(
                 context,
-                event.connection_id,
+                response_connection_id,
                 event.range,
                 local,
                 event.summary,
@@ -99,7 +101,7 @@ pub fn handle_inbound_event(
             report
                 .events
                 .push(need_id::codec::outbound_record(NeedIdEvent {
-                    connection_id: event.connection_id,
+                    connection_id: response_connection_id,
                     id: event.id,
                 })?);
         }

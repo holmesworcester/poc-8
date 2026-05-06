@@ -23,6 +23,9 @@ fn cli_key_wrap_derives_access_only_for_wrapped_recipient() {
     let workspace_id = create_workspace(&alice, "Keys", "alice", "alice-laptop");
     let bob_join_port = free_port();
     let carol_join_port = free_port();
+    let alice_port = free_port();
+    let bob_port = free_port();
+    let carol_port = free_port();
 
     join_workspace(
         &alice,
@@ -41,15 +44,15 @@ fn cli_key_wrap_derives_access_only_for_wrapped_recipient() {
         "carol-tablet",
     );
 
+    let _alice_daemon = spawn_daemon(&alice, alice_port);
+    let _bob_daemon = spawn_daemon(&bob, bob_port);
+    let _carol_daemon = spawn_daemon(&carol, carol_port);
+    connect_daemon_pair(&alice, alice_port, &bob, bob_port);
+    connect_daemon_pair(&alice, alice_port, &carol, carol_port);
+
     let bob_recipient = assert_success(topo(&["--db", &bob, "key-recipient", &workspace_id]));
     let bob_recipient_id = line_value(&bob_recipient, "recipient_key_id");
     assert_success(topo(&["--db", &carol, "key-recipient", &workspace_id]));
-    sync_once(&bob, &alice, bob_join_port);
-
-    let alice_to_bob = free_port();
-    let alice_to_carol = free_port();
-    connect_pair(&alice, &bob, alice_to_bob);
-    connect_pair(&alice, &carol, alice_to_carol);
 
     let frontier = assert_success(topo(&["--db", &alice, "key-frontier", &workspace_id]));
     let removal_frontier_id = line_value(&frontier, "removal_frontier_id");
@@ -67,7 +70,7 @@ fn cli_key_wrap_derives_access_only_for_wrapped_recipient() {
         "yes"
     );
 
-    sync_two_routes(&alice, &bob, alice_to_bob, &carol, alice_to_carol);
+    thread::sleep(Duration::from_millis(1200));
     assert_eq!(
         line_value(
             &assert_success(topo(&[
@@ -95,19 +98,15 @@ fn cli_key_wrap_derives_access_only_for_wrapped_recipient() {
         "no"
     );
 
-    let wrapped = assert_success(topo(&[
-        "--db",
+    let wrapped = key_wrap_with_retry(
         &alice,
-        "key-wrap",
         &workspace_id,
         &removal_frontier_id,
         &bob_recipient_id,
-    ]));
+    );
     assert_eq!(line_value(&wrapped, "recipient_key_id"), bob_recipient_id);
 
-    sync_two_routes(&alice, &bob, alice_to_bob, &carol, alice_to_carol);
-
-    let bob_derive = assert_success(topo(&["--db", &bob, "key-derive"]));
+    let bob_derive = wait_for_key_derive(&bob, "1");
     assert_eq!(line_value(&bob_derive, "derived_key_secrets"), "1");
     assert_eq!(
         line_value(
@@ -145,10 +144,10 @@ fn cli_invite_server_syncs_but_cannot_be_a_key_recipient() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
     let server = temp_db(&tmp, "invite-server.db");
-    let bob = temp_db(&tmp, "bob.db");
     let workspace_id = create_workspace(&alice, "Helper FS", "alice", "alice-laptop");
     let server_join_port = free_port();
-    let bob_join_port = free_port();
+    let alice_port = free_port();
+    let server_port = free_port();
 
     join_invite_server(&alice, &server, &workspace_id, server_join_port, "relay");
     let server_identity = assert_success(topo(&["--db", &server, "identity"]));
@@ -170,38 +169,22 @@ fn cli_invite_server_syncs_but_cannot_be_a_key_recipient() {
         stderr(&denied)
     );
 
-    join_workspace(
-        &alice,
-        &bob,
-        &workspace_id,
-        bob_join_port,
-        "bob",
-        "bob-phone",
-    );
-    let bob_recipient = assert_success(topo(&["--db", &bob, "key-recipient", &workspace_id]));
-    let bob_recipient_id = line_value(&bob_recipient, "recipient_key_id");
-    sync_once(&bob, &alice, bob_join_port);
-
-    let alice_to_bob = free_port();
-    let alice_to_server = free_port();
-    connect_pair(&alice, &bob, alice_to_bob);
-    connect_pair(&alice, &server, alice_to_server);
-
-    let frontier = assert_success(topo(&["--db", &alice, "key-frontier", &workspace_id]));
-    let removal_frontier_id = line_value(&frontier, "removal_frontier_id");
+    let _alice_daemon = spawn_daemon(&alice, alice_port);
+    let _server_daemon = spawn_daemon(&server, server_port);
+    connect_daemon_pair(&alice, alice_port, &server, server_port);
     assert_success(topo(&[
         "--db",
         &alice,
-        "key-wrap",
+        "generate",
         &workspace_id,
-        &removal_frontier_id,
-        &bob_recipient_id,
+        "2",
+        "64",
     ]));
+    wait_for_content_count(&server, &workspace_id, "2");
 
-    sync_two_routes(&alice, &bob, alice_to_bob, &server, alice_to_server);
-
-    let bob_derive = assert_success(topo(&["--db", &bob, "key-derive"]));
-    assert_eq!(line_value(&bob_derive, "derived_key_secrets"), "1");
+    let frontier = assert_success(topo(&["--db", &alice, "key-frontier", &workspace_id]));
+    let removal_frontier_id = line_value(&frontier, "removal_frontier_id");
+    thread::sleep(Duration::from_millis(1200));
     let server_derive = assert_success(topo(&["--db", &server, "key-derive"]));
     assert_eq!(line_value(&server_derive, "derived_key_secrets"), "0");
     assert_eq!(
@@ -467,22 +450,6 @@ fn spawn_invite_server_listener(
     listening_invite_from_child(child)
 }
 
-fn spawn_invite_listener(db: &str, port: u16, accept: usize) -> ListeningInvite {
-    let port = port.to_string();
-    let accept = accept.to_string();
-    let child = spawn_topo(&[
-        "--db",
-        db,
-        "invite",
-        "--listen",
-        "127.0.0.1",
-        &port,
-        "--accept",
-        &accept,
-    ]);
-    listening_invite_from_child(child)
-}
-
 fn listening_invite_from_child(mut child: Child) -> ListeningInvite {
     let stdout = child.stdout.take().expect("listener stdout");
     let stderr = child.stderr.take().expect("listener stderr");
@@ -582,86 +549,135 @@ fn try_accept_invite_server_with_retry(
     Err(last)
 }
 
-fn connect_pair(initiator_db: &str, listener_db: &str, listener_port: u16) {
-    let mut listener = spawn_invite_listener(listener_db, listener_port, 1);
-    let invite = listener.invite_link();
-    let connected = accept_with_retry(initiator_db, &invite);
-    assert!(connected.contains("connected:"), "{connected}");
-    let out = listener.wait_success("transport invite listener");
-    assert!(out.contains("accepted_connections: 1"), "{out}");
+struct RunningDaemon {
+    child: Child,
 }
 
-fn accept_with_retry(db: &str, invite: &str) -> String {
+impl Drop for RunningDaemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_daemon(db: &str, port: u16) -> RunningDaemon {
+    let port = port.to_string();
+    let mut child = spawn_topo(&[
+        "--db",
+        db,
+        "start",
+        "--listen",
+        "127.0.0.1",
+        &port,
+        "--tick-ms",
+        "50",
+        "--quiet-ms",
+        "50",
+    ]);
+    let stdout = child.stdout.take().expect("daemon stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut first = String::new();
+    reader.read_line(&mut first).expect("daemon first line");
+    assert!(
+        first.starts_with("listening: "),
+        "daemon did not report listening: {first}"
+    );
+    RunningDaemon { child }
+}
+
+fn connect_daemon_pair(left_db: &str, left_port: u16, right_db: &str, right_port: u16) {
+    let left_invite = transport_invite(left_db, left_port);
+    let right_invite = transport_invite(right_db, right_port);
+    let right_to_left = connect_with_retry(right_db, &left_invite);
+    assert!(right_to_left.contains("connected:"), "{right_to_left}");
+    let left_to_right = connect_with_retry(left_db, &right_invite);
+    assert!(left_to_right.contains("connected:"), "{left_to_right}");
+}
+
+fn transport_invite(db: &str, port: u16) -> String {
+    let addr = format!("127.0.0.1:{port}");
+    let out = assert_success(topo(&["--db", db, "invite", "--public-addr", &addr]));
+    invite_link_from_output(&out)
+}
+
+fn invite_link_from_output(output: &str) -> String {
+    output
+        .lines()
+        .find(|line| line.starts_with("topo://invite/"))
+        .unwrap_or_else(|| panic!("missing invite link in output:\n{output}"))
+        .to_string()
+}
+
+fn connect_with_retry(db: &str, invite: &str) -> String {
     let mut last = String::new();
     for _ in 0..200 {
-        let output = topo(&["--db", db, "accept", invite]);
+        let output = topo(&["--db", db, "connect", invite]);
         if output.status.success() {
             return stdout(&output);
         }
         last = stderr(&output);
-        if !last.contains("open tcp stream") {
-            break;
-        }
         thread::sleep(Duration::from_millis(50));
     }
-    panic!("accept never succeeded: {last}");
+    panic!("connect never succeeded: {last}");
 }
 
-fn sync_once(from_db: &str, listener_db: &str, listener_port: u16) {
-    let listener = start_sync_listener(listener_db, listener_port, 1);
+fn key_wrap_with_retry(
+    db: &str,
+    workspace_id: &str,
+    removal_frontier_id: &str,
+    recipient_key_id: &str,
+) -> String {
     let mut last = String::new();
-    let sync_out = (0..100)
-        .find_map(|_| {
-            let output = topo(&["--db", from_db, "sync"]);
-            if output.status.success() {
-                return Some(stdout(&output));
-            }
-            last = stderr(&output);
-            thread::sleep(Duration::from_millis(50));
-            None
-        })
-        .unwrap_or_else(|| panic!("sync never succeeded: {last}"));
-    assert!(sync_out.contains("routes_synced:"), "{sync_out}");
-    wait_success(listener, "sync listener");
+    for _ in 0..300 {
+        let output = topo(&[
+            "--db",
+            db,
+            "key-wrap",
+            workspace_id,
+            removal_frontier_id,
+            recipient_key_id,
+        ]);
+        if output.status.success() {
+            return stdout(&output);
+        }
+        last = stderr(&output);
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("key-wrap never succeeded: {last}");
 }
 
-fn sync_two_routes(
-    from_db: &str,
-    first_db: &str,
-    first_port: u16,
-    second_db: &str,
-    second_port: u16,
-) {
-    let first = start_sync_listener(first_db, first_port, 1);
-    let second = start_sync_listener(second_db, second_port, 1);
+fn wait_for_key_derive(db: &str, expected: &str) -> String {
     let mut last = String::new();
-    let sync_out = (0..100)
-        .find_map(|_| {
-            let output = topo(&["--db", from_db, "sync"]);
-            if output.status.success() {
-                return Some(stdout(&output));
+    for _ in 0..300 {
+        let output = topo(&["--db", db, "key-derive"]);
+        if output.status.success() {
+            let out = stdout(&output);
+            if line_value(&out, "derived_key_secrets") == expected {
+                return out;
             }
+            last = out;
+        } else {
             last = stderr(&output);
-            thread::sleep(Duration::from_millis(50));
-            None
-        })
-        .unwrap_or_else(|| panic!("sync never succeeded: {last}"));
-    assert!(sync_out.contains("routes_synced:"), "{sync_out}");
-    wait_success(first, "first sync listener");
-    wait_success(second, "second sync listener");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("key derive did not reach {expected}: {last}");
 }
 
-fn start_sync_listener(db: &str, port: u16, accept: usize) -> Child {
-    let port = port.to_string();
-    let accept = accept.to_string();
-    spawn_topo(&[
-        "--db",
-        db,
-        "sync",
-        "--listen",
-        "127.0.0.1",
-        &port,
-        "--accept",
-        &accept,
-    ])
+fn wait_for_content_count(db: &str, workspace_id: &str, expected: &str) {
+    let mut last = String::new();
+    for _ in 0..300 {
+        let output = topo(&["--db", db, "content-count", workspace_id]);
+        if output.status.success() {
+            let out = stdout(&output);
+            if line_value(&out, "content_events") == expected {
+                return;
+            }
+            last = out;
+        } else {
+            last = stderr(&output);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("content count did not reach {expected}: {last}");
 }

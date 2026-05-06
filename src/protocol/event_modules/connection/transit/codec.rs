@@ -134,12 +134,9 @@ pub fn encode_inner_events(inners: &[Vec<u8>]) -> Result<Vec<u8>, String> {
 
 pub fn decode_inner_events(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     if !bytes.starts_with(INNER_EVENTS_MAGIC) {
-        return Err("not a connection inner-event batch".to_string());
+        return Err("not a transit inner-event batch".to_string());
     }
-    let mut reader = Reader::new(
-        &bytes[INNER_EVENTS_MAGIC.len()..],
-        "connection inner events",
-    );
+    let mut reader = Reader::new(&bytes[INNER_EVENTS_MAGIC.len()..], "transit inner events");
     let count = reader.u32()? as usize;
     let mut inners = Vec::with_capacity(count);
     for _ in 0..count {

@@ -1,10 +1,10 @@
 //! Opaque byte queues used by the TCP pump.
 //!
 //! Core owns the mechanics of queueing bytes by route because the TCP code
-//! needs a durable place to stage frames before and after socket writes. It does
-//! not own the bytes' meaning. The only interpretation here is the route key
-//! needed to claim a bounded batch for one remote address without scanning every
-//! pending row.
+//! needs a place to stage frames before and after socket writes. These queues
+//! are memory-local operational state, not durable protocol truth. The only
+//! interpretation here is the route key needed to claim a bounded batch for one
+//! remote address without scanning every pending row.
 //!
 //! The queue key is intentionally deterministic: the same route and same bytes
 //! map to the same row. That gives the boundary a cheap idempotence property
@@ -24,10 +24,11 @@ pub const INBOUND_TABLE: TableName = TableName::new("core.network.inbound");
 ///
 /// Network queues are core IO state, so their schemas live here rather than in
 /// the protocol registry. They still use the same generic row-table shape as
-/// module-owned tables.
+/// module-owned tables, but they are restart-local because higher layers can
+/// regenerate meaningful sends and resend missing inbound facts.
 pub const SCHEMAS: &[Schema] = &[
-    Schema::durable_row_table("core.network.outbound.v1", OUTBOUND_TABLE),
-    Schema::durable_row_table("core.network.inbound.v1", INBOUND_TABLE),
+    Schema::memory_row_table("core.network.outbound.v1", OUTBOUND_TABLE),
+    Schema::memory_row_table("core.network.inbound.v1", INBOUND_TABLE),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -160,6 +161,24 @@ pub fn delete_inbound(store: &Store, rows: &[InboundNetworkRow]) -> Result<(), S
         .map_err(|err| format!("delete inbound network rows: {err}"))
 }
 
+/// Claim at most `limit` inbound byte rows, ordered by the deterministic queue key.
+pub fn claim_inbound(store: &Store, limit: usize) -> Result<Vec<InboundNetworkRow>, String> {
+    store
+        .table_rows_with_key_prefix(INBOUND_TABLE, &[], limit)
+        .map_err(|err| format!("claim inbound network rows: {err}"))?
+        .into_iter()
+        .map(|(key, value)| decode_inbound(key, &value))
+        .collect()
+}
+
+/// Remove inbound rows inside a caller-owned transaction after admission.
+pub fn delete_inbound_in_tx(store: &Store, rows: &[InboundNetworkRow]) -> rusqlite::Result<usize> {
+    store.delete_table_rows_in_tx(
+        INBOUND_TABLE,
+        rows.iter().map(|row| row.key.clone()).collect(),
+    )
+}
+
 fn outbound_table_row(row: &OutboundNetworkRow) -> TableRow {
     TableRow {
         table: OUTBOUND_TABLE,
@@ -181,6 +200,15 @@ fn decode_outbound(key: Vec<u8>, value: &[u8]) -> Result<OutboundNetworkRow, Str
     Ok(OutboundNetworkRow {
         key,
         target: NetworkTarget::new(addr),
+        bytes: value.to_vec(),
+    })
+}
+
+fn decode_inbound(key: Vec<u8>, value: &[u8]) -> Result<InboundNetworkRow, String> {
+    let addr = decode_addr_from_key(&key)?;
+    Ok(InboundNetworkRow {
+        key,
+        source: NetworkSource::new(addr),
         bytes: value.to_vec(),
     })
 }

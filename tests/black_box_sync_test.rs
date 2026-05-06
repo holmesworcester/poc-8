@@ -14,6 +14,7 @@ fn two_endpoints_sync_multiple_mutual_workspaces() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
     let bob = temp_db(&tmp, "bob.db");
+    let alice_port = free_port();
     let bob_port = free_port();
 
     let workspace_a = create_workspace(&alice, "workspace-a", "alice-a", "alice-a-laptop");
@@ -34,14 +35,15 @@ fn two_endpoints_sync_multiple_mutual_workspaces() {
         "bob-b",
         "bob-b-phone",
     );
-    connect_pair(&alice, &bob, bob_port);
+    let _alice_daemon = spawn_daemon(&alice, alice_port);
+    let _bob_daemon = spawn_daemon(&bob, bob_port);
+    connect_daemon_pair(&alice, alice_port, &bob, bob_port);
 
     generate(&alice, &workspace_a, 3, 128);
     generate(&alice, &workspace_b, 4, 129);
-    sync_once(&alice, &bob, bob_port);
 
-    assert_content_count(&bob, &workspace_a, 3);
-    assert_content_count(&bob, &workspace_b, 4);
+    wait_for_content_count(&bob, &workspace_a, 3);
+    wait_for_content_count(&bob, &workspace_b, 4);
 }
 
 #[test]
@@ -49,18 +51,21 @@ fn two_player_sync_does_not_leak_alice_private_workspace_to_bob() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
     let bob = temp_db(&tmp, "bob.db");
+    let alice_port = free_port();
     let bob_port = free_port();
 
     let shared = create_workspace(&alice, "shared-a", "alice-a", "alice-a-laptop");
     accept_workspace_invite(&alice, &bob, &shared, free_port(), "bob-a", "bob-a-phone");
     let alice_private = create_workspace(&alice, "alice-b", "alice-b", "alice-b-laptop");
-    connect_pair(&alice, &bob, bob_port);
+    let _alice_daemon = spawn_daemon(&alice, alice_port);
+    let _bob_daemon = spawn_daemon(&bob, bob_port);
+    connect_daemon_pair(&alice, alice_port, &bob, bob_port);
 
     generate(&alice, &shared, 2, 128);
-    generate(&alice, &alice_private, 5, 128);
-    sync_once(&alice, &bob, bob_port);
 
-    assert_content_count(&bob, &shared, 2);
+    wait_for_content_count(&bob, &shared, 2);
+    generate(&alice, &alice_private, 5, 128);
+    thread::sleep(Duration::from_millis(1200));
     assert_content_count(&bob, &alice_private, 0);
 }
 
@@ -92,22 +97,21 @@ fn three_player_sync_through_alice_keeps_workspace_scopes_separate() {
         "carol-b",
         "carol-b-phone",
     );
-    connect_pair(&alice, &bob, bob_port);
-    connect_pair(&alice, &carol, carol_port);
+    let _alice_daemon = spawn_daemon(&alice, alice_port);
+    let _bob_daemon = spawn_daemon(&bob, bob_port);
+    let _carol_daemon = spawn_daemon(&carol, carol_port);
+    connect_daemon_pair(&alice, alice_port, &bob, bob_port);
+    connect_daemon_pair(&alice, alice_port, &carol, carol_port);
 
     generate(&bob, &workspace_a, 3, 128);
     generate(&carol, &workspace_b, 4, 128);
 
-    sync_once(&bob, &alice, alice_port);
-    sync_once(&carol, &alice, alice_port);
-    sync_from_alice_to_bob_and_carol(&alice, &bob, bob_port, &carol, carol_port);
-
-    assert_content_count(&alice, &workspace_a, 3);
-    assert_content_count(&alice, &workspace_b, 4);
-    assert_content_count(&bob, &workspace_a, 3);
+    wait_for_content_count(&alice, &workspace_a, 3);
+    wait_for_content_count(&alice, &workspace_b, 4);
+    wait_for_content_count(&bob, &workspace_a, 3);
     assert_content_count(&bob, &workspace_b, 0);
     assert_content_count(&carol, &workspace_a, 0);
-    assert_content_count(&carol, &workspace_b, 4);
+    wait_for_content_count(&carol, &workspace_b, 4);
 }
 
 #[test]
@@ -175,21 +179,6 @@ fn second_daemon_for_same_db_is_rejected() {
         "unexpected second-daemon stderr:\n{}",
         stderr(&output)
     );
-}
-
-fn start_listener(db: &str, port: u16, accept: usize) -> Child {
-    let port = port.to_string();
-    let accept = accept.to_string();
-    spawn_topo(&[
-        "--db",
-        db,
-        "sync",
-        "--listen",
-        "127.0.0.1",
-        &port,
-        "--accept",
-        &accept,
-    ])
 }
 
 struct ListeningInvite {
@@ -375,12 +364,13 @@ fn spawn_daemon(db: &str, port: u16) -> RunningDaemon {
     RunningDaemon { child }
 }
 
-fn connect_pair(initiator_db: &str, listener_db: &str, listener_port: u16) {
-    let invite = invite(listener_db, listener_port);
-    let listener = start_listener(listener_db, listener_port, 1);
-    let connected = connect_with_retry(initiator_db, &invite);
-    assert!(connected.contains("connected:"));
-    wait_success(listener, "connect listener");
+fn connect_daemon_pair(left_db: &str, left_port: u16, right_db: &str, right_port: u16) {
+    let left_invite = invite(left_db, left_port);
+    let right_invite = invite(right_db, right_port);
+    let right_to_left = connect_with_retry(right_db, &left_invite);
+    assert!(right_to_left.contains("connected:"), "{right_to_left}");
+    let left_to_right = connect_with_retry(left_db, &right_invite);
+    assert!(left_to_right.contains("connected:"), "{left_to_right}");
 }
 
 fn invite(db: &str, port: u16) -> String {
@@ -439,67 +429,10 @@ fn try_accept_with_identity_retry(
     Err(last)
 }
 
-fn sync_once(from_db: &str, listener_db: &str, listener_port: u16) {
-    let (sync_out, listener) = sync_with_listener_retry(from_db, listener_db, listener_port, 1);
-    assert!(sync_out.contains("routes_synced: 1"), "{sync_out}");
-    wait_success(listener, "sync listener");
-}
-
-fn sync_from_alice_to_bob_and_carol(
-    alice: &str,
-    bob: &str,
-    bob_port: u16,
-    carol: &str,
-    carol_port: u16,
-) {
-    let bob_listener = start_listener(bob, bob_port, 1);
-    let carol_listener = start_listener(carol, carol_port, 1);
-    thread::sleep(Duration::from_millis(100));
-    let sync_out = sync_with_retry(alice);
-    assert!(sync_out.contains("routes_synced: 2"), "{sync_out}");
-    wait_success(bob_listener, "bob sync listener");
-    wait_success(carol_listener, "carol sync listener");
-}
-
-fn sync_with_listener_retry(
-    from_db: &str,
-    listener_db: &str,
-    listener_port: u16,
-    accept: usize,
-) -> (String, Child) {
-    let mut last = String::new();
-    for _ in 0..50 {
-        let mut listener = start_listener(listener_db, listener_port, accept);
-        thread::sleep(Duration::from_millis(50));
-        let output = topo(&["--db", from_db, "sync"]);
-        if output.status.success() {
-            return (stdout(&output), listener);
-        }
-        last = stderr(&output);
-        let _ = listener.kill();
-        let _ = listener.wait();
-        thread::sleep(Duration::from_millis(50));
-    }
-    panic!("sync never succeeded: {last}");
-}
-
 fn generate(db: &str, workspace: &str, count: usize, size: usize) -> String {
     let count = count.to_string();
     let size = size.to_string();
     assert_success(topo(&["--db", db, "generate", workspace, &count, &size]))
-}
-
-fn sync_with_retry(db: &str) -> String {
-    let mut last = String::new();
-    for _ in 0..50 {
-        let output = topo(&["--db", db, "sync"]);
-        if output.status.success() {
-            return stdout(&output);
-        }
-        last = stderr(&output);
-        thread::sleep(Duration::from_millis(50));
-    }
-    panic!("sync never succeeded: {last}");
 }
 
 fn assert_content_count(db: &str, workspace: &str, expected: usize) {

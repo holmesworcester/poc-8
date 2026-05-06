@@ -1,7 +1,7 @@
 //! Codec for need-id sync events.
 //!
 //! A need-id event asks the peer to send bytes for exactly one event id. The
-//! response path dedupes in the connection outbox by `(connection_id, event_id)`.
+//! response path dedupes in transit out by `(connection_id, event_id)`.
 
 use crate::protocol::event_modules::types::{ConnectionScope, EventRecord, EventScope};
 use crate::protocol::wire::{Reader, Writer};

@@ -355,20 +355,23 @@ modules own opaque TCP/transit mechanics.
 
 ## Receive, Blocking, Signing, And Bootstrap Connections
 
-The connection worker is not a second projector pipeline. After transit unwrap,
-valid shareable event bytes go into the common event-module worker. That worker
-owns parse, dependency blocking, projection, and status transitions. Connection
-ingress rejects remote local-only events, but it does not decide whether a
-content event, identity event, or auth event is semantically valid.
+Transit in is not a second event pipeline. It unwraps/authenticates network
+frames and writes valid inner event bytes into `canonical.in`. The common event
+pipeline owns parse, dependency blocking, projection, and status transitions.
+Event admission rejects remote local-only events and unauthorized
+transit/provenance shapes, but it does not decide whether a content event,
+identity event, or auth event is semantically valid.
 
 This is the intended receive path:
 
 ```text
 core TCP row
-  -> connection worker unwraps transit
-  -> reject non-shared durable event scopes from remote peers
+  -> transit_in runs the transit projector
+  -> canonical.in row with unwrap provenance
+  -> event_admission claims canonical.in
+  -> reject invalid provenance/event-scope combinations
   -> registry decodes the shareable canonical event
-  -> common event-module worker stores/blocks/applies/rejects
+  -> common event pipeline stores/blocks/applies/rejects
   -> projectors receive only already-applied dependency context
 ```
 
@@ -394,7 +397,7 @@ Mutual-only workspace sync is enforced on outbound disclosure, not by trusting
 inbound bytes. When a peer asks for a durable event id, the sync worker/command
 path must check that the event's workspace is mutually shared by the local
 endpoint and the remote endpoint for that connection before queueing bytes to
-connection outbox. Inbound durable bytes still validate normally after receipt;
+transit outbox. Inbound durable bytes still validate normally after receipt;
 network sync messages can cause work to be attempted, but cannot make invalid
 durable events valid.
 
@@ -696,7 +699,8 @@ only when the concern exists. Do not keep placeholder concern files that merely
 say "no rows" or forward to another module. `schema.rs` is where the module
 declares its own projection tables, indexes, queues, cursors, and storage
 class. A domain root may also contain `schema.rs`, `queries.rs`,
-`types.rs`, `worker.rs`, and `cli.rs` when it owns shared tables, a worker, or a
+`types.rs`, `commands.rs`, `worker.rs`, and `cli.rs` when it owns shared tables,
+cross-child protocol decisions over explicit context, a worker, or a
 domain-level CLI command registry coordinating several leaf event modules.
 There is no generic `jobs/` or `cli_commands/` dumping ground and no fake event
 module for an algorithm: `sync/worker.rs` may run negentropy over `sync/schema.rs`;
@@ -734,7 +738,7 @@ Every `worker.rs` exposes one public free function, `run`, as the obvious
 entrypoint. Public work/output types describe the worker boundary; helper
 functions stay private.
 
-Default dependency blocking is centralized in the event-modules worker after
+Default dependency blocking is centralized in the common event pipeline after
 record decoding and before projection. Projectors remain expressive by writing
 module-owned wait/blocked rows for semantic blockers that are not just
 immediate missing dependencies, but they do not each reimplement the common
@@ -743,7 +747,7 @@ dependency wait queue.
 **control loop** means the protocol's worker scheduling policy. It claims
 bounded batches of queue rows, dispatches to the owning worker, applies returned
 state writes atomically through core storage, and admits returned events
-through the event-modules worker. Workers queue network IO by writing
+through the common event pipeline. Workers queue network IO by writing
 `OutboundNetworkRow`s with target metadata; core TCP drains those rows as
 opaque frames. Core
 provides queue and transaction mechanics; protocol owns which workers exist
@@ -763,10 +767,10 @@ connect, length-prefixed frame read/write, socket shutdown, and transport
 backpressure mechanics. It does not create or interpret transit blobs,
 canonical event bytes, sync control events, invites, or connection ids.
 
-**workers** are module-owned active components woken by queue rows, timers, IO
-readiness, or explicit CLI requests. A worker declares its wake sources, read
+**workers** are module-owned active components run from queue rows, timers, IO
+readiness, or explicit CLI requests. A worker declares its input sources, read
 set, and write set. Core uses those declarations to load bounded context
-and commit output; the worker owns the semantic decision. Use `wake` for
+and commit output; the worker owns the semantic decision. Use `input` for
 scheduling and `run` for execution.
 
 **cli.rs** is the module-local CLI adapter. It owns help text, parameter names,
@@ -774,7 +778,7 @@ domain command invocation, follow-up queries, and output formatting for the
 commands that belong to that module or domain. The generic CLI runner stays
 boring: find the named command spec, reject duplicate command names, pass argv
 tail and context to the command, and return text lines. The binary shell parses
-global flags such as `--db`; the scoped command decides which workers to wake
+global flags such as `--db`; the scoped command decides which workers to run
 and which queries to run.
 
 CLI files follow the tightest-scope rule. A command that creates or queries one
@@ -967,10 +971,10 @@ per-event-type SQL queries against arbitrary state just because a dependency or
 label is missing.
 
 Connection handshakes are the important subjective case. A received
-request/ack is canonical event bytes plus local receive metadata in
+request/response is canonical event bytes plus local receive metadata in
 `EventContext`, not in `EventRecord`. Request receive context must carry
 bootstrap-invite authorization backed by an applied invite-secret dependency.
-Ack receive context must carry endpoint-transit authorization from the
+Response receive context must carry endpoint-transit authorization from the
 decrypted sender endpoint. The connection projector consumes those together and
 writes the established connection row plus the current transport-target row only
 when the origin is a route worth dialing later. The route is not a separate
@@ -999,7 +1003,7 @@ cut. Model their checks as first-level dependencies and labels:
 
 - a connection request depends on the invite, peer-shared signer, or other
   signer/prekey facts needed to verify it;
-- a connection ack depends on the request it acknowledges;
+- a connection response depends on the request it accepts;
 - invite acceptance creates or labels local trust anchors and route hints rather
   than reaching through custom context;
 - observed/self address and route facts are labels or module rows consumed by
@@ -1100,21 +1104,21 @@ Queued work is typed:
 ```
 WorkItem =
   ReadyEvent
-  WorkerWake(worker_id, wake_key)
+  WorkerInput(worker_id, input_key)
 ```
 
 Each queue item has exactly one owning worker. The control loop calls one
 function:
 
 ```
-worker.run(wake, context) -> WorkerOutput
-worker.run(wake, context) -> WorkerOutput
+worker.run(input, context) -> WorkerOutput
+worker.run(input, context) -> WorkerOutput
 ```
 
 Mathematically:
 
 ```
-Worker_i : Wake_i x Read_i(State) -> Delta_i(State) x Events x Complete
+Worker_i : Input_i x Read_i(State) -> Delta_i(State) x Events x Complete
 ```
 
 The module registry gives core an worker catalog:
@@ -1122,7 +1126,7 @@ The module registry gives core an worker catalog:
 ```
 WorkerSpec:
   worker_id
-  wake_sources
+  input_sources
   read_set       // declared tables/indexes this worker can read
   write_set      // declared tables this worker can update
   run
@@ -1131,15 +1135,15 @@ WorkerSpec:
 The protocol scheduler owns the mechanical sequence:
 
 ```
-select wake
+select input
 lookup WorkerSpec
 load declared context from read_set
-worker.run(wake, context)
+worker.run(input, context)
 commit returned rows/events/completions against write_set
 ```
 
 Core does not know this worker catalog exists. The protocol supplies worker
-catalogs and wake sources. At network boundaries, protocol workers write
+catalogs and input sources. At network boundaries, protocol workers write
 `OutboundNetworkRow`s with target metadata; core TCP drains those rows without
 learning protocol meaning.
 
@@ -1147,11 +1151,11 @@ learning protocol meaning.
 
 ```
 StateUpdates   // includes NewRows into ordinary tables and boundary tables
-Events         // proposed canonical events to admit through the event-modules worker
+Events         // proposed canonical events to admit through the common event pipeline
 Complete       // queue rows to complete/delete after the state commit
 ```
 
-The event-modules worker is a pure chain over canonical event bytes:
+The common event pipeline is a pure chain over canonical event bytes:
 
 ```
 CanonicalEventBytes
@@ -1180,10 +1184,11 @@ queue rows. Commands are pure construction/query helpers. Workers are the only
 event-module surface that can advance queued work. They do not return ad hoc
 effects; they write queue rows.
 
-Protocol inbound processing receives `InboundNetworkRow`s from core TCP. The
-connection worker unwraps or rejects the opaque bytes, rejects remote local-only
-durable events, and sends surviving shared canonical bytes through the
-event-modules worker.
+Protocol inbound processing receives `InboundNetworkRow`s from core TCP.
+`transit_in` runs the transit projector over those opaque bytes and writes
+surviving canonical bytes into `canonical.in`. Event admission rejects invalid
+transit/provenance shapes and remote local-only durable events before sending
+accepted bytes through the common event pipeline.
 
 Boundary tables that need claim/retry ownership are ordinary module-owned tables with status metadata:
 
@@ -1248,7 +1253,7 @@ transport IO inline.
 The control loop has no sync, bootstrap, auth, connection, or event-type policy
 beyond calling protocol workers. It only knows dispatch, bounded batches,
 transactions, time, limits, retries, and queue commits. Blocking policy belongs to
-the event-modules worker. Leases are a
+the common event pipeline. Leases are a
 later extension for multiple workers or long-running claim ownership.
 
 ## Network Boundary
@@ -1282,7 +1287,7 @@ Normal inbound processing is a core/protocol worker chain:
 InboundNetworkRow { source, bytes }
   -> connection.unwrap / raw frame parse
   -> CanonicalEventBytes
-  -> event-modules worker
+  -> common event pipeline
 ```
 
 Normal outbound processing is:
@@ -1303,7 +1308,7 @@ lives in `core/network_queues.rs`, not `core/store.rs`.
 The current target-indexed core network queue is the right boundary for a POC,
 but the sender loop can become more mature without changing that model. A
 future long-lived sender should keep each open `NetworkTarget` fed with bounded
-low/high watermarks, claim queued bytes by target and byte budget, and wake
+low/high watermarks, claim queued bytes by target and byte budget, and run
 protocol workers when that target has capacity for more wrapped bytes. That
 demand signal should stay generic: core TCP reports target capacity and drains
 opaque rows; protocol workers decide which connection-scoped outbox rows to
@@ -1334,7 +1339,7 @@ The connection module also owns the transit envelope as plain functions, not as 
 - `connection.unwrap(bytes) -> Vec<CanonicalEventBytes>`: a parse-stage
   transform run by the inbound-byte loop on every inbound frame. Unwraps either
   endpoint-pubkey bootstrap frames or connection-secret frames. Connection-secret
-  frames recover `connection_id`; the connection worker rejects local-only
+  frames recover `connection_id`; network admission rejects local-only
   durable events from remote peers and passes shared canonical event bytes into
   canonical-event processing.
 
@@ -1352,19 +1357,19 @@ Projectors write rows to module-owned queues. A sync worker that wants to send a
 durable event, for example after reading a queued need from connection C for
 event E, must first check that E can be disclosed to C's remote endpoint through
 a mutual workspace. Only then may it write the id-only
-`outbox(connection_id=C, event_id=E)` row. `connection/worker.rs` claims outbox
+`outbox(connection_id=C, event_id=E)` row. `transit_out` claims outbox
 rows, resolves C to a current transport target, calls the transit wrap command,
 and writes a core TCP send queue row. The TCP IO worker packs those bytes into
 TCP frames and writes sockets. A slow route backs off its own target; other
 transport targets continue.
 *Invariant: ordinary durable bytes on the wire have passed send-side disclosure
-policy before entering connection outbox. The receiving side does not trust that
+policy before entering transit outbox. The receiving side does not trust that
 fact; after unwrap it admits only shared-scope durable bytes to the common
 pipeline, which performs dependency, signature, projector, and storage
 validation.*
 
-For the current POC, connection request/ack projection also owns route learning.
-The connection worker attaches receive metadata as projector context to accepted
+For the current POC, connection request/response projection also owns route learning.
+Network admission attaches receive metadata as projector context to accepted
 inbound handshake records before admitting them. The projector writes:
 
 ```
@@ -1374,10 +1379,10 @@ connection.transport_targets[connection_id] = observed_socket_addr   # only if r
 
 This keeps connection establishment and "where can I send back to that
 connection?" in one atomic projection. A transport target is still a protocol
-row consumed by the connection worker, but it is not its own child event module.
+row consumed by transit out, but it is not its own child event module.
 For TCP listeners, the client's ephemeral source port is valid receive metadata
-but usually not a durable route; client-side ack receive is the ordinary place to
-remember the listener address.
+but usually not a durable route; client-side response receive is the ordinary
+place to remember the listener address.
 
 `outbox` stores only deterministic event ids to process for a connection:
 
@@ -1392,18 +1397,18 @@ outbox:
 `outbox` is a memory row table by default and has no per-row claim, lease, or
 retry status. It is send work, not truth: if the process restarts, sync can
 recreate the same deterministic connection-scoped events and outbox rows. Each
-active connection has exactly one `connection/worker.rs` owner for outbox drain
+active connection has exactly one transit out worker owner for outbox drain
 work:
 
 ```
-connection::worker.run:
+transit_out::run:
   connection_id
   hot_queue: bounded deque<event_id>
   present: set<event_id>
 ```
 
 `hot_queue` is bounded by estimated bytes, not only event count. When it drops
-below a low-water mark, `connection::worker.run` refills with a prefix scan over
+below a low-water mark, `transit_out::run` refills with a prefix scan over
 pending `outbox` rows for that connection, skipping ids already in `present`.
 After the socket
 accepts a complete frame, the protocol runner deletes the corresponding
@@ -1439,24 +1444,37 @@ queue/cursor work. No compatibility adapters or duplicate engines.
 
 # Daemon runtime plan
 
-`topo start` is the product daemon path. It should be a foreground process that
-owns a long-lived `Store`, a core TCP listener, and a scheduler loop over the
-existing protocol workers. RPC is optional; direct-DB CLI commands are acceptable
-as long as the daemon observes durable committed state and keeps syncing.
+`topo start` is the product daemon path. It is built by the generic core app
+shell from the selected protocol spec. Core owns the long-lived `Store` context
+handoff, TCP listener, daemon lock, and scheduler loop. The protocol supplies
+commands and daemon worker objects through `src/workers`. RPC is optional;
+direct-DB CLI commands are acceptable as long as the daemon observes durable
+committed state and keeps syncing.
 
-The daemon module belongs at the application crate root (`src/daemon.rs`), not
-under `src/protocol`. It orchestrates protocol workers; it is not itself
-protocol semantics, an event module, or a protocol command aggregator concern.
+The daemon runner belongs in `src/core/daemon.rs`, not under `src/protocol`.
+The project root `src/main.rs` is only the app shell that chooses the protocol
+spec. Protocol semantics stay in event modules and workers; the core daemon
+only runs opaque named worker steps.
 
 Daemon responsibilities:
 
 - accept inbound TCP frames continuously through `core/tcp.rs`
-- hand opaque frames to `connection::worker::Work::IngestNetwork`
-- drain ready durable events through the common event-module worker
-- periodically wake `sync::worker::Work::MaybeStart`, not force-start sync
-- drain connection outbox routes and write framed bytes through the same core TCP
+- drain raw inbound network rows through event admission and the transit
+  projector
+- drain ready durable events through the common event pipeline
+- periodically run `sync::worker::Work::Tick`
+- drain transit outbox routes and write framed bytes through the same core TCP
   pump used by finite CLI tests
 - enforce one daemon per DB with a clear duplicate-start error
+
+TCP send liveness rule: the daemon must not wait indefinitely for a peer to
+drain its socket. TCP already handles packet loss and retransmit while a
+connection is healthy, but a blocked send buffer, stalled peer, or broken route
+must return control to the worker loop within a bounded budget. On timeout or
+route failure, protocol send rows stay queued or are recreated by set
+reconciliation; they are consumed locally only after core has written the
+framed bytes and completed its send bookkeeping. This is a synchronous
+one-worker-step send, not a claim that the peer has processed the frame.
 
 Daemon non-responsibilities:
 
@@ -1466,15 +1484,13 @@ Daemon non-responsibilities:
 - no durable state hidden in memory rows
 
 Sync cadence belongs in `sync::worker`, not in the daemon. The daemon's timer is
-only a wakeup edge. The worker tracks memory-local per-connection activity and
-starts a new round only after inbound/pending sync work has been quiet long
-enough. Duplicate compare/have/need events are correctness-safe, but a live
-daemon should avoid wasteful overlapping rounds.
+only a wakeup edge. The daemon-facing sync `Tick` catches up the sync index,
+chooses whether to start a round, and drains projected sync input. Duplicate
+compare/have/need events are correctness-safe, but a live daemon should avoid
+wasteful overlapping rounds.
 
-`topo sync --listen IP PORT --accept N` remains useful as a finite
-test/debug harness. It is not the product daemon, and passing finite-listener
-tests is not enough to claim daemon behavior works. Daemon behavior needs
-black-box coverage through real `topo start` processes.
+Manual finite sync listeners are deprecated. Daemon behavior needs black-box
+coverage through real `topo start` processes.
 
 # Appendix: Negentropy, dependencies, and dedupe
 
@@ -1593,17 +1609,16 @@ projection context:
 
 ```
 EventScope::Connection(Outgoing { connection_id })
-  -> projector writes connection-scoped byte cache + id-only connection outbox row
+  -> projector writes connection-scoped byte cache + id-only transit outbox row
 
 EventScope::Connection(Incoming { connection_id })
   -> projector writes sync.inbound_events
 ```
 
-Inbound transit bytes are unwrapped by the connection worker, decoded as the
-same canonical sync event bytes, admitted with incoming connection scope,
-projected to `sync.inbound_events`, and then read by `sync/worker.rs`. Core owns
-only TCP length framing; protocol event modules own event bytes and transit
-wrapping.
+Inbound transit bytes are unwrapped by `transit_in`, decoded as the same
+canonical sync event bytes, admitted with incoming connection scope, projected
+to `sync.inbound_events`, and then read by `sync/worker.rs`. Core owns only TCP
+length framing; protocol event modules own event bytes and transit wrapping.
 
 Connection transit may batch several canonical inner events into one encrypted
 transit blob. That is still connection-domain work, not TCP framing: the
@@ -1622,16 +1637,16 @@ created. Workers may decide that a follow-up sync event is needed, but they
 express that decision by calling a module command and admitting its
 `ProposedEvent`s. Workers may also admit canonical bytes that already exist,
 such as bytes received from a connection, but decoding existing bytes is not
-event creation. A worker may write an id-only `connection.outbox` row for an
+event creation. A worker may write an id-only `transit.outbox` row for an
 already-existing durable shared event requested by `NeedId`; that row is send
 work, not a newly created event.
 
 There is no distinct `SyncStartRequested` protocol event in the base design.
-The current CLI wakes `sync::worker::Work::Start`; that wake is local worker
+The current CLI runs `sync::worker::Work::Start`; that input is local worker
 control, not wire protocol. Today the worker fans out across known routed
 connections, calls `compare::commands::start`, and returns an outgoing root
 `SyncCompare` for admission. Once the materialized sync index exists, the same
-wake first catches the index up and then calls the root-compare command for each
+input first catches the index up and then calls the root-compare command for each
 selected connection. The first protocol event on the wire remains
 `SyncCompare(root)`.
 
@@ -1640,16 +1655,16 @@ topo sync
   -> sync::worker::run(Work::Start)
   -> compare command from current sync index/context
   -> proposed outgoing root SyncCompare events
-  -> common event-module worker admits events
+  -> common event pipeline admits events
 
 Outgoing-scoped SyncCompare / SyncHaveId / SyncNeedId projected
   -> connection_scoped_events(event_id, bytes)
   -> temp outbox(connection_id, event_id)
 
 Incoming transit bytes
-  -> connection::worker unwraps bytes
+  -> transit_in runs transit projector
   -> sync::inbound_record_from_connection_bytes(connection_id, bytes)
-  -> common event-module worker admits incoming connection-scoped event
+  -> common event pipeline admits incoming connection-scoped event
 
 Incoming-scoped SyncCompare / SyncHaveId / SyncNeedId projected
   -> temp sync.inbound_events(connection_id, event_id, bytes)
@@ -1658,21 +1673,21 @@ sync::worker.run
   -> drains sync.inbound_events by connection
   -> command(ctx, params) -> proposed SyncCompare / SyncHaveId / SyncNeedId
   -> or id-only temp outbox row for requested durable event id
-  -> common event-module worker admits proposed sync events
+  -> common event pipeline admits proposed sync events
 
-connection::worker.run
+transit_out::run
   -> prefix-scans temp outbox(connection_id, event_id)
   -> transit_wrap command returns transit bytes
   -> writes core TCP send queue rows for those bytes
 ```
 
 The current implementation keeps a timestamp-ordered shared-event feed in the
-common event schema. `sync/worker.rs` owns an in-memory negentropy index over
-that feed: catch-up inserts only new ids, updates each timestamp leaf-to-root
-path, and then serves compare summaries from the tree instead of recomputing
-hashes for every range. In the current CLI each command is a fresh process, so
-the index may rebuild once at command start. In the intended long-lived control
-loop it stays warm and only receives path updates.
+common event schema. The sync worker owns the process-local sync index over
+that feed plus catch-up timing and queue consumption: it catches the index up before
+response work, calls sync commands over explicit read context, and writes the
+resulting event/outbox rows. In the current CLI each command is a fresh process,
+so the index may rebuild once at command start. In the intended long-lived
+control loop it stays warm and receives only new applied shared events.
 
 `topo sync` starts at the root timestamp range. `topo sync today` is a narrow
 POC selector: it starts the same compare protocol at the synthetic day bucket
@@ -1708,9 +1723,10 @@ it defines a real event type. The implementation plan is:
 1. Preserve the current POC boundary. `sync/compare`,
    `sync/have_id`, and `sync/need_id` stay leaf event modules. Their projectors
    remain row-only: outgoing scope writes connection-scoped bytes plus temp
-   outbox rows, incoming scope writes `sync.inbound_events`. `sync/worker.rs`
-   remains the only sync component that scans indexes, chooses responses, or
-   queues requested durable ids.
+   outbox rows, incoming scope writes `sync.inbound_events`. `sync/commands.rs`
+   chooses compare/have/need responses from explicit context;
+   `src/workers/sync.rs` owns the process-local index shape, scans queues,
+   catches up the index, writes transit out rows, and consumes work.
 2. The current code already has real range negotiation: `SyncCompare` names an
    inclusive timestamp range and carries a count/fingerprint summary;
    mismatched ranges split; small leaves emit `SyncHaveId`; missing ids emit
@@ -1722,19 +1738,18 @@ it defines a real event type. The implementation plan is:
    each admitted shared event in the same transaction that records the event.
    Use a monotonically increasing feed/apply sequence in the row key, not event
    timestamps. Transient sync events and rejected bytes do not enter this feed.
-4. The current POC already has process-local plain-negentropy state in
-   `sync/worker.rs`. If we need restart-time replay to be bounded, add
+4. The current POC already has process-local sync index state in
+   `src/workers/sync.rs`. If we need restart-time replay to be bounded, add
    `sync.index_cursor` to `sync/schema.rs` and a monotonic shared-event feed in
    the common event schema. Keep range nodes in memory unless measurements show
    restart rebuild is the real bottleneck.
-5. Keep `sync/worker.rs` responsible for index catch-up before response work.
-   It should drain the shared-event feed after the cursor, update leaf-to-root
-   range summaries with path updates, and advance the cursor in the same
-   transaction as any durable cursor writes. This is the point where negentropy
-   hashes stay cheap: no full tree rebuild on ordinary event arrival.
+5. Keep `src/workers/sync.rs` responsible for index catch-up before response
+   work. It should drain the shared-event feed after the cursor, update the
+   process-local index, and advance any future durable cursor in the same
+   transaction as cursor writes.
 6. Keep every newly created sync protocol item on the command/admission path.
    The sync worker may call module commands and return proposed events to the
-   common event-module worker; it must not hand bytes to transit or write core
+   common event pipeline; it must not hand bytes to transit or write core
    network rows. Connection transit may batch many outbox ids into one encrypted
    transit blob; core TCP still owns only the outer length frame.
 7. Add the full dep-aware invariant without changing the worker boundary. The
@@ -1772,7 +1787,7 @@ Keep the storage split explicit:
 ```
 event_modules.events(event_id, canonical_event_bytes, status, ...)
 connection.connection_scoped_events(event_id, canonical_event_bytes)   # temp
-connection.outbox(connection_id, event_id)                             # temp
+transit.outbox(connection_id, event_id)                             # temp
 sync.inbound_events(connection_id, event_id, canonical_event_bytes)     # temp
 sync.index_*                                                           # future durable sync-owned index tables
 ```
@@ -1816,7 +1831,7 @@ inbound_observations:
   seen_count
 ```
 
-The incoming buffer is idempotent by `wire_id`. Source observations are tracked separately so address changes are diagnostics and dialing hints, not event semantics. Inner canonical event bytes unwrapped by `connection.unwrap` re-enter the same inbound processing path and dedupe again by their own canonical bytes.
+The incoming buffer is idempotent by `wire_id`. Source observations are tracked separately so address changes are diagnostics and dialing hints, not event semantics. Inner canonical event bytes unwrapped by the transit projector re-enter the same inbound processing path and dedupe again by their own canonical bytes.
 
 Canonical-event processing only calls sync suppression after parse succeeds and the canonical event id is known. Invalid bytes may be deduped as bytes, but they are not event ids.
 
@@ -1828,7 +1843,7 @@ Dedupe deterministic send intent before transit wrapping.
 NeedId
   -> SendEvent(connection_id, inner_event_id)
   -> outbox(connection_id, send_event_id)
-  -> connection::worker.run
+  -> transit_out::run
   -> connection.wrap(connection_id, inner_event)
   -> core tcp_send_queue(target: ip/port or socket_id, bytes: transit_blob)
   -> protocol TCP frame/write

@@ -1,9 +1,0 @@
-[package]
-name = "sync_state_machine_crux_poc"
-version = "0.1.0"
-edition = "2021"
-publish = false
-
-[dependencies]
-crux_core = "0.17"
-serde = { version = "1", features = ["derive"] }

@@ -1,31 +1,32 @@
-//! Blocking TCP frame pump over opaque network queue rows.
+//! TCP frame pump over opaque network queue rows.
 //!
 //! This file is deliberately a byte mover. It opens sockets, reads and writes
 //! `[u32 length][bytes]` frames, records inbound bytes in the core queue, and
 //! drains outbound bytes for the connected route.
 //!
 //! The protocol boundary is the stored queue rows in `core/network_queues.rs`.
-//! On receive, TCP wraps a frame in an `InboundNetworkRow` keyed by the observed
-//! `NetworkSource`, inserts it into the inbound queue, hands that exact row to
-//! the caller, and deletes it only after the caller returns protocol-produced
-//! outbound rows. On send, callers provide `OutboundNetworkRow`s keyed by one
-//! `NetworkTarget`; TCP inserts them into the outbound queue, claims rows for
-//! that same target, writes their opaque bytes as frames, deletes the sent core
-//! rows, and then reports the sent rows back through `on_sent` so protocol-owned
-//! bookkeeping can advance. Core never interprets or constructs protocol bytes.
+//! On receive, TCP wraps each frame in an `InboundNetworkRow` keyed by the
+//! observed `NetworkSource` and inserts it into the inbound queue. An
+//! upper-layer worker later claims that row and writes any accepted protocol
+//! bytes to its own input queues. On send, callers provide `OutboundNetworkRow`s
+//! keyed by one `NetworkTarget`; TCP inserts them into the outbound queue,
+//! claims rows for that same target, writes their opaque bytes as frames,
+//! deletes the sent core rows, and then reports the sent rows back through
+//! `on_sent` so protocol-owned bookkeeping can advance. Core never interprets
+//! or constructs protocol bytes.
 //!
 //! The invariant is routing correctness: each outbound row is sent only on the
 //! stream for its `NetworkTarget`, and each inbound row is recorded with the
 //! `NetworkSource` observed from the socket before any worker sees the bytes. A
-//! frame is first written to a core queue row, then handed to the caller, and
-//! only deleted after the caller accepts responsibility for it. The same shape
-//! is used on send: callers provide opaque rows, this pump writes frames, and
-//! then calls back so the caller can update its own send bookkeeping. Keep this
-//! file boring; cleverness here usually means a domain worker is missing.
+//! frame is first written to a core queue row and then left for admission. The
+//! same shape is used on send: callers provide opaque rows, this pump writes
+//! those rows in caller order, and then calls back so the caller can update its
+//! own send bookkeeping. Keep this file boring; cleverness here usually means a
+//! domain worker is missing.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::core::network_queues::{
     self, InboundNetworkRow, NetworkSource, NetworkTarget, OutboundNetworkRow,
@@ -33,6 +34,7 @@ use crate::core::network_queues::{
 use crate::core::store::Store;
 
 const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
+const WRITE_FRAME_BUDGET: Duration = Duration::from_millis(100);
 
 /// Counts observed while pumping one TCP stream.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -41,17 +43,17 @@ pub struct StreamReport {
     pub received_frames: usize,
 }
 
-/// Result of accepting one or more TCP streams.
+/// Result of polling a reusable listener once.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServeReport<T> {
-    pub local_addr: SocketAddr,
+pub struct AcceptReport<T> {
     pub accepted_connections: usize,
     pub value: T,
 }
 
-/// Result of polling a reusable listener once.
+/// Result of serving a fixed number of inbound streams.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AcceptReport<T> {
+pub struct ServeReport<T> {
+    pub local_addr: SocketAddr,
     pub accepted_connections: usize,
     pub value: T,
 }
@@ -67,12 +69,41 @@ impl Listener {
         self.local_addr
     }
 
-    /// Accept and pump at most one available stream.
+    /// Accept and pump at most one available inbound stream.
     ///
-    /// If no stream is ready, the supplied value is returned unchanged. This
-    /// gives higher-level schedulers a nonblocking accept step without moving
-    /// any byte interpretation into core.
-    pub fn accept_available<T>(
+    /// If no stream is ready, the returned report has zero accepted
+    /// connections. This gives higher-level schedulers a nonblocking accept
+    /// step without moving any byte interpretation into core.
+    pub fn accept_available(&self, store: &Store) -> Result<AcceptReport<StreamReport>, String> {
+        let (mut stream, source_addr) = match self.listener.accept() {
+            Ok(accepted) => accepted,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(AcceptReport {
+                    accepted_connections: 0,
+                    value: StreamReport::default(),
+                })
+            }
+            Err(err) => return Err(format!("accept tcp stream: {err}")),
+        };
+        stream
+            .set_nonblocking(false)
+            .map_err(|err| format!("set stream blocking: {err}"))?;
+        stream
+            .set_nodelay(true)
+            .map_err(|err| format!("set stream nodelay: {err}"))?;
+        let value = read_inbound_frames(store, &mut stream, NetworkSource::new(source_addr))?;
+        Ok(AcceptReport {
+            accepted_connections: 1,
+            value,
+        })
+    }
+
+    /// Accept and pump at most one available inbound stream with caller replies.
+    ///
+    /// This is still an opaque byte pump. The caller receives queued inbound
+    /// rows and may return queued outbound rows for the same route; core only
+    /// moves bytes and invokes the send hook after rows are written.
+    pub fn accept_exchange_available<T>(
         &self,
         store: &Store,
         value: T,
@@ -127,12 +158,38 @@ pub fn listen(listen: SocketAddr) -> Result<Listener, String> {
     })
 }
 
-/// Open a TCP stream, send initial rows, then react to inbound frames.
+/// Open a TCP stream, send outbound rows for that target, and return.
 ///
-/// `on_inbound` is the protocol boundary: it receives an opaque inbound row and
-/// may return more opaque outbound rows for the same route. `on_sent` is called
-/// after frame writes and queue deletion, so protocol bookkeeping can lag socket
-/// writes without being hidden in core.
+/// This is the daemon-friendly shape for queued outbound work whose responses
+/// will arrive later as ordinary inbound streams. It still stages bytes in the
+/// core outbound queue and calls `on_sent` only after bounded socket writes and
+/// queue deletion complete. If the remote side stops draining its socket, the write
+/// times out and the protocol send rows remain queued for a later pass.
+pub fn send_once<T>(
+    store: &Store,
+    target: NetworkTarget,
+    rows: Vec<OutboundNetworkRow>,
+    mut value: T,
+    mut on_sent: impl FnMut(&[OutboundNetworkRow], &mut T) -> Result<(), String>,
+) -> Result<T, String> {
+    let mut stream = connect(target.addr()).map_err(|err| format!("open tcp stream: {err}"))?;
+    let mut report = StreamReport::default();
+    write_outbound(
+        store,
+        &mut stream,
+        target,
+        rows,
+        &mut value,
+        &mut on_sent,
+        &mut report,
+    )?;
+    stream
+        .shutdown(Shutdown::Both)
+        .map_err(|err| format!("shutdown sent stream: {err}"))?;
+    Ok(value)
+}
+
+/// Open a stream, send initial opaque rows, then let the caller answer rows.
 pub fn connect_exchange<T>(
     store: &Store,
     target: NetworkTarget,
@@ -154,11 +211,7 @@ pub fn connect_exchange<T>(
     .map(|(_, value)| value)
 }
 
-/// Serve a fixed number of incoming streams.
-///
-/// This POC runner is intentionally finite; tests can ask it to accept exactly
-/// the number of streams they intend to drive. A long-lived scheduler can wrap
-/// this same stream pump later without changing the byte/queue boundary.
+/// Serve a fixed number of incoming streams with caller-produced replies.
 pub fn serve<T>(
     store: &Store,
     listen: SocketAddr,
@@ -201,9 +254,6 @@ pub fn serve<T>(
     })
 }
 
-// Drive one stream until the remote side closes it or neither side has more
-// bytes to write. Every frame passes through the inbound queue before the
-// callback sees it, which keeps the core/protocol handoff visible in tests.
 fn pump_stream<T>(
     store: &Store,
     stream: &mut TcpStream,
@@ -261,8 +311,35 @@ fn pump_stream<T>(
     Ok((report, value))
 }
 
+// Drive one inbound stream until the remote side closes it. Every frame is
+// queued before the admission worker sees it, which keeps the core/protocol
+// handoff visible and retryable.
+fn read_inbound_frames(
+    store: &Store,
+    stream: &mut TcpStream,
+    source: NetworkSource,
+) -> Result<StreamReport, String> {
+    let mut report = StreamReport::default();
+    loop {
+        let bytes = match read_frame(stream) {
+            Ok(bytes) => bytes,
+            Err(err) if is_stream_closed(&err) => break,
+            Err(err) => return Err(format!("read frame: {err}")),
+        };
+        report.received_frames += 1;
+
+        let inbound = InboundNetworkRow::new(source, bytes);
+        network_queues::enqueue_inbound(store, std::slice::from_ref(&inbound))?;
+    }
+
+    Ok(report)
+}
+
 // Commit rows to the outbound queue before writing them. The caller's `on_sent`
 // hook runs only after the rows were written and removed from the core queue.
+// The provided order is the stream order. Some protocol handshakes need an
+// authorization frame before later frames on the same stream; the generic queue
+// key is deterministic for idempotence, not an ordering primitive.
 fn write_outbound<T>(
     store: &Store,
     stream: &mut TcpStream,
@@ -277,13 +354,19 @@ fn write_outbound<T>(
     }
     ensure_target(target, &rows)?;
     network_queues::enqueue_outbound(store, &rows)?;
-    let queued = network_queues::claim_outbound_for_target(store, target, rows.len())?;
-    for row in &queued {
+    let claimed = network_queues::claim_outbound_for_target(store, target, rows.len())?;
+    if rows
+        .iter()
+        .any(|row| !claimed.iter().any(|claimed| claimed.key == row.key))
+    {
+        return Err("queued outbound network row was not claimable for stream target".to_string());
+    }
+    for row in &rows {
         write_frame(stream, &row.bytes).map_err(|err| format!("write frame: {err}"))?;
     }
-    network_queues::delete_outbound(store, &queued)?;
-    on_sent(&queued, value)?;
-    report.sent_frames += queued.len();
+    network_queues::delete_outbound(store, &rows)?;
+    on_sent(&rows, value)?;
+    report.sent_frames += rows.len();
     Ok(())
 }
 
@@ -301,11 +384,59 @@ fn connect(addr: SocketAddr) -> std::io::Result<TcpStream> {
 }
 
 fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+    write_frame_with_budget(stream, bytes, WRITE_FRAME_BUDGET)
+}
+
+fn write_frame_with_budget(
+    stream: &mut TcpStream,
+    bytes: &[u8],
+    budget: Duration,
+) -> std::io::Result<()> {
     let len = u32::try_from(bytes.len())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame too large"))?;
-    stream.write_all(&len.to_be_bytes())?;
-    stream.write_all(bytes)?;
-    stream.flush()
+    stream.set_nonblocking(true)?;
+    let deadline = Instant::now() + budget;
+    let result = (|| {
+        write_all_until(stream, &len.to_be_bytes(), deadline)?;
+        write_all_until(stream, bytes, deadline)?;
+        stream.flush()
+    })();
+    let reset = stream.set_nonblocking(false);
+    match (result, reset) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(err), _) => Err(err),
+        (Ok(()), Err(err)) => Err(err),
+    }
+}
+
+fn write_all_until(
+    stream: &mut TcpStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "tcp frame write budget exhausted",
+            ));
+        }
+        match stream.write(bytes) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "tcp stream accepted zero bytes",
+                ))
+            }
+            Ok(n) => bytes = &bytes[n..],
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 // The frame format is fixed and intentionally not self-describing. Type tags,
@@ -333,4 +464,46 @@ fn is_stream_closed(err: &std::io::Error) -> bool {
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::BrokenPipe
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    #[test]
+    fn write_frame_sends_length_prefixed_bytes_within_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let reader = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut len = [0; 4];
+            stream.read_exact(&mut len).expect("read len");
+            let mut body = vec![0; u32::from_be_bytes(len) as usize];
+            stream.read_exact(&mut body).expect("read body");
+            body
+        });
+
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        write_frame_with_budget(&mut stream, b"abc", Duration::from_secs(1)).expect("write frame");
+
+        assert_eq!(reader.join().expect("reader thread"), b"abc");
+    }
+
+    #[test]
+    fn write_frame_zero_budget_times_out_before_blocking() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let reader = thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept");
+            thread::sleep(Duration::from_millis(20));
+        });
+
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        let err = write_frame_with_budget(&mut stream, b"abc", Duration::ZERO)
+            .expect_err("zero budget should time out");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        reader.join().expect("reader thread");
+    }
 }

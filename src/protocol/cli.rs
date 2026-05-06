@@ -13,9 +13,15 @@
 use std::path::Path;
 
 use crate::core::cli::{CliArgs, CliCommand, CliOutput};
+use crate::core::network_queues::InboundNetworkRow;
 use crate::core::store::Store;
 use crate::protocol::event_modules::schema as event_schema;
+use crate::protocol::event_modules::types::{EventRecord, ReceiveMetadata};
+use crate::protocol::event_modules::worker::{
+    EventRegistry, EventWithContext, ProjectionOutput, ReceivedRecord,
+};
 use crate::protocol::{clock, event_modules, Protocol};
+use crate::workers::DaemonWorkerContext;
 
 const CLOCK_USAGE: &str = "clock [set TIMESTAMP|advance DELTA|clear]";
 const COUNT_USAGE: &str = "count";
@@ -35,6 +41,51 @@ impl Context {
             protocol: Protocol::new(),
             db_path,
         })
+    }
+}
+
+// The shared CLI/daemon context delegates protocol behavior to `Protocol` while
+// exposing the store and persistent worker state required by the generic runner.
+impl EventRegistry for Context {
+    fn record_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
+        self.protocol.record_from_bytes(bytes)
+    }
+
+    fn project_network_in(
+        &self,
+        store: &Store,
+        inbound: &InboundNetworkRow,
+    ) -> Result<ProjectionOutput, String> {
+        self.protocol.project_network_in(store, inbound)
+    }
+
+    fn record_from_canonical_in(
+        &self,
+        store: &Store,
+        bytes: Vec<u8>,
+        receive: Option<ReceiveMetadata>,
+        provenance: Option<crate::workers::schema::TransitProvenance>,
+    ) -> Result<ReceivedRecord, String> {
+        self.protocol
+            .record_from_canonical_in(store, bytes, receive, provenance)
+    }
+
+    fn project_record(
+        &self,
+        store: &Store,
+        event: &EventWithContext<'_>,
+    ) -> Result<ProjectionOutput, String> {
+        self.protocol.project_record(store, event)
+    }
+}
+
+impl DaemonWorkerContext for Context {
+    fn store(&self) -> &Store {
+        &self.store
+    }
+
+    fn sync_index(&self) -> &event_modules::sync::SyncIndex {
+        self.protocol.sync_index()
     }
 }
 

@@ -1,18 +1,22 @@
 //! Sync domain.
 //!
 //! Sync is modeled as connection-scoped compare/have/need events plus a domain
-//! worker. Projectors use connection scope metadata, not event-body direction
-//! fields: locally proposed sync events go to the connection outbox by id, while
-//! received sync events go to sync-owned work rows. The worker decides what
-//! follow-up ids to propose by querying event indexes. This keeps reconciliation
-//! protocol logic out of the common admission worker.
+//! command layer and worker. Projectors use connection scope metadata, not
+//! event-body direction fields: locally proposed sync events go to the
+//! transit out queue by id, while received sync events go to sync-owned in
+//! rows. Commands decide what follow-up ids to propose from explicit read
+//! context. The worker owns queue draining and the process-local sync index.
+//!
+//! This module owns sync event syntax, projection, and command logic.
+//! `crate::workers::sync` owns scheduling, queue consumption, and worker state.
 
 pub mod cli;
+pub mod commands;
 pub mod compare;
 pub mod have_id;
 pub mod need_id;
-pub mod schema;
-pub mod worker;
+pub use crate::workers::sync as worker;
+pub use crate::workers::sync::SyncIndex;
 
 use crate::protocol::event_modules::connection;
 use crate::protocol::event_modules::types::EventRecord;
