@@ -20,6 +20,7 @@ pub const ED25519_PUBLIC_KEY_BYTES: usize = 32;
 pub const ED25519_SIGNATURE_BYTES: usize = 64;
 pub const X25519_PRIVATE_KEY_BYTES: usize = 32;
 pub const X25519_PUBLIC_KEY_BYTES: usize = 32;
+pub const XCHACHA20_POLY1305_KEY_BYTES: usize = 32;
 pub const XCHACHA20_POLY1305_NONCE_BYTES: usize = 24;
 
 pub type Hash = [u8; HASH_BYTES];
@@ -28,6 +29,7 @@ pub type Ed25519PublicKey = [u8; ED25519_PUBLIC_KEY_BYTES];
 pub type Ed25519Signature = [u8; ED25519_SIGNATURE_BYTES];
 pub type X25519PrivateKey = [u8; X25519_PRIVATE_KEY_BYTES];
 pub type X25519PublicKey = [u8; X25519_PUBLIC_KEY_BYTES];
+pub type XChaCha20Poly1305Key = [u8; XCHACHA20_POLY1305_KEY_BYTES];
 pub type XChaCha20Poly1305Nonce = [u8; XCHACHA20_POLY1305_NONCE_BYTES];
 
 pub fn hash(bytes: &[u8]) -> Hash {
@@ -76,6 +78,46 @@ pub fn random_xchacha20poly1305_nonce() -> XChaCha20Poly1305Nonce {
     let mut nonce = [0; XCHACHA20_POLY1305_NONCE_BYTES];
     OsRng.fill_bytes(&mut nonce);
     nonce
+}
+
+pub fn random_xchacha20poly1305_key() -> XChaCha20Poly1305Key {
+    random_bytes_32()
+}
+
+pub fn xchacha20poly1305_encrypt(
+    key: &XChaCha20Poly1305Key,
+    associated_data: &[u8],
+    nonce: &XChaCha20Poly1305Nonce,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, String> {
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    cipher
+        .encrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: plaintext,
+                aad: associated_data,
+            },
+        )
+        .map_err(|_| "encrypt xchacha20poly1305 payload".to_string())
+}
+
+pub fn xchacha20poly1305_decrypt(
+    key: &XChaCha20Poly1305Key,
+    associated_data: &[u8],
+    nonce: &XChaCha20Poly1305Nonce,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, String> {
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    cipher
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: associated_data,
+            },
+        )
+        .map_err(|_| "decrypt xchacha20poly1305 payload".to_string())
 }
 
 pub fn x25519_xchacha20poly1305_encrypt(
@@ -230,6 +272,37 @@ mod tests {
             ed25519_sign(&private_key, bytes),
             ed25519_sign(&private_key, bytes)
         );
+    }
+
+    #[test]
+    fn xchacha20poly1305_roundtrips_and_rejects_tamper() {
+        let key = random_xchacha20poly1305_key();
+        let nonce = random_xchacha20poly1305_nonce();
+        let aad = b"topo test symmetric aad";
+        let plaintext = b"phase-one local epoch secret bytes";
+
+        let ciphertext = xchacha20poly1305_encrypt(&key, aad, &nonce, plaintext).expect("encrypt");
+
+        assert_eq!(
+            xchacha20poly1305_decrypt(&key, aad, &nonce, &ciphertext).expect("decrypt"),
+            plaintext
+        );
+        assert!(xchacha20poly1305_decrypt(
+            &random_xchacha20poly1305_key(),
+            aad,
+            &nonce,
+            &ciphertext
+        )
+        .is_err());
+        assert!(xchacha20poly1305_decrypt(&key, b"wrong aad", &nonce, &ciphertext).is_err());
+
+        let mut tampered_nonce = nonce;
+        tampered_nonce[0] ^= 1;
+        assert!(xchacha20poly1305_decrypt(&key, aad, &tampered_nonce, &ciphertext).is_err());
+
+        let mut tampered_ciphertext = ciphertext;
+        tampered_ciphertext[0] ^= 1;
+        assert!(xchacha20poly1305_decrypt(&key, aad, &nonce, &tampered_ciphertext).is_err());
     }
 
     #[test]
