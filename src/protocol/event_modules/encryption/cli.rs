@@ -13,14 +13,17 @@ use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker as common_worker;
 
 use super::{
-    key_wrap, local_key_secret, local_recipient_key, recipient_key, removal_frontier, worker,
+    key_wrap, local_history_node_secret, local_key_secret, local_recipient_key, recipient_key,
+    recipient_key_tombstone, removal_frontier, worker,
 };
 
 const KEY_RECIPIENT_USAGE: &str = "key-recipient WORKSPACE_ID_HEX";
+const KEY_ROTATE_RECIPIENT_USAGE: &str = "key-rotate-recipient WORKSPACE_ID_HEX";
 const KEY_FRONTIER_USAGE: &str = "key-frontier WORKSPACE_ID_HEX";
 const KEY_WRAP_USAGE: &str =
     "key-wrap WORKSPACE_ID_HEX REMOVAL_FRONTIER_ID_HEX RECIPIENT_KEY_ID_HEX";
 const KEY_DERIVE_USAGE: &str = "key-derive [LIMIT]";
+const KEY_NODE_USAGE: &str = "key-node WORKSPACE_ID_HEX REMOVAL_FRONTIER_ID_HEX SOURCE_SECRET_ID_HEX RANGE_START RANGE_WIDTH [TOMBSTONE_NODE_ID_HEX]";
 const KEY_ACCESS_USAGE: &str = "key-access WORKSPACE_ID_HEX REMOVAL_FRONTIER_ID_HEX";
 const KEYS_USAGE: &str = "keys WORKSPACE_ID_HEX";
 
@@ -31,6 +34,12 @@ pub fn commands() -> Vec<CliCommand<Context>> {
             usage: KEY_RECIPIENT_USAGE,
             help: "Create and publish a recipient key for this endpoint membership.",
             run: run_key_recipient_command,
+        },
+        CliCommand {
+            name: "key-rotate-recipient",
+            usage: KEY_ROTATE_RECIPIENT_USAGE,
+            help: "Create a replacement recipient key and tombstone this endpoint's old keys.",
+            run: run_key_rotate_recipient_command,
         },
         CliCommand {
             name: "key-frontier",
@@ -49,6 +58,12 @@ pub fn commands() -> Vec<CliCommand<Context>> {
             usage: KEY_DERIVE_USAGE,
             help: "Derive local key secrets from received key wraps.",
             run: run_key_derive_command,
+        },
+        CliCommand {
+            name: "key-node",
+            usage: KEY_NODE_USAGE,
+            help: "Derive a local history range-node key from an applied key event.",
+            run: run_key_node_command,
         },
         CliCommand {
             name: "key-access",
@@ -120,6 +135,45 @@ fn run_key_recipient_command(
             "recipient_key: {}",
             hex_id(recipient_report.value.recipient_key)
         ),
+    ]))
+}
+
+fn run_key_rotate_recipient_command(
+    context: &mut Context,
+    args: CliArgs<'_>,
+) -> Result<CliOutput, String> {
+    args.require_len(1, KEY_ROTATE_RECIPIENT_USAGE)?;
+    let workspace_id = parse_hex_id(
+        args.get(0).expect("length checked"),
+        KEY_ROTATE_RECIPIENT_USAGE,
+    )?;
+    let output = worker::run(
+        &context.store,
+        &context.protocol,
+        worker::Work::RotateRecipientKey { workspace_id },
+    )?;
+    let worker::Output::RotatedRecipientKey(report) = output else {
+        return Err("unexpected key rotation worker output".to_string());
+    };
+
+    Ok(CliOutput::lines(vec![
+        format!(
+            "old_active_recipient_keys: {}",
+            report.old_active_recipient_keys
+        ),
+        format!(
+            "tombstoned_recipient_keys: {}",
+            report.tombstoned_recipient_keys
+        ),
+        format!(
+            "local_recipient_key_id: {}",
+            optional_hex_id(report.local_recipient_key_id)
+        ),
+        format!(
+            "recipient_key_id: {}",
+            optional_hex_id(report.recipient_key_id)
+        ),
+        format!("admitted_events: {}", report.admitted_events),
     ]))
 }
 
@@ -243,16 +297,61 @@ fn run_key_derive_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cl
             .map_err(|_| KEY_DERIVE_USAGE.to_string())?,
         None => common_worker::DEFAULT_READY_BATCH,
     };
-    let worker::Output::DerivedKeySecrets(report) = worker::run(
+    let output = worker::run(
         &context.store,
         &context.protocol,
         worker::Work::DeriveKeySecrets { batch_size },
     )?;
+    let worker::Output::DerivedKeySecrets(report) = output else {
+        return Err("unexpected key derive worker output".to_string());
+    };
 
     Ok(CliOutput::lines(vec![
         format!("scanned_key_wraps: {}", report.scanned_key_wraps),
         format!("derived_key_secrets: {}", report.derived_key_secrets),
         format!("failed_key_wraps: {}", report.failed_key_wraps),
+        format!("admitted_events: {}", report.admitted_events),
+    ]))
+}
+
+fn run_key_node_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutput, String> {
+    if args.values().len() != 5 && args.values().len() != 6 {
+        return Err(KEY_NODE_USAGE.to_string());
+    }
+    let workspace_id = parse_hex_id(args.get(0).expect("length checked"), KEY_NODE_USAGE)?;
+    let removal_frontier_id = parse_hex_id(args.get(1).expect("length checked"), KEY_NODE_USAGE)?;
+    let source_secret_id = parse_hex_id(args.get(2).expect("length checked"), KEY_NODE_USAGE)?;
+    let range_start = parse_u64(args.get(3).expect("length checked"), KEY_NODE_USAGE)?;
+    let range_width = parse_u64(args.get(4).expect("length checked"), KEY_NODE_USAGE)?;
+    let tombstone_node_id = args
+        .get(5)
+        .map(|value| parse_hex_id(value, KEY_NODE_USAGE))
+        .transpose()?;
+    let output = worker::run(
+        &context.store,
+        &context.protocol,
+        worker::Work::DeriveHistoryNode {
+            workspace_id,
+            removal_frontier_id,
+            source_secret_id,
+            range_start,
+            range_width,
+            tombstone_node_id,
+        },
+    )?;
+    let worker::Output::DerivedHistoryNode(report) = output else {
+        return Err("unexpected key node worker output".to_string());
+    };
+
+    Ok(CliOutput::lines(vec![
+        format!(
+            "local_history_node_secret_id: {}",
+            optional_hex_id(report.local_history_node_secret_id)
+        ),
+        format!(
+            "tombstoned_node_id: {}",
+            optional_hex_id(report.tombstoned_node_id)
+        ),
         format!("admitted_events: {}", report.admitted_events),
     ]))
 }
@@ -282,16 +381,33 @@ fn run_keys_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
     let frontiers = removal_frontier::schema::list_for_workspace(&context.store, workspace_id)?;
     let local_secrets = local_key_secret::schema::list_for_workspace(&context.store, workspace_id)?;
     let recipient_keys = recipient_key::schema::list_for_workspace(&context.store, workspace_id)?;
+    let recipient_key_tombstones =
+        recipient_key_tombstone::schema::list_for_workspace(&context.store, workspace_id)?;
     let local_recipient_keys =
         local_recipient_key::schema::list_for_workspace(&context.store, workspace_id)?;
     let key_wraps = key_wrap::schema::list_for_workspace(&context.store, workspace_id)?;
+    let history_nodes =
+        local_history_node_secret::schema::list_for_workspace(&context.store, workspace_id)?;
+    let history_tombstones = local_history_node_secret::schema::list_tombstones_for_workspace(
+        &context.store,
+        workspace_id,
+    )?;
 
     let mut lines = vec![
         format!("recipient_keys: {}", recipient_keys.len()),
+        format!(
+            "recipient_key_tombstones: {}",
+            recipient_key_tombstones.len()
+        ),
         format!("local_recipient_keys: {}", local_recipient_keys.len()),
         format!("removal_frontiers: {}", frontiers.len()),
         format!("key_wraps: {}", key_wraps.len()),
         format!("local_key_secrets: {}", local_secrets.len()),
+        format!("local_history_node_secrets: {}", history_nodes.len()),
+        format!(
+            "local_history_node_tombstones: {}",
+            history_tombstones.len()
+        ),
     ];
     for frontier in frontiers {
         let access = local_key_secret::schema::get(
@@ -304,6 +420,16 @@ fn run_keys_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
             "frontier: {} access={}",
             hex_id(frontier.removal_frontier_id),
             if access { "yes" } else { "no" }
+        ));
+    }
+    for node in history_nodes {
+        lines.push(format!(
+            "history_node: {} frontier={} start={} width={} tombstones={}",
+            hex_id(node.local_history_node_secret_id),
+            hex_id(node.removal_frontier_id),
+            node.range_start,
+            node.range_width,
+            optional_hex_id(node.tombstone_node_id)
         ));
     }
     Ok(CliOutput::lines(lines))
@@ -384,6 +510,10 @@ fn hex_value(byte: u8, usage: &str) -> Result<u8, String> {
     }
 }
 
+fn parse_u64(value: &str, usage: &str) -> Result<u64, String> {
+    value.parse::<u64>().map_err(|_| usage.to_string())
+}
+
 fn hex_id(id: EventId) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(64);
@@ -392,4 +522,8 @@ fn hex_id(id: EventId) -> String {
         out.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+fn optional_hex_id(id: Option<EventId>) -> String {
+    id.map(hex_id).unwrap_or_else(|| "none".to_string())
 }

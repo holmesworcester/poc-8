@@ -140,6 +140,106 @@ fn cli_key_wrap_derives_access_only_for_wrapped_recipient() {
     );
 }
 
+#[test]
+fn cli_rotates_recipient_keys_and_tombstones_history_path_nodes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = temp_db(&tmp, "alice.db");
+    let workspace_id = create_workspace(&alice, "Fs Keys", "alice", "alice-laptop");
+
+    let first_recipient = assert_success(topo(&["--db", &alice, "key-recipient", &workspace_id]));
+    let first_recipient_id = line_value(&first_recipient, "recipient_key_id");
+    let rotated = assert_success(topo(&[
+        "--db",
+        &alice,
+        "key-rotate-recipient",
+        &workspace_id,
+    ]));
+    assert_eq!(line_value(&rotated, "old_active_recipient_keys"), "1");
+    assert_eq!(line_value(&rotated, "tombstoned_recipient_keys"), "1");
+
+    let keys = assert_success(topo(&["--db", &alice, "keys", &workspace_id]));
+    assert_eq!(line_value(&keys, "recipient_keys"), "1");
+    assert_eq!(line_value(&keys, "recipient_key_tombstones"), "1");
+    assert_eq!(line_value(&keys, "local_recipient_keys"), "2");
+
+    let frontier = assert_success(topo(&["--db", &alice, "key-frontier", &workspace_id]));
+    let removal_frontier_id = line_value(&frontier, "removal_frontier_id");
+    let local_key_secret_id = line_value(&frontier, "local_key_secret_id");
+    let old_wrap = topo(&[
+        "--db",
+        &alice,
+        "key-wrap",
+        &workspace_id,
+        &removal_frontier_id,
+        &first_recipient_id,
+    ]);
+    assert!(
+        !old_wrap.status.success(),
+        "old recipient key should have been purged\nstdout={}\nstderr={}",
+        stdout(&old_wrap),
+        stderr(&old_wrap)
+    );
+    assert!(
+        stderr(&old_wrap).contains("recipient key is missing"),
+        "{}",
+        stderr(&old_wrap)
+    );
+
+    let root_node = assert_success(topo(&[
+        "--db",
+        &alice,
+        "key-node",
+        &workspace_id,
+        &removal_frontier_id,
+        &local_key_secret_id,
+        "0",
+        "8",
+    ]));
+    let root_node_id = line_value(&root_node, "local_history_node_secret_id");
+    let keys = assert_success(topo(&["--db", &alice, "keys", &workspace_id]));
+    assert_eq!(line_value(&keys, "local_history_node_secrets"), "1");
+    assert_eq!(line_value(&keys, "local_history_node_tombstones"), "0");
+
+    let sibling = assert_success(topo(&[
+        "--db",
+        &alice,
+        "key-node",
+        &workspace_id,
+        &removal_frontier_id,
+        &root_node_id,
+        "4",
+        "4",
+        &root_node_id,
+    ]));
+    assert_eq!(line_value(&sibling, "tombstoned_node_id"), root_node_id);
+    let keys = assert_success(topo(&["--db", &alice, "keys", &workspace_id]));
+    assert_eq!(line_value(&keys, "local_history_node_secrets"), "1");
+    assert_eq!(line_value(&keys, "local_history_node_tombstones"), "1");
+    assert!(keys.contains("start=4 width=4"), "{keys}");
+
+    let from_retired_root = topo(&[
+        "--db",
+        &alice,
+        "key-node",
+        &workspace_id,
+        &removal_frontier_id,
+        &root_node_id,
+        "0",
+        "4",
+    ]);
+    assert!(
+        !from_retired_root.status.success(),
+        "retired path node should not derive children\nstdout={}\nstderr={}",
+        stdout(&from_retired_root),
+        stderr(&from_retired_root)
+    );
+    assert!(
+        stderr(&from_retired_root).contains("history node source has been tombstoned"),
+        "{}",
+        stderr(&from_retired_root)
+    );
+}
+
 fn create_workspace(db: &str, name: &str, username: &str, device_name: &str) -> String {
     let out = assert_success(topo(&[
         "--db",

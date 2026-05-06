@@ -84,6 +84,18 @@ pub fn random_xchacha20poly1305_key() -> XChaCha20Poly1305Key {
     random_bytes_32()
 }
 
+pub fn hkdf_sha256_key(
+    input_key_material: &[u8],
+    purpose: &[u8],
+    associated_data: &[u8],
+) -> Result<XChaCha20Poly1305Key, String> {
+    let hkdf = Hkdf::<Sha256>::new(Some(purpose), input_key_material);
+    let mut key = [0; XCHACHA20_POLY1305_KEY_BYTES];
+    hkdf.expand(associated_data, &mut key)
+        .map_err(|_| "derive hkdf sha256 key".to_string())?;
+    Ok(key)
+}
+
 pub fn xchacha20poly1305_encrypt(
     key: &XChaCha20Poly1305Key,
     associated_data: &[u8],
@@ -303,6 +315,23 @@ mod tests {
         let mut tampered_ciphertext = ciphertext;
         tampered_ciphertext[0] ^= 1;
         assert!(xchacha20poly1305_decrypt(&key, aad, &nonce, &tampered_ciphertext).is_err());
+    }
+
+    #[test]
+    fn hkdf_sha256_key_is_deterministic_and_context_bound() {
+        let input = [7; 32];
+        let purpose = b"test-purpose";
+        let associated_data = b"test-associated-data";
+
+        let left = hkdf_sha256_key(&input, purpose, associated_data).expect("derive");
+        let right = hkdf_sha256_key(&input, purpose, associated_data).expect("derive");
+        let wrong_purpose =
+            hkdf_sha256_key(&input, b"other-purpose", associated_data).expect("derive");
+        let wrong_data = hkdf_sha256_key(&input, purpose, b"other-data").expect("derive");
+
+        assert_eq!(left, right);
+        assert_ne!(left, wrong_purpose);
+        assert_ne!(left, wrong_data);
     }
 
     #[test]

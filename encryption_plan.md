@@ -60,9 +60,11 @@ src/protocol/event_modules/encryption/
   cli.rs
   worker.rs
   recipient_key/
+  recipient_key_tombstone/
   local_recipient_key/
   removal_frontier/
   local_key_secret/
+  local_history_node_secret/
   key_wrap/
   key_wrap_receipt/
   encrypted_message/          # or encrypted content leaf; exact shape TBD
@@ -88,6 +90,10 @@ Initial phase-one terms:
   wraps and later content events.
 - `key_wrap`: a shared event carrying sealed key-secret bytes for one
   `recipient_key` and one `removal_frontier_id`.
+- `recipient_key_tombstone`: a shared endpoint-signed supersession fact. It
+  names an old `recipient_key`, a replacement `recipient_key`, and projects a
+  durable tombstone while purging the old public-key row from the active read
+  model.
 - `key_wrap_receipt`: a shared signed acknowledgement that an endpoint decrypted
   a key wrap. The receipt does not expose or depend on local secret material.
 - `encrypted_message`: a shared encrypted content event whose projection depends
@@ -95,13 +101,18 @@ Initial phase-one terms:
 
 Later phase-two terms:
 
-- `history_node_secret`
+- `local_history_node_secret`: local-only secret material for a canonical
+  history range node under one `removal_frontier_id`. The node is named by
+  `(workspace_id, removal_frontier_id, range_start, range_width)`, where
+  `range_width` is a power of two and `range_start` is width-aligned.
 - `history_delete`
 - `invite_history_grant`
 - retained cover / purge cover / puncturing
 
-Phase two stays out of scope until phase-one replay, restart, and black-box
-availability tests are stable.
+Phase two is now being introduced in narrow slices. The current slice makes
+history range-node keys and recipient-key supersession ordinary events, but it
+does not yet implement encrypted filesystem content, retained-cover
+calculation, deletion facts, invite history grants, or retained-node key wraps.
 
 ## Dependency Model
 
@@ -159,6 +170,37 @@ encryption worker sees:
 The worker is a derivation runner, not a projector and not a dependency
 resolver. It should be restart-safe: if memory queues vanish, projected rows and
 local-only secret events are enough to derive the same remaining obligations.
+
+For history-tree secrets:
+
+```text
+local_key_secret or local_history_node_secret source
+  -> encryption worker derives local_history_node_secret with HKDF-SHA256
+  -> common worker admits local event
+  -> projector writes the node row
+  -> if the event names tombstone_node_id, projector writes a durable tombstone
+     row and exact-deletes the retired path-node row
+```
+
+The tombstone is intentionally an event-shaped dependency, not a storage-side
+shortcut. A sibling node that retires a path node depends on that path-node event,
+so the common worker applies the sibling only after the path node is valid. Once
+the sibling is projected, the retired node row is purged and workers can no
+longer derive children from it.
+
+For recipient-key rotation:
+
+```text
+encryption worker creates new local_recipient_key
+  -> publishes new recipient_key signed by the endpoint membership
+  -> emits recipient_key_tombstone events for old active local recipient keys
+  -> tombstone projection removes old recipient_key rows from the active model
+```
+
+The current active-key boundary is the projected read model used by CLI and
+workers. A future retained-node wrap projector may need an explicit recipient
+key status dependency if we decide that shared wrap events themselves must be
+invalid after supersession rather than merely ignored by honest workers.
 
 ## Crypto Direction
 
@@ -229,6 +271,26 @@ Rules retained from the old plan:
   policy.
 - Removed recipients are excluded from future frontiers and future retained-node
   wraps.
+
+Current phase-two slice:
+
+- Real HKDF-SHA256 derivation in `core::crypto` for local range-node secrets.
+- `recipient_key_tombstone` shared events purge old recipient public keys from
+  the active key table.
+- `local_history_node_secret` local events name canonical range nodes and can
+  tombstone an older local path node by exact row delete.
+- Black-box CLI coverage proves key rotation purges old recipient keys and a
+  sibling history node tombstones a retired path node.
+
+Still pending:
+
+- Functional retained-cover and purge-cover calculation from delete/expiry sets.
+- Shared delete facts and deterministic deletion summaries.
+- Wrap obligations for retained history nodes.
+- Invite-time history grants for newly authorized endpoints.
+- Encrypted filesystem content events that depend on local history node secrets.
+- Property tests comparing incremental retained-cover projection with a pure
+  functional reference implementation.
 
 ## Implementation Order
 

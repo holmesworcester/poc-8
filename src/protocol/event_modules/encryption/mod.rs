@@ -6,9 +6,11 @@
 
 pub mod cli;
 pub mod key_wrap;
+pub mod local_history_node_secret;
 pub mod local_key_secret;
 pub mod local_recipient_key;
 pub mod recipient_key;
+pub mod recipient_key_tombstone;
 pub mod removal_frontier;
 pub mod worker;
 
@@ -24,8 +26,14 @@ pub fn project_record(event: &EventWithContext<'_>) -> Result<Option<ProjectionO
         Some(local_key_secret::codec::TYPE_LOCAL_KEY_SECRET) => {
             Ok(Some(local_key_secret::projector::project(event)?))
         }
+        Some(local_history_node_secret::codec::TYPE_LOCAL_HISTORY_NODE_SECRET) => {
+            Ok(Some(local_history_node_secret::projector::project(event)?))
+        }
         Some(recipient_key::codec::TYPE_SIGNED_RECIPIENT_KEY) => {
             Ok(Some(recipient_key::projector::project(event)?))
+        }
+        Some(recipient_key_tombstone::codec::TYPE_SIGNED_RECIPIENT_KEY_TOMBSTONE) => {
+            Ok(Some(recipient_key_tombstone::projector::project(event)?))
         }
         Some(removal_frontier::codec::TYPE_SIGNED_REMOVAL_FRONTIER) => {
             Ok(Some(removal_frontier::projector::project(event)?))
@@ -48,8 +56,14 @@ pub fn record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
         local_key_secret::codec::TYPE_LOCAL_KEY_SECRET => {
             local_key_secret::codec::record_from_bytes(bytes)
         }
+        local_history_node_secret::codec::TYPE_LOCAL_HISTORY_NODE_SECRET => {
+            local_history_node_secret::codec::record_from_bytes(bytes)
+        }
         recipient_key::codec::TYPE_SIGNED_RECIPIENT_KEY => {
             recipient_key::codec::signed_record_from_bytes(bytes)
+        }
+        recipient_key_tombstone::codec::TYPE_SIGNED_RECIPIENT_KEY_TOMBSTONE => {
+            recipient_key_tombstone::codec::signed_record_from_bytes(bytes)
         }
         removal_frontier::codec::TYPE_SIGNED_REMOVAL_FRONTIER => {
             removal_frontier::codec::signed_record_from_bytes(bytes)
