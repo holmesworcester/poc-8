@@ -26,10 +26,19 @@ pub const FILE_SLICE_CIPHERTEXT_BYTES: usize =
     FILE_SLICE_DATA_BYTES + XCHACHA20_POLY1305_TAG_BYTES;
 
 /// BAO encoding overhead budget. The slice proof = ciphertext + tree nodes
-/// embedded at the front of the BAO encoding. Real BAO proofs for this
-/// chunk size land well under this budget; the slot is fixed so canonical
+/// embedded at the front of the BAO encoding. The slot is fixed so canonical
 /// bytes stay deterministic.
-pub const FILE_SLICE_PROOF_BYTES: usize = FILE_SLICE_CIPHERTEXT_BYTES + 17 * 1024;
+///
+/// poc-8 computes BAO over the ciphertext stream and slices it on
+/// `FILE_SLICE_DATA_BYTES + AEAD tag` boundaries. The tag offset breaks
+/// alignment with BAO's 1 KiB chunk boundaries, which in turn forces every
+/// non-tail slice's proof to span an extra chunk. Empirically the worst-case
+/// proof size for a 256 KiB+tag slice in a 10 GiB file is ~281 KiB, so the
+/// slop has to comfortably exceed `FILE_SLICE_DATA_BYTES + tag` plus the
+/// extra-chunk overhead. 25 KiB clears every measured proof for files up to
+/// `MAX_FILE_BYTES` with margin to spare. Reducing the budget below this
+/// fails any multi-slice send with `"file slice proof exceeds slot capacity"`.
+pub const FILE_SLICE_PROOF_BYTES: usize = FILE_SLICE_CIPHERTEXT_BYTES + 25 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSliceEvent {
