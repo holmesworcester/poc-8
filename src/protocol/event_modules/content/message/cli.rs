@@ -8,6 +8,7 @@
 use crate::core::cli::{CliArgs, CliCommand, CliOutput};
 use crate::core::store::Store;
 use crate::protocol::cli::Context;
+use crate::protocol::clock;
 use crate::protocol::event_modules::content::message_deletion::types::deletion_label_author;
 use crate::protocol::event_modules::identity::{endpoint, endpoint_shared, user};
 use crate::protocol::event_modules::schema as event_schema;
@@ -263,7 +264,7 @@ pub(crate) fn next_timestamp(store: &Store, workspace_id: EventId) -> Result<u64
     let from_messages = max_timestamp_for_messages(store, workspace_id)?;
     let from_content =
         super::super::content_event::schema::max_timestamp_for_workspace(store, workspace_id)?;
-    Ok(from_messages.max(from_content).saturating_add(1))
+    clock::next_timestamp(store, from_messages.max(from_content))
 }
 
 fn max_timestamp_for_messages(store: &Store, workspace_id: EventId) -> Result<u64, String> {

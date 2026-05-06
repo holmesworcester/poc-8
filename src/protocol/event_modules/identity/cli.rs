@@ -13,6 +13,7 @@ use crate::core::cli::{CliArgs, CliCommand, CliOutput};
 use crate::core::crypto;
 use crate::core::store::Store;
 use crate::protocol::cli::Context;
+use crate::protocol::clock;
 use crate::protocol::event_modules::connection::{
     types as connection_types, worker as connection_worker,
 };
@@ -956,9 +957,9 @@ fn admin_for_user(
 }
 
 fn next_timestamp(store: &Store) -> Result<u64, String> {
-    event_schema::max_timestamp(store)
-        .map_err(|err| format!("load max timestamp: {err}"))
-        .map(|timestamp| timestamp.saturating_add(1))
+    let max_timestamp =
+        event_schema::max_timestamp(store).map_err(|err| format!("load max timestamp: {err}"))?;
+    clock::next_timestamp(store, max_timestamp)
 }
 
 fn admit<T>(context: &mut Context, output: CommandOutput<T>) -> Result<T, String> {

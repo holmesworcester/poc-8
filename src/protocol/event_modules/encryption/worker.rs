@@ -7,6 +7,7 @@
 
 use crate::core::crypto;
 use crate::core::store::Store;
+use crate::protocol::clock;
 use crate::protocol::event_modules::identity::{endpoint, endpoint_shared};
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::types::EventId;
@@ -409,9 +410,9 @@ fn source_secret_material(
 }
 
 fn next_timestamp(store: &Store) -> Result<u64, String> {
-    event_schema::max_timestamp(store)
-        .map_err(|err| format!("load max timestamp: {err}"))
-        .map(|timestamp| timestamp.saturating_add(1))
+    let max_timestamp =
+        event_schema::max_timestamp(store).map_err(|err| format!("load max timestamp: {err}"))?;
+    clock::next_timestamp(store, max_timestamp)
 }
 
 fn key_wrap_event_from_row(row: &key_wrap::types::KeyWrapRow) -> key_wrap::types::KeyWrapEvent {

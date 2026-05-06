@@ -148,6 +148,7 @@ fn cli_rotates_recipient_keys_and_tombstones_history_path_nodes() {
 
     let first_recipient = assert_success(topo(&["--db", &alice, "key-recipient", &workspace_id]));
     let first_recipient_id = line_value(&first_recipient, "recipient_key_id");
+    assert_success(topo(&["--db", &alice, "clock", "set", "70000"]));
     let rotated = assert_success(topo(&[
         "--db",
         &alice,
@@ -156,13 +157,20 @@ fn cli_rotates_recipient_keys_and_tombstones_history_path_nodes() {
     ]));
     assert_eq!(line_value(&rotated, "old_active_recipient_keys"), "1");
     assert_eq!(line_value(&rotated, "tombstoned_recipient_keys"), "1");
+    let clock = assert_success(topo(&["--db", &alice, "clock"]));
+    assert_eq!(line_value(&clock, "logical_time"), "70000");
+    assert_eq!(line_value(&clock, "max_event_timestamp"), "70001");
 
     let keys = assert_success(topo(&["--db", &alice, "keys", &workspace_id]));
     assert_eq!(line_value(&keys, "recipient_keys"), "1");
     assert_eq!(line_value(&keys, "recipient_key_tombstones"), "1");
     assert_eq!(line_value(&keys, "local_recipient_keys"), "2");
 
+    let advanced = assert_success(topo(&["--db", &alice, "clock", "advance", "1000"]));
+    assert_eq!(line_value(&advanced, "next_timestamp"), "71000");
     let frontier = assert_success(topo(&["--db", &alice, "key-frontier", &workspace_id]));
+    let clock = assert_success(topo(&["--db", &alice, "clock"]));
+    assert_eq!(line_value(&clock, "max_event_timestamp"), "71000");
     let removal_frontier_id = line_value(&frontier, "removal_frontier_id");
     let local_key_secret_id = line_value(&frontier, "local_key_secret_id");
     let old_wrap = topo(&[

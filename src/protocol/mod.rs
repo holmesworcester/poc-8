@@ -11,6 +11,7 @@
 //! add its schema beside the rows that encode it, then aggregate it here.
 
 pub mod cli;
+pub mod clock;
 pub mod event_modules;
 pub mod wire;
 
@@ -54,6 +55,7 @@ pub fn schemas() -> Vec<Schema> {
     // the core TCP queues. The queue tables remain core-owned; event module
     // schemas remain protocol-owned.
     let mut schemas = event_modules::schemas();
+    schemas.extend_from_slice(clock::SCHEMAS);
     schemas.extend_from_slice(network_queues::SCHEMAS);
     schemas
 }

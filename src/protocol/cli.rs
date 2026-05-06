@@ -15,8 +15,9 @@ use std::path::Path;
 use crate::core::cli::{CliArgs, CliCommand, CliOutput};
 use crate::core::store::Store;
 use crate::protocol::event_modules::schema as event_schema;
-use crate::protocol::{event_modules, Protocol};
+use crate::protocol::{clock, event_modules, Protocol};
 
+const CLOCK_USAGE: &str = "clock [set TIMESTAMP|advance DELTA|clear]";
 const COUNT_USAGE: &str = "count";
 const STATUS_USAGE: &str = "status";
 
@@ -51,6 +52,7 @@ pub fn commands() -> Vec<CliCommand<Context>> {
     out.extend(event_modules::sync::cli::commands());
     out.extend(event_modules::test_events::event_with_deps::cli::commands());
     out.extend([
+        clock_command(),
         count_command("count", COUNT_USAGE),
         count_command("status", STATUS_USAGE),
     ]);
@@ -120,4 +122,51 @@ fn run_count_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutp
         }
         .lines(),
     ))
+}
+
+fn clock_command() -> CliCommand<Context> {
+    CliCommand {
+        name: "clock",
+        usage: CLOCK_USAGE,
+        help: "Show or adjust this store's logical timestamp lower bound.",
+        run: run_clock_command,
+    }
+}
+
+fn run_clock_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutput, String> {
+    match args.values() {
+        [] => {}
+        [op, timestamp] if op == "set" => {
+            clock::set_logical_time(&context.store, parse_u64(timestamp)?)?;
+        }
+        [op, delta] if op == "advance" => {
+            clock::advance_logical_time(&context.store, parse_u64(delta)?)?;
+        }
+        [op] if op == "clear" => {
+            clock::clear_logical_time(&context.store)?;
+        }
+        _ => return Err(CLOCK_USAGE.to_string()),
+    }
+    clock_output(&context.store)
+}
+
+fn clock_output(store: &Store) -> Result<CliOutput, String> {
+    let logical_time = clock::logical_time(store)?;
+    let max_event_timestamp =
+        event_schema::max_timestamp(store).map_err(|err| format!("load max timestamp: {err}"))?;
+    let next_timestamp = clock::next_timestamp(store, max_event_timestamp)?;
+    Ok(CliOutput::lines(vec![
+        format!(
+            "logical_time: {}",
+            logical_time
+                .map(|timestamp| timestamp.to_string())
+                .unwrap_or_else(|| "unset".to_string())
+        ),
+        format!("max_event_timestamp: {max_event_timestamp}"),
+        format!("next_timestamp: {next_timestamp}"),
+    ]))
+}
+
+fn parse_u64(value: &str) -> Result<u64, String> {
+    value.parse::<u64>().map_err(|_| CLOCK_USAGE.to_string())
 }
