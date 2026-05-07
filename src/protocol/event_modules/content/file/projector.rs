@@ -134,7 +134,7 @@ mod tests {
             created_at_ms: 1,
             author_user_id,
             removal_frontier_id: [30; 32],
-            local_key_secret_id: [31; 32],
+            local_history_node_secret_id: [31; 32],
             nonce: [32; crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES],
             ciphertext: [33; message::types::MESSAGE_CIPHERTEXT_BYTES],
         });

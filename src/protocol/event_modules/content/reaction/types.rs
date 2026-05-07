@@ -20,7 +20,7 @@ pub struct ReactionEvent {
     pub target_message_id: EventId,
     pub author_user_id: EventId,
     pub removal_frontier_id: EventId,
-    pub local_key_secret_id: EventId,
+    pub local_history_node_secret_id: EventId,
     pub nonce: XChaCha20Poly1305Nonce,
     pub ciphertext: ReactionCiphertext,
 }
@@ -32,7 +32,7 @@ pub struct ReactionPlaintext {
     pub target_message_id: EventId,
     pub author_user_id: EventId,
     pub removal_frontier_id: EventId,
-    pub local_key_secret_id: EventId,
+    pub local_history_node_secret_id: EventId,
     pub emoji: String,
 }
 

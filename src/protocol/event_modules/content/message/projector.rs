@@ -157,8 +157,8 @@ mod tests {
             signer_endpoint_shared_id,
             signer_private_key: *signer_private_key,
             removal_frontier_id: [30; 32],
-            local_key_secret_id: [31; 32],
-            key_secret: KEY_SECRET,
+            local_history_node_secret_id: [31; 32],
+            leaf_node_secret: KEY_SECRET,
             text: "hello".to_string(),
         })
         .expect("send");
@@ -355,7 +355,7 @@ mod tests {
             created_at_ms: 5,
             author_user_id: [2; 32],
             removal_frontier_id: [3; 32],
-            local_key_secret_id: [4; 32],
+            local_history_node_secret_id: [4; 32],
             nonce: [5; 24],
             ciphertext: [6; super::super::types::MESSAGE_CIPHERTEXT_BYTES],
         });

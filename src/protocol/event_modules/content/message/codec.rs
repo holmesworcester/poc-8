@@ -29,7 +29,7 @@ struct MessageMetadata {
     created_at_ms: u64,
     author_user_id: EventId,
     removal_frontier_id: EventId,
-    local_key_secret_id: EventId,
+    local_history_node_secret_id: EventId,
 }
 
 pub fn encode(event: &MessageEvent) -> Vec<u8> {
@@ -39,7 +39,7 @@ pub fn encode(event: &MessageEvent) -> Vec<u8> {
     out.u64(event.created_at_ms);
     out.id(&event.author_user_id);
     out.id(&event.removal_frontier_id);
-    out.id(&event.local_key_secret_id);
+    out.id(&event.local_history_node_secret_id);
     out.raw(&event.nonce);
     out.raw(&event.ciphertext);
     out.finish()
@@ -55,7 +55,7 @@ pub fn decode(bytes: &[u8]) -> Result<MessageEvent, String> {
     let created_at_ms = reader.u64()?;
     let author_user_id = reader.id()?;
     let removal_frontier_id = reader.id()?;
-    let local_key_secret_id = reader.id()?;
+    let local_history_node_secret_id = reader.id()?;
     let nonce = fixed_nonce(reader.bytes(XCHACHA20_POLY1305_NONCE_BYTES)?)?;
     let ciphertext = fixed_ciphertext(reader.bytes(MESSAGE_CIPHERTEXT_BYTES)?)?;
     reader.finish()?;
@@ -64,7 +64,7 @@ pub fn decode(bytes: &[u8]) -> Result<MessageEvent, String> {
         created_at_ms,
         author_user_id,
         removal_frontier_id,
-        local_key_secret_id,
+        local_history_node_secret_id,
         nonce,
         ciphertext,
     };
@@ -138,7 +138,7 @@ pub fn signed_record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
     push_unique(&mut dependencies, metadata.workspace_id);
     push_unique(&mut dependencies, metadata.author_user_id);
     push_unique(&mut dependencies, metadata.removal_frontier_id);
-    push_unique(&mut dependencies, metadata.local_key_secret_id);
+    push_unique(&mut dependencies, metadata.local_history_node_secret_id);
     Ok(EventRecord {
         timestamp: metadata.created_at_ms,
         body_len: MESSAGE_WIRE_SIZE - 1,
@@ -159,7 +159,7 @@ fn metadata(bytes: &[u8]) -> Result<MessageMetadata, String> {
     let created_at_ms = reader.u64()?;
     let author_user_id = reader.id()?;
     let removal_frontier_id = reader.id()?;
-    let local_key_secret_id = reader.id()?;
+    let local_history_node_secret_id = reader.id()?;
     let _nonce = reader.bytes(XCHACHA20_POLY1305_NONCE_BYTES)?;
     let _ciphertext = reader.bytes(MESSAGE_CIPHERTEXT_BYTES)?;
     reader.finish()?;
@@ -168,12 +168,15 @@ fn metadata(bytes: &[u8]) -> Result<MessageMetadata, String> {
         created_at_ms,
         author_user_id,
         removal_frontier_id,
-        local_key_secret_id,
+        local_history_node_secret_id,
     };
     validate_id("message workspace", &metadata.workspace_id)?;
     validate_id("message author_user_id", &metadata.author_user_id)?;
     validate_id("message removal_frontier_id", &metadata.removal_frontier_id)?;
-    validate_id("message local_key_secret_id", &metadata.local_key_secret_id)?;
+    validate_id(
+        "message local_history_node_secret_id",
+        &metadata.local_history_node_secret_id,
+    )?;
     Ok(metadata)
 }
 
@@ -184,7 +187,7 @@ pub fn associated_data(event: &MessageEvent, signer_endpoint_shared_id: EventId)
     out.u64(event.created_at_ms);
     out.id(&event.author_user_id);
     out.id(&event.removal_frontier_id);
-    out.id(&event.local_key_secret_id);
+    out.id(&event.local_history_node_secret_id);
     out.raw(&event.nonce);
     out.id(&signer_endpoint_shared_id);
     out.finish()
@@ -233,7 +236,10 @@ fn validate_event(event: &MessageEvent) -> Result<(), String> {
     validate_id("message workspace", &event.workspace_id)?;
     validate_id("message author_user_id", &event.author_user_id)?;
     validate_id("message removal_frontier_id", &event.removal_frontier_id)?;
-    validate_id("message local_key_secret_id", &event.local_key_secret_id)?;
+    validate_id(
+        "message local_history_node_secret_id",
+        &event.local_history_node_secret_id,
+    )?;
     Ok(())
 }
 
@@ -286,7 +292,7 @@ mod tests {
             created_at_ms: 1234,
             author_user_id: [2; 32],
             removal_frontier_id: [3; 32],
-            local_key_secret_id: [4; 32],
+            local_history_node_secret_id: [4; 32],
             nonce: [5; XCHACHA20_POLY1305_NONCE_BYTES],
             ciphertext: [6; MESSAGE_CIPHERTEXT_BYTES],
         }

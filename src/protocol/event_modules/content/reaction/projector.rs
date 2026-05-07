@@ -145,7 +145,7 @@ mod tests {
             created_at_ms: 1,
             author_user_id,
             removal_frontier_id: [30; 32],
-            local_key_secret_id: [31; 32],
+            local_history_node_secret_id: [31; 32],
             nonce: [32; crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES],
             ciphertext: [33; message::types::MESSAGE_CIPHERTEXT_BYTES],
         });
@@ -190,8 +190,8 @@ mod tests {
             signer_endpoint_shared_id: signer_id,
             signer_private_key,
             removal_frontier_id: frontier_id,
-            local_key_secret_id: key_secret_id,
-            key_secret: KEY_SECRET,
+            local_history_node_secret_id: key_secret_id,
+            leaf_node_secret: KEY_SECRET,
             emoji: "🔥".to_string(),
         })
         .expect("post reaction");
@@ -286,7 +286,7 @@ mod tests {
         assert_eq!(row.author_user_id, author_id);
         assert_eq!(row.signer_endpoint_shared_id, signer_id);
         assert_eq!(row.removal_frontier_id, built.frontier_id);
-        assert_eq!(row.local_key_secret_id, built.key_secret_id);
+        assert_eq!(row.local_history_node_secret_id, built.key_secret_id);
     }
 
     #[test]
@@ -334,7 +334,7 @@ mod tests {
             target_message_id: [10; 32],
             author_user_id: [11; 32],
             removal_frontier_id: [14; 32],
-            local_key_secret_id: [15; 32],
+            local_history_node_secret_id: [15; 32],
             nonce: [16; crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES],
             ciphertext: [17; super::super::types::REACTION_CIPHERTEXT_BYTES],
         };
@@ -357,7 +357,7 @@ mod tests {
             target_message_id: [2; 32],
             author_user_id: [3; 32],
             removal_frontier_id: [4; 32],
-            local_key_secret_id: [5; 32],
+            local_history_node_secret_id: [5; 32],
             nonce: [6; crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES],
             ciphertext: [7; super::super::types::REACTION_CIPHERTEXT_BYTES],
         });

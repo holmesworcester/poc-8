@@ -6,8 +6,12 @@
 //! protocol event store.
 //! Step: verify message deletion labels against encrypted message metadata,
 //! write tombstones, remove visible plaintext rows, and purge obsolete message
-//! or reaction event bytes.
-//! Outputs: `content.message_tombstones` rows and row/event deletes.
+//! or reaction event bytes. After the transactional purge, retire each deleted
+//! message's per-message HKDF leaf and intermediate path-node so the leaf
+//! key cannot be recovered from disk.
+//! Outputs: `content.message_tombstones` rows and row/event deletes; the leaf
+//! retirement step writes a sibling-tombstone history-node event and purges
+//! retired bytes.
 //! Consume: purged event rows leave the durable deletion label/tombstone facts
 //! behind so semantic deletion survives without keeping ciphertext bytes.
 //! Failure: one malformed event aborts that worker transaction and will be
@@ -19,7 +23,9 @@ use crate::core::store::Store;
 use crate::protocol::event_modules::content::{message, message_deletion, reaction};
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::types::EventId;
+use crate::workers::common::event_pipeline::EventRegistry;
 use crate::workers::common::retention;
+use crate::workers::encryption as encryption_worker;
 use crate::workers::DaemonWorkerContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,18 +33,23 @@ pub enum Work {
     Drain { limit: usize },
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PurgeReport {
     pub scanned_events: usize,
     pub tombstones_written: usize,
     pub message_rows_deleted: usize,
     pub reaction_rows_deleted: usize,
     pub event_bytes_purged: usize,
+    pub retired_message_leaves: usize,
 }
 
-pub fn run(store: &Store, work: Work) -> Result<PurgeReport, String> {
+pub fn run<R: EventRegistry>(
+    store: &Store,
+    registry: &R,
+    work: Work,
+) -> Result<PurgeReport, String> {
     match work {
-        Work::Drain { limit } => drain(store, limit),
+        Work::Drain { limit } => drain(store, registry, limit),
     }
 }
 
@@ -56,8 +67,11 @@ fn daemon_step<C>(ctx: &mut StepContext<'_, C>) -> Result<(), String>
 where
     C: DaemonWorkerContext,
 {
+    let app = &*ctx.app;
+    let store = app.store();
     let report = run(
-        ctx.app.store(),
+        store,
+        app,
         Work::Drain {
             limit: ctx.options.work_limit,
         },
@@ -65,19 +79,60 @@ where
     .map_err(|err| format!("purge content: {err}"))?;
     ctx.report
         .add("purged_content_events", report.event_bytes_purged);
+    ctx.report
+        .add("retired_message_leaves", report.retired_message_leaves);
     Ok(())
 }
 
-fn drain(store: &Store, limit: usize) -> Result<PurgeReport, String> {
-    store
-        .write_transaction(|store| drain_in_tx(store, limit).map_err(table_error))
-        .map_err(|err| format!("drain content purge: {err}"))
+#[derive(Debug, Clone, Copy)]
+struct RetireLeafJob {
+    workspace_id: EventId,
+    removal_frontier_id: EventId,
+    created_at_ms: u64,
 }
 
-fn drain_in_tx(store: &Store, limit: usize) -> Result<PurgeReport, String> {
+fn drain<R: EventRegistry>(
+    store: &Store,
+    registry: &R,
+    limit: usize,
+) -> Result<PurgeReport, String> {
+    let (mut report, retire_jobs) = store
+        .write_transaction(|store| drain_in_tx(store, limit).map_err(table_error))
+        .map_err(|err| format!("drain content purge: {err}"))?;
+    // Retire per-message leaf chains outside the purge transaction. Each
+    // retirement runs the encryption worker, which admits a sibling-tombstone
+    // history-node event through the common worker and purges retired bytes.
+    // Doing this after the purge transaction commits avoids nesting the
+    // event-admission transactions inside the purge's own write transaction.
+    for job in retire_jobs {
+        let output = encryption_worker::run(
+            store,
+            registry,
+            encryption_worker::Work::RetireDeletedMessageLeaf {
+                workspace_id: job.workspace_id,
+                removal_frontier_id: job.removal_frontier_id,
+                created_at_ms: job.created_at_ms,
+            },
+        )?;
+        let encryption_worker::Output::RetiredDeletedMessageLeaf(retired) = output else {
+            return Err("unexpected encryption worker output retiring deleted leaf".to_string());
+        };
+        report.event_bytes_purged += retired.purged_event_bytes;
+        if retired.leaf_id.is_some() || retired.intermediate_id.is_some() {
+            report.retired_message_leaves += 1;
+        }
+    }
+    Ok(report)
+}
+
+fn drain_in_tx(
+    store: &Store,
+    limit: usize,
+) -> Result<(PurgeReport, Vec<RetireLeafJob>), String> {
     let entries = event_schema::event_index_entries_in_timestamp_range(store, 0, u64::MAX)
         .map_err(|err| format!("load event index: {err}"))?;
     let mut report = PurgeReport::default();
+    let mut retire_jobs = Vec::new();
     for entry in entries.into_iter().take(limit) {
         let Some(bytes) = event_schema::event_bytes(store, &entry.event_id)
             .map_err(|err| format!("load event bytes: {err}"))?
@@ -87,7 +142,13 @@ fn drain_in_tx(store: &Store, limit: usize) -> Result<PurgeReport, String> {
         report.scanned_events += 1;
         match bytes.first().copied() {
             Some(message::codec::TYPE_SIGNED_MESSAGE) => {
-                purge_deleted_message(store, entry.event_id, &bytes, &mut report)?;
+                purge_deleted_message(
+                    store,
+                    entry.event_id,
+                    &bytes,
+                    &mut report,
+                    &mut retire_jobs,
+                )?;
             }
             Some(reaction::codec::TYPE_SIGNED_REACTION) => {
                 purge_reaction_for_deleted_message(store, entry.event_id, &bytes, &mut report)?;
@@ -95,7 +156,7 @@ fn drain_in_tx(store: &Store, limit: usize) -> Result<PurgeReport, String> {
             _ => {}
         }
     }
-    Ok(report)
+    Ok((report, retire_jobs))
 }
 
 fn purge_deleted_message(
@@ -103,12 +164,18 @@ fn purge_deleted_message(
     message_id: EventId,
     bytes: &[u8],
     report: &mut PurgeReport,
+    retire_jobs: &mut Vec<RetireLeafJob>,
 ) -> Result<(), String> {
     let envelope = message::codec::decode_signed(bytes)?;
     let event = message::codec::decode(&envelope.payload)?;
     if !has_author_deletion_label(store, &message_id, &event.author_user_id)? {
         return Ok(());
     }
+    retire_jobs.push(RetireLeafJob {
+        workspace_id: event.workspace_id,
+        removal_frontier_id: event.removal_frontier_id,
+        created_at_ms: event.created_at_ms,
+    });
 
     let inserted = store
         .insert_table_rows_in_tx(vec![message::schema::message_tombstone_row(
@@ -187,7 +254,6 @@ fn table_error(err: String) -> rusqlite::Error {
 mod tests {
     use crate::protocol::event_modules::content::message::types::MessagePlaintext;
     use crate::protocol::event_modules::content::reaction::types::ReactionPlaintext;
-    use crate::protocol::event_modules::encryption::local_key_secret;
     use crate::protocol::event_modules::schema::EventLabel;
     use crate::protocol::event_modules::types::{event_id, EventStatus};
     use crate::protocol::Protocol;
@@ -201,12 +267,7 @@ mod tests {
     const FRONTIER: EventId = [4; 32];
     const KEY_SECRET: [u8; 32] = [5; 32];
 
-    fn local_key_secret_id() -> EventId {
-        local_key_secret::commands::from_key_secret(WORKSPACE, FRONTIER, KEY_SECRET)
-            .expect("local key")
-            .value
-            .local_key_secret_id
-    }
+    const LEAF_NODE_ID: EventId = [42; 32];
 
     fn message_record(text: &str) -> crate::protocol::event_modules::types::EventRecord {
         let output = message::commands::send(message::commands::SendMessage {
@@ -216,8 +277,8 @@ mod tests {
             signer_endpoint_shared_id: SIGNER,
             signer_private_key: [9; 32],
             removal_frontier_id: FRONTIER,
-            local_key_secret_id: local_key_secret_id(),
-            key_secret: KEY_SECRET,
+            local_history_node_secret_id: LEAF_NODE_ID,
+            leaf_node_secret: KEY_SECRET,
             text: text.to_string(),
         })
         .expect("message");
@@ -235,8 +296,8 @@ mod tests {
             signer_endpoint_shared_id: SIGNER,
             signer_private_key: [9; 32],
             removal_frontier_id: FRONTIER,
-            local_key_secret_id: local_key_secret_id(),
-            key_secret: KEY_SECRET,
+            local_history_node_secret_id: LEAF_NODE_ID,
+            leaf_node_secret: KEY_SECRET,
             emoji: "+1".to_string(),
         })
         .expect("reaction");
@@ -265,7 +326,7 @@ mod tests {
                         created_at_ms: 10,
                         author_user_id: AUTHOR,
                         removal_frontier_id: FRONTIER,
-                        local_key_secret_id: local_key_secret_id(),
+                        local_history_node_secret_id: LEAF_NODE_ID,
                         text: "delete me".to_string(),
                     },
                 )
@@ -279,7 +340,7 @@ mod tests {
                         target_message_id: message_id,
                         author_user_id: AUTHOR,
                         removal_frontier_id: FRONTIER,
-                        local_key_secret_id: local_key_secret_id(),
+                        local_history_node_secret_id: LEAF_NODE_ID,
                         emoji: "+1".to_string(),
                     },
                 )
@@ -293,7 +354,8 @@ mod tests {
             }]))
             .expect("insert deletion label");
 
-        let report = run(&store, Work::Drain { limit: 10 }).expect("purge");
+        let protocol = Protocol::new();
+        let report = run(&store, &protocol, Work::Drain { limit: 10 }).expect("purge");
 
         assert_eq!(report.tombstones_written, 1);
         assert_eq!(report.event_bytes_purged, 2);
@@ -334,7 +396,8 @@ mod tests {
             }]))
             .expect("insert deletion label");
 
-        let report = run(&store, Work::Drain { limit: 10 }).expect("purge");
+        let protocol = Protocol::new();
+        let report = run(&store, &protocol, Work::Drain { limit: 10 }).expect("purge");
 
         assert_eq!(report.event_bytes_purged, 0);
         assert!(event_schema::event_bytes(&store, &message_id)

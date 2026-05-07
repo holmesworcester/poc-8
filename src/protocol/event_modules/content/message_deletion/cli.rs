@@ -79,6 +79,7 @@ fn run_delete_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOut
     }
     content_purge::run(
         &context.store,
+        &context.protocol,
         content_purge::Work::Drain {
             limit: worker::DEFAULT_READY_BATCH,
         },

@@ -223,6 +223,342 @@ fn cli_send_file_syncs_bytes_to_peer_for_save() {
     assert_eq!(read_back, payload);
 }
 
+#[test]
+fn cli_deleted_message_key_is_unrecoverable_after_path_tombstone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = temp_db(&tmp, "alice.db");
+    let workspace_id = create_workspace(&db, "Content", "alice", "alice-laptop");
+    assert_success(topo(&["--db", &db, "key-frontier", &workspace_id]));
+
+    let send = assert_success(topo(&["--db", &db, "send", &workspace_id, "secret note"]));
+    let message_id_hex = line_value(&send, "event_id");
+
+    // Read out the leaf id and intermediate id from `keys`. The keys command
+    // lists every history node row keyed by frontier; we must capture both
+    // ids before deletion so we can prove they are gone afterwards.
+    let keys_before = assert_success(topo(&["--db", &db, "keys", &workspace_id]));
+    let history_nodes_before: Vec<&str> = keys_before
+        .lines()
+        .filter(|line| line.starts_with("history_node:"))
+        .collect();
+    assert_eq!(
+        history_nodes_before.len(),
+        2,
+        "expected leaf and intermediate path-node before deletion: {keys_before}"
+    );
+    let leaf_id_hex = node_id_from_keys_line(&history_nodes_before, 1, "width=1")
+        .expect("leaf id from keys before delete");
+    let intermediate_id_hex = node_id_from_keys_line(&history_nodes_before, 2, "width=2")
+        .expect("intermediate id from keys before delete");
+
+    let leaf_id = decode_hex_id(&leaf_id_hex);
+    let intermediate_id = decode_hex_id(&intermediate_id_hex);
+    let message_id = decode_hex_id(&message_id_hex);
+
+    // The leaf event must currently sit in event_modules.events with its
+    // plaintext node_secret. If it does not, the rest of this test is
+    // vacuous, so assert it explicitly first.
+    assert!(
+        event_id_present(&db, &leaf_id),
+        "leaf event must exist before deletion"
+    );
+    assert!(
+        event_id_present(&db, &intermediate_id),
+        "intermediate event must exist before deletion"
+    );
+
+    let deleted = assert_success(topo(&["--db", &db, "delete-message", &workspace_id, "#1"]));
+    assert!(deleted.contains("event_id:"), "{deleted}");
+
+    // (a) ciphertext gone — the message bytes have been purged from
+    // event_modules.events by content_purge.
+    assert!(
+        !event_id_present(&db, &message_id),
+        "message ciphertext must be purged from event_modules.events after deletion"
+    );
+    // (b) leaf gone from event_modules.events — purged by retire_deleted_message_leaf
+    assert!(
+        !event_id_present(&db, &leaf_id),
+        "deleted message leaf must be purged from event_modules.events"
+    );
+    // (c) every path-node from leaf to root is gone. In this fork the
+    // single-level intermediate at width=2 is the only path-node node-event
+    // between the leaf and the local_key_secret root. The local_key_secret
+    // root is workspace-shared and intentionally retained.
+    assert!(
+        !event_id_present(&db, &intermediate_id),
+        "deleted message intermediate path-node must be purged from event_modules.events"
+    );
+}
+
+#[test]
+fn cli_other_messages_in_frontier_remain_readable_after_one_delete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = temp_db(&tmp, "alice.db");
+    let bob = temp_db(&tmp, "bob.db");
+    let workspace_id = create_workspace(&alice, "Shared", "alice", "alice-laptop");
+    let invite_port = free_port();
+    let alice_port = free_port();
+    let bob_port = free_port();
+
+    join_workspace(&alice, &bob, &workspace_id, invite_port, "bob", "bob-phone");
+    let _alice_daemon = spawn_daemon(&alice, alice_port);
+    let _bob_daemon = spawn_daemon(&bob, bob_port);
+    connect_daemon_pair(&alice, alice_port, &bob, bob_port);
+    grant_content_key_to_peer(&alice, &bob, &workspace_id);
+
+    assert_success(topo(&["--db", &alice, "send", &workspace_id, "first"]));
+    assert_success(topo(&["--db", &alice, "send", &workspace_id, "second"]));
+
+    wait_for_messages_count(&bob, &workspace_id, "2");
+
+    // Delete the first message on alice. Bob's daemon will sync the deletion.
+    assert_success(topo(&["--db", &alice, "delete-message", &workspace_id, "#1"]));
+
+    // Bob should eventually see the deletion: 1 message left, "second"
+    // remains readable. Wait, then assert.
+    wait_for_messages_count(&bob, &workspace_id, "1");
+    let bob_listing = assert_success(topo(&["--db", &bob, "messages", &workspace_id]));
+    assert_eq!(line_value(&bob_listing, "messages"), "1");
+    assert!(
+        bob_listing.contains("alice: second"),
+        "bob's surviving message must still be decryptable: {bob_listing}",
+    );
+    assert!(
+        !bob_listing.contains("first"),
+        "deleted message must not appear in bob's listing: {bob_listing}",
+    );
+}
+
+#[test]
+fn cli_received_message_blocks_until_local_history_node_secret_is_derived() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = temp_db(&tmp, "alice.db");
+    let bob = temp_db(&tmp, "bob.db");
+    let workspace_id = create_workspace(&alice, "Blocking", "alice", "alice-laptop");
+    let invite_port = free_port();
+    let alice_port = free_port();
+    let bob_port = free_port();
+
+    join_workspace(&alice, &bob, &workspace_id, invite_port, "bob", "bob-phone");
+    let _alice_daemon = spawn_daemon(&alice, alice_port);
+    let _bob_daemon = spawn_daemon(&bob, bob_port);
+    connect_daemon_pair(&alice, alice_port, &bob, bob_port);
+    grant_content_key_to_peer(&alice, &bob, &workspace_id);
+
+    // alice sends a message; bob's daemon must auto-derive the per-message
+    // leaf and unblock the message before display. The CLI will still show
+    // exactly one decrypted message once derivation lands. If derivation
+    // never happened on bob, this assertion would time out.
+    assert_success(topo(&["--db", &alice, "send", &workspace_id, "blockcheck"]));
+    wait_for_messages_contains(&bob, &workspace_id, "alice: blockcheck");
+
+    // Inspect bob's keys to confirm the daemon's encryption_message_leaves
+    // worker actually produced a leaf history node row, rather than relying
+    // on side-effects of any other admission path.
+    let bob_keys = assert_success(topo(&["--db", &bob, "keys", &workspace_id]));
+    let history_nodes: Vec<&str> = bob_keys
+        .lines()
+        .filter(|line| line.starts_with("history_node:"))
+        .collect();
+    assert!(
+        history_nodes.iter().any(|line| line.contains("width=1")),
+        "bob must have at least one width=1 leaf node after auto-derivation: {bob_keys}",
+    );
+    assert!(
+        history_nodes.iter().any(|line| line.contains("width=2")),
+        "bob must have at least one width=2 intermediate after auto-derivation: {bob_keys}",
+    );
+}
+
+#[test]
+fn cli_receiver_cannot_decrypt_after_path_tombstone_replays_old_event() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = temp_db(&tmp, "alice.db");
+    let bob = temp_db(&tmp, "bob.db");
+    let workspace_id = create_workspace(&alice, "Forward", "alice", "alice-laptop");
+    let invite_port = free_port();
+    let alice_port = free_port();
+    let bob_port = free_port();
+
+    join_workspace(&alice, &bob, &workspace_id, invite_port, "bob", "bob-phone");
+    let _alice_daemon = spawn_daemon(&alice, alice_port);
+    let _bob_daemon = spawn_daemon(&bob, bob_port);
+    connect_daemon_pair(&alice, alice_port, &bob, bob_port);
+    grant_content_key_to_peer(&alice, &bob, &workspace_id);
+
+    let send = assert_success(topo(&["--db", &alice, "send", &workspace_id, "rewindable"]));
+    let message_id_hex = line_value(&send, "event_id");
+    let message_id = decode_hex_id(&message_id_hex);
+
+    wait_for_messages_contains(&bob, &workspace_id, "alice: rewindable");
+    // Capture bob's pre-delete state. If we replay the message canonical
+    // bytes against this snapshot AFTER the tombstone runs, decryption must
+    // fail — proving forward secrecy through the HKDF range tree.
+    let pre_delete_message_bytes = read_event_canonical_bytes(&bob, &message_id);
+    let pre_delete_keys = assert_success(topo(&["--db", &bob, "keys", &workspace_id]));
+    let bob_history_nodes: Vec<&str> = pre_delete_keys
+        .lines()
+        .filter(|line| line.starts_with("history_node:"))
+        .collect();
+    let bob_intermediate_id_hex = node_id_from_keys_line(&bob_history_nodes, 2, "width=2")
+        .expect("bob's intermediate before delete");
+    let bob_intermediate_id = decode_hex_id(&bob_intermediate_id_hex);
+    assert!(
+        event_id_present(&bob, &bob_intermediate_id),
+        "bob's intermediate path-node event must be present pre-delete"
+    );
+
+    // alice deletes the message; bob's daemon receives the deletion and runs
+    // content_purge -> RetireDeletedMessageLeaf.
+    assert_success(topo(&["--db", &alice, "delete-message", &workspace_id, "#1"]));
+    wait_for_messages_count(&bob, &workspace_id, "0");
+    // The retire pass that purges the intermediate's canonical bytes runs in
+    // a follow-up worker step after the deletion event projects on bob.
+    // Wait until bob's intermediate path-node is gone before asserting,
+    // because purge is bounded per-tick by the daemon scheduler.
+    wait_for_event_absent(&bob, &bob_intermediate_id);
+
+    // Bob's intermediate and leaf events must be purged from event_modules.events
+    // (forward-secrecy property): the parent path-node bytes are gone, so
+    // even an attacker holding the captured ciphertext + bob's previous
+    // local key state cannot re-derive the leaf node_secret to decrypt the
+    // captured ciphertext.
+    assert!(
+        !event_id_present(&bob, &bob_intermediate_id),
+        "bob's intermediate path-node event must be purged after the path tombstone runs"
+    );
+    // The leaf canonical bytes are also gone from bob's event_modules.events.
+    // We check that the captured pre-delete message ciphertext bytes do not
+    // appear anywhere in bob's events table any more — the only retained
+    // copy was the message envelope, and the deletion projected its purge.
+    let bob_payloads = all_event_payloads(&bob);
+    for (key, value) in &bob_payloads {
+        assert!(
+            !contains_subsequence(value, &pre_delete_message_bytes),
+            "no row_value should still embed the deleted message canonical bytes (offending row_key={})",
+            hex(key),
+        );
+    }
+}
+
+fn node_id_from_keys_line(
+    history_nodes: &[&str],
+    _expected_count: usize,
+    width_marker: &str,
+) -> Option<String> {
+    history_nodes
+        .iter()
+        .find(|line| line.contains(width_marker))
+        .and_then(|line| {
+            // Format: "history_node: <id_hex> frontier=<id_hex> start=<n> width=<n> tombstones=..."
+            let after_prefix = line.strip_prefix("history_node: ")?;
+            let id = after_prefix.split_whitespace().next()?;
+            Some(id.to_string())
+        })
+}
+
+fn decode_hex_id(hex: &str) -> Vec<u8> {
+    assert_eq!(hex.len(), 64, "event ids are 32-byte hex strings");
+    let mut out = Vec::with_capacity(32);
+    let bytes = hex.as_bytes();
+    for chunk in 0..32 {
+        let high = decode_hex_nibble(bytes[chunk * 2]);
+        let low = decode_hex_nibble(bytes[chunk * 2 + 1]);
+        out.push((high << 4) | low);
+    }
+    out
+}
+
+fn decode_hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => panic!("invalid hex digit: {byte}"),
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{:02x}", byte));
+    }
+    out
+}
+
+fn wait_for_event_absent(db: &str, event_id: &[u8]) {
+    for _ in 0..300 {
+        if !event_id_present(db, event_id) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "event {} never disappeared from {db} event_modules.events",
+        hex(event_id)
+    );
+}
+
+fn event_id_present(db: &str, event_id: &[u8]) -> bool {
+    let conn = rusqlite::Connection::open(db).expect("open db");
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM \"event_modules.events\" WHERE row_key = ?1",
+            rusqlite::params![event_id],
+            |row| row.get(0),
+        )
+        .expect("count rows");
+    count > 0
+}
+
+fn all_event_payloads(db: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let conn = rusqlite::Connection::open(db).expect("open db");
+    let mut stmt = conn
+        .prepare("SELECT row_key, row_value FROM \"event_modules.events\"")
+        .expect("prepare");
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query")
+        .map(|item| item.expect("row"))
+        .collect()
+}
+
+fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn read_event_canonical_bytes(db: &str, event_id: &[u8]) -> Vec<u8> {
+    let conn = rusqlite::Connection::open(db).expect("open db");
+    let bytes: Vec<u8> = conn
+        .query_row(
+            "SELECT row_value FROM \"event_modules.events\" WHERE row_key = ?1",
+            rusqlite::params![event_id],
+            |row| row.get(0),
+        )
+        .expect("event row");
+    canonical_bytes_from_event_row(&bytes)
+}
+
+fn canonical_bytes_from_event_row(value: &[u8]) -> Vec<u8> {
+    let mut offset = 0;
+    offset += 8; // timestamp
+    offset += 8; // body_len
+    offset += 1; // first byte of event id
+    offset += 1; // scope
+    offset += 1; // status
+    let has_workspace = value[offset] != 0;
+    offset += 1;
+    if has_workspace {
+        offset += 32;
+    }
+    value[offset..].to_vec()
+}
+
 fn create_workspace(db: &str, name: &str, username: &str, device_name: &str) -> String {
     let out = assert_success(topo(&[
         "--db",

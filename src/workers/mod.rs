@@ -43,6 +43,7 @@ where
         event_admission::daemon_worker(),
         event_projection::daemon_worker(),
         dependency_unblock::daemon_worker(),
+        encryption::daemon_worker(),
         content_purge::daemon_worker(),
         sync::daemon_worker(),
         transit_out::daemon_worker(),

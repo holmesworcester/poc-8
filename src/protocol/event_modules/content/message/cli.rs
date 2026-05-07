@@ -14,11 +14,14 @@ use crate::core::store::Store;
 use crate::protocol::cli::Context;
 use crate::protocol::event_modules::content::message_deletion::types::deletion_label_author;
 use crate::protocol::event_modules::content::reaction;
-use crate::protocol::event_modules::encryption::{local_key_secret, removal_frontier};
+use crate::protocol::event_modules::encryption::{
+    local_history_node_secret, local_key_secret, removal_frontier,
+};
 use crate::protocol::event_modules::identity::{endpoint, endpoint_shared, user};
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker;
+use crate::workers::encryption as encryption_worker;
 
 use super::{commands, schema};
 
@@ -99,16 +102,23 @@ fn run_send_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
     }
 
     let timestamp = next_timestamp(&context.store, workspace_id)?;
-    let content_key = require_content_key(&context.store, workspace_id)?;
+    let removal_frontier_id = require_active_frontier_id(&context.store, workspace_id)?;
+    let leaf = derive_message_leaf(
+        &context.store,
+        &context.protocol,
+        workspace_id,
+        removal_frontier_id,
+        timestamp,
+    )?;
     let send = commands::send(commands::SendMessage {
         workspace_id,
         created_at_ms: timestamp,
         author_user_id: membership.user_authority_event_id,
         signer_endpoint_shared_id: membership.endpoint_shared_id,
         signer_private_key: local.signing_secret,
-        removal_frontier_id: content_key.removal_frontier_id,
-        local_key_secret_id: content_key.local_key_secret_id,
-        key_secret: content_key.key_secret,
+        removal_frontier_id,
+        local_history_node_secret_id: leaf.local_history_node_secret_id,
+        leaf_node_secret: leaf.leaf_node_secret,
         text,
     })?;
     let report = worker::run(
@@ -258,25 +268,34 @@ fn open_sealed_message_row(
     store: &Store,
     row: schema::SealedMessageRow,
 ) -> Result<Option<super::types::MessageRow>, String> {
-    let Some(secret) =
-        local_key_secret::schema::get(store, row.workspace_id, row.removal_frontier_id)?
+    let leaf_start = super::types::leaf_range_start(row.created_at_ms);
+    let leaf_width = super::types::LEAF_RANGE_WIDTH;
+    let Some(leaf) = local_history_node_secret::schema::get(
+        store,
+        row.workspace_id,
+        row.removal_frontier_id,
+        leaf_start,
+        leaf_width,
+    )?
     else {
         return Ok(None);
     };
-    if secret.local_key_secret_id != row.local_key_secret_id {
-        return Err("sealed message local_key_secret_id does not match local key".to_string());
+    if leaf.local_history_node_secret_id != row.local_history_node_secret_id {
+        return Err(
+            "sealed message local_history_node_secret_id does not match local leaf".to_string(),
+        );
     }
     let event = super::types::MessageEvent {
         workspace_id: row.workspace_id,
         created_at_ms: row.created_at_ms,
         author_user_id: row.author_user_id,
         removal_frontier_id: row.removal_frontier_id,
-        local_key_secret_id: row.local_key_secret_id,
+        local_history_node_secret_id: row.local_history_node_secret_id,
         nonce: row.nonce,
         ciphertext: row.ciphertext,
     };
     let plaintext = crypto::xchacha20poly1305_decrypt(
-        &secret.key_secret,
+        &leaf.node_secret,
         &super::codec::associated_data(&event, row.signer_endpoint_shared_id),
         &event.nonce,
         &event.ciphertext,
@@ -347,13 +366,22 @@ fn open_sealed_reaction_row(
     store: &Store,
     row: reaction::schema::SealedReactionRow,
 ) -> Result<Option<reaction::types::ReactionRow>, String> {
-    let Some(secret) =
-        local_key_secret::schema::get(store, row.workspace_id, row.removal_frontier_id)?
+    let leaf_start = super::types::leaf_range_start(row.created_at_ms);
+    let leaf_width = super::types::LEAF_RANGE_WIDTH;
+    let Some(leaf) = local_history_node_secret::schema::get(
+        store,
+        row.workspace_id,
+        row.removal_frontier_id,
+        leaf_start,
+        leaf_width,
+    )?
     else {
         return Ok(None);
     };
-    if secret.local_key_secret_id != row.local_key_secret_id {
-        return Err("sealed reaction local_key_secret_id does not match local key".to_string());
+    if leaf.local_history_node_secret_id != row.local_history_node_secret_id {
+        return Err(
+            "sealed reaction local_history_node_secret_id does not match local leaf".to_string(),
+        );
     }
     let event = reaction::types::ReactionEvent {
         workspace_id: row.workspace_id,
@@ -361,12 +389,12 @@ fn open_sealed_reaction_row(
         target_message_id: row.target_message_id,
         author_user_id: row.author_user_id,
         removal_frontier_id: row.removal_frontier_id,
-        local_key_secret_id: row.local_key_secret_id,
+        local_history_node_secret_id: row.local_history_node_secret_id,
         nonce: row.nonce,
         ciphertext: row.ciphertext,
     };
     let plaintext = crypto::xchacha20poly1305_decrypt(
-        &secret.key_secret,
+        &leaf.node_secret,
         &reaction::codec::associated_data(&event, row.signer_endpoint_shared_id),
         &event.nonce,
         &event.ciphertext,
@@ -425,16 +453,20 @@ pub(crate) fn require_membership(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ContentKey {
+pub(crate) struct MessageLeafKey {
     pub removal_frontier_id: EventId,
-    pub local_key_secret_id: EventId,
-    pub key_secret: local_key_secret::types::KeySecret,
+    pub local_history_node_secret_id: EventId,
+    pub leaf_node_secret: local_key_secret::types::KeySecret,
 }
 
-pub(crate) fn require_content_key(
+/// Find the most recent local frontier for which this store has key material.
+///
+/// Senders need a frontier id to author messages; receivers do not call this
+/// because they trust the message body to name the frontier id.
+pub(crate) fn require_active_frontier_id(
     store: &Store,
     workspace_id: EventId,
-) -> Result<ContentKey, String> {
+) -> Result<EventId, String> {
     let mut candidates = Vec::new();
     for frontier in removal_frontier::schema::list_for_workspace(store, workspace_id)? {
         let Some(secret) =
@@ -442,19 +474,57 @@ pub(crate) fn require_content_key(
         else {
             continue;
         };
-        candidates.push((frontier.created_at_ms, frontier.removal_frontier_id, secret));
+        candidates.push((
+            frontier.created_at_ms,
+            frontier.removal_frontier_id,
+            secret.local_key_secret_id,
+        ));
     }
     candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    let Some((_, removal_frontier_id, secret)) = candidates.pop() else {
+    let Some((_, removal_frontier_id, _)) = candidates.pop() else {
         return Err(
             "local content key is missing for workspace; run key-frontier or key-derive"
                 .to_string(),
         );
     };
-    Ok(ContentKey {
+    Ok(removal_frontier_id)
+}
+
+/// Idempotently derive the per-message intermediate path-node and leaf for one
+/// `(workspace_id, removal_frontier_id, created_at_ms)` triple. Returns the
+/// leaf id and the leaf's `node_secret` for AEAD use.
+pub(crate) fn derive_message_leaf<R>(
+    store: &Store,
+    registry: &R,
+    workspace_id: EventId,
+    removal_frontier_id: EventId,
+    created_at_ms: u64,
+) -> Result<MessageLeafKey, String>
+where
+    R: crate::workers::common::event_pipeline::EventRegistry,
+{
+    let output = encryption_worker::run(
+        store,
+        registry,
+        encryption_worker::Work::DeriveMessageLeaf {
+            workspace_id,
+            removal_frontier_id,
+            created_at_ms,
+        },
+    )?;
+    let encryption_worker::Output::DerivedMessageLeaf(report) = output else {
+        return Err("unexpected encryption worker output".to_string());
+    };
+    let local_history_node_secret_id = report
+        .local_history_node_secret_id
+        .ok_or_else(|| "leaf history node secret id was not produced".to_string())?;
+    let leaf_node_secret = report
+        .leaf_node_secret
+        .ok_or_else(|| "leaf history node secret material was not produced".to_string())?;
+    Ok(MessageLeafKey {
         removal_frontier_id,
-        local_key_secret_id: secret.local_key_secret_id,
-        key_secret: secret.key_secret,
+        local_history_node_secret_id,
+        leaf_node_secret,
     })
 }
 

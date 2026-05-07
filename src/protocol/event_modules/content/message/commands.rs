@@ -2,8 +2,10 @@
 //!
 //! The send command takes explicit signing material plus the message body and
 //! returns one proposed signed message event. The CLI is responsible for
-//! resolving local endpoint material, workspace memberships, and user identity
-//! before calling this command.
+//! resolving local endpoint material, workspace memberships, user identity, and
+//! the per-message history-tree leaf key before calling this command. Each
+//! message is encrypted with a per-message leaf key so deletion can retire that
+//! specific leaf without revoking decryption for the rest of the frontier.
 
 use crate::core::crypto::{self, Ed25519PrivateKey, XChaCha20Poly1305Key};
 use crate::protocol::event_modules::types::EventId;
@@ -20,8 +22,8 @@ pub struct SendMessage {
     pub signer_endpoint_shared_id: EventId,
     pub signer_private_key: Ed25519PrivateKey,
     pub removal_frontier_id: EventId,
-    pub local_key_secret_id: EventId,
-    pub key_secret: XChaCha20Poly1305Key,
+    pub local_history_node_secret_id: EventId,
+    pub leaf_node_secret: XChaCha20Poly1305Key,
     pub text: String,
 }
 
@@ -44,12 +46,12 @@ pub fn send(input: SendMessage) -> Result<CommandOutput<SendMessageOutput>, Stri
         created_at_ms: input.created_at_ms,
         author_user_id: input.author_user_id,
         removal_frontier_id: input.removal_frontier_id,
-        local_key_secret_id: input.local_key_secret_id,
+        local_history_node_secret_id: input.local_history_node_secret_id,
         nonce: crypto::random_xchacha20poly1305_nonce(),
         ciphertext: [0; super::types::MESSAGE_CIPHERTEXT_BYTES],
     };
     let ciphertext = crypto::xchacha20poly1305_encrypt(
-        &input.key_secret,
+        &input.leaf_node_secret,
         &codec::associated_data(&event, input.signer_endpoint_shared_id),
         &event.nonce,
         &plaintext,
@@ -89,8 +91,8 @@ mod tests {
             signer_endpoint_shared_id: [3; 32],
             signer_private_key: [9; 32],
             removal_frontier_id: [4; 32],
-            local_key_secret_id: [5; 32],
-            key_secret: [6; 32],
+            local_history_node_secret_id: [5; 32],
+            leaf_node_secret: [6; 32],
             text: "private message".to_string(),
         })
         .expect("send");

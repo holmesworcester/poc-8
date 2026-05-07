@@ -43,6 +43,33 @@ pub enum Work {
         range_width: u64,
         tombstone_node_id: Option<EventId>,
     },
+    /// Idempotently derive (or look up) the per-message intermediate path-node
+    /// at width=2 plus the width=1 leaf for one message under one frontier.
+    /// Senders call this before authoring a message so the canonical event can
+    /// name the leaf id; receivers call it after admission blocks on the named
+    /// leaf so dependency unblock can let the message project.
+    DeriveMessageLeaf {
+        workspace_id: EventId,
+        removal_frontier_id: EventId,
+        created_at_ms: u64,
+    },
+    /// Retire one message's intermediate path-node by deriving a sibling leaf
+    /// in the unused right slot, purging the intermediate canonical bytes, and
+    /// purging the deleted leaf canonical bytes. Used by the deletion worker so
+    /// the leaf and its path become unrecoverable once the deletion fact is
+    /// applied.
+    RetireDeletedMessageLeaf {
+        workspace_id: EventId,
+        removal_frontier_id: EventId,
+        created_at_ms: u64,
+    },
+    /// Scan a bounded batch of admitted message and reaction events and derive
+    /// their per-message leaves. This is the receiver-side wiring: when a
+    /// signed message arrives blocked on a leaf id this peer has not yet
+    /// derived, this work item reads the (workspace, frontier, ts) triple out
+    /// of the canonical bytes and runs `DeriveMessageLeaf` so dependency
+    /// unblock can let the message project.
+    DrainPendingMessageLeaves { batch_size: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +77,16 @@ pub enum Output {
     DerivedKeySecrets(DeriveReport),
     RotatedRecipientKey(RotateRecipientKeyReport),
     DerivedHistoryNode(DeriveHistoryNodeReport),
+    DerivedMessageLeaf(DeriveMessageLeafReport),
+    RetiredDeletedMessageLeaf(RetireDeletedMessageLeafReport),
+    DrainedPendingMessageLeaves(DrainPendingLeavesReport),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrainPendingLeavesReport {
+    pub scanned_events: usize,
+    pub derived_leaves: usize,
+    pub admitted_events: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -73,6 +110,21 @@ pub struct RotateRecipientKeyReport {
 pub struct DeriveHistoryNodeReport {
     pub local_history_node_secret_id: Option<EventId>,
     pub tombstoned_node_id: Option<EventId>,
+    pub admitted_events: usize,
+    pub purged_event_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeriveMessageLeafReport {
+    pub local_history_node_secret_id: Option<EventId>,
+    pub leaf_node_secret: Option<crate::core::crypto::XChaCha20Poly1305Key>,
+    pub admitted_events: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetireDeletedMessageLeafReport {
+    pub leaf_id: Option<EventId>,
+    pub intermediate_id: Option<EventId>,
     pub admitted_events: usize,
     pub purged_event_bytes: usize,
 }
@@ -115,6 +167,28 @@ pub fn run<R: EventRegistry>(store: &Store, registry: &R, work: Work) -> Result<
             },
         )
         .map(Output::DerivedHistoryNode),
+        Work::DeriveMessageLeaf {
+            workspace_id,
+            removal_frontier_id,
+            created_at_ms,
+        } => derive_message_leaf(store, registry, workspace_id, removal_frontier_id, created_at_ms)
+            .map(Output::DerivedMessageLeaf),
+        Work::RetireDeletedMessageLeaf {
+            workspace_id,
+            removal_frontier_id,
+            created_at_ms,
+        } => retire_deleted_message_leaf(
+            store,
+            registry,
+            workspace_id,
+            removal_frontier_id,
+            created_at_ms,
+        )
+        .map(Output::RetiredDeletedMessageLeaf),
+        Work::DrainPendingMessageLeaves { batch_size } => {
+            drain_pending_message_leaves(store, registry, batch_size)
+                .map(Output::DrainedPendingMessageLeaves)
+        }
     }
 }
 
@@ -339,6 +413,334 @@ fn derive_history_node<R: EventRegistry>(
         admitted_events: admitted.admitted.inserted_events,
         purged_event_bytes,
     })
+}
+
+/// Idempotently derive (or look up) the per-message leaf chain.
+///
+/// The chain is `local_key_secret_root -> intermediate(width=2) -> leaf(width=1)`
+/// where the intermediate's range is `(2 * created_at_ms, 2)` and the leaf's
+/// range is `(2 * created_at_ms, 1)`. The `2 * created_at_ms` shift reserves
+/// the right slot at `(2*ts + 1, 1)` for the deletion-tombstone leaf so each
+/// message owns a private intermediate path-node that can be retired
+/// independently. Both sender and receiver call this with the same
+/// `created_at_ms` and reach the same leaf id by HKDF determinism.
+fn derive_message_leaf<R: EventRegistry>(
+    store: &Store,
+    registry: &R,
+    workspace_id: EventId,
+    removal_frontier_id: EventId,
+    created_at_ms: u64,
+) -> Result<DeriveMessageLeafReport, String> {
+    let root = local_key_secret::schema::get(store, workspace_id, removal_frontier_id)?
+        .ok_or_else(|| "local key secret is missing for removal frontier".to_string())?;
+    let intermediate_start =
+        crate::protocol::event_modules::content::message::types::intermediate_parent_range_start(
+            created_at_ms,
+        );
+    let intermediate_width =
+        crate::protocol::event_modules::content::message::types::LEAF_PARENT_WIDTH;
+    let leaf_start =
+        crate::protocol::event_modules::content::message::types::leaf_range_start(created_at_ms);
+    let leaf_width = crate::protocol::event_modules::content::message::types::LEAF_RANGE_WIDTH;
+
+    let mut admitted_events = 0;
+    let intermediate_id = match local_history_node_secret::schema::get(
+        store,
+        workspace_id,
+        removal_frontier_id,
+        intermediate_start,
+        intermediate_width,
+    )? {
+        Some(row) => row.local_history_node_secret_id,
+        None => {
+            let report = derive_history_node(
+                store,
+                registry,
+                HistoryNodeJob {
+                    workspace_id,
+                    removal_frontier_id,
+                    source_secret_id: root.local_key_secret_id,
+                    range_start: intermediate_start,
+                    range_width: intermediate_width,
+                    tombstone_node_id: None,
+                },
+            )?;
+            admitted_events += report.admitted_events;
+            report
+                .local_history_node_secret_id
+                .ok_or_else(|| "intermediate history node was not admitted".to_string())?
+        }
+    };
+
+    let leaf_row = match local_history_node_secret::schema::get(
+        store,
+        workspace_id,
+        removal_frontier_id,
+        leaf_start,
+        leaf_width,
+    )? {
+        Some(row) => row,
+        None => {
+            derive_history_node(
+                store,
+                registry,
+                HistoryNodeJob {
+                    workspace_id,
+                    removal_frontier_id,
+                    source_secret_id: intermediate_id,
+                    range_start: leaf_start,
+                    range_width: leaf_width,
+                    tombstone_node_id: None,
+                },
+            )?;
+            admitted_events += 1;
+            local_history_node_secret::schema::get(
+                store,
+                workspace_id,
+                removal_frontier_id,
+                leaf_start,
+                leaf_width,
+            )?
+            .ok_or_else(|| "leaf history node was not projected".to_string())?
+        }
+    };
+
+    Ok(DeriveMessageLeafReport {
+        local_history_node_secret_id: Some(leaf_row.local_history_node_secret_id),
+        leaf_node_secret: Some(leaf_row.node_secret),
+        admitted_events,
+    })
+}
+
+/// Retire the path-node and leaf bytes for a deleted message.
+///
+/// The intermediate is retired via a sibling-tombstone event in the unused
+/// right slot. The existing `derive_history_node` worker exact-deletes the
+/// intermediate's projection row and purges the intermediate's canonical
+/// bytes. The deleted leaf's canonical bytes are then purged here so the
+/// leaf's `node_secret` cannot be recovered from `event_modules.events`.
+fn retire_deleted_message_leaf<R: EventRegistry>(
+    store: &Store,
+    registry: &R,
+    workspace_id: EventId,
+    removal_frontier_id: EventId,
+    created_at_ms: u64,
+) -> Result<RetireDeletedMessageLeafReport, String> {
+    let intermediate_start =
+        crate::protocol::event_modules::content::message::types::intermediate_parent_range_start(
+            created_at_ms,
+        );
+    let intermediate_width =
+        crate::protocol::event_modules::content::message::types::LEAF_PARENT_WIDTH;
+    let leaf_start =
+        crate::protocol::event_modules::content::message::types::leaf_range_start(created_at_ms);
+    let leaf_width = crate::protocol::event_modules::content::message::types::LEAF_RANGE_WIDTH;
+    let tombstone_sibling_start =
+        crate::protocol::event_modules::content::message::types::tombstone_sibling_range_start(
+            created_at_ms,
+        );
+
+    let mut admitted_events = 0;
+    let mut purged_event_bytes = 0;
+
+    let leaf_row = local_history_node_secret::schema::get(
+        store,
+        workspace_id,
+        removal_frontier_id,
+        leaf_start,
+        leaf_width,
+    )?;
+    let leaf_id = leaf_row.as_ref().map(|row| row.local_history_node_secret_id);
+
+    let intermediate_row = local_history_node_secret::schema::get(
+        store,
+        workspace_id,
+        removal_frontier_id,
+        intermediate_start,
+        intermediate_width,
+    )?;
+    let intermediate_id = intermediate_row
+        .as_ref()
+        .map(|row| row.local_history_node_secret_id);
+
+    if let Some(intermediate) = intermediate_row {
+        let report = derive_history_node(
+            store,
+            registry,
+            HistoryNodeJob {
+                workspace_id,
+                removal_frontier_id,
+                source_secret_id: intermediate.local_history_node_secret_id,
+                range_start: tombstone_sibling_start,
+                range_width: leaf_width,
+                tombstone_node_id: Some(intermediate.local_history_node_secret_id),
+            },
+        )?;
+        admitted_events += report.admitted_events;
+        purged_event_bytes += report.purged_event_bytes;
+    }
+
+    if let Some(leaf_id) = leaf_id {
+        // Purge the leaf's canonical event bytes. The leaf carries the
+        // plaintext per-message AEAD key in its canonical body. Without this
+        // explicit purge an on-disk attacker could still read the leaf bytes
+        // and decrypt the (already deleted) message.
+        let purged = store
+            .write_transaction(|store| retention::purge_event_storage_in_tx(store, &leaf_id))
+            .map_err(|err| format!("purge deleted message leaf bytes: {err}"))?;
+        if purged {
+            purged_event_bytes += 1;
+            // Also drop the projection row so workers do not try to derive
+            // children from this leaf later.
+            store
+                .delete_table_rows(
+                    local_history_node_secret::schema::LOCAL_HISTORY_NODE_SECRETS,
+                    vec![local_history_node_secret::schema::local_history_node_secret_key(
+                        workspace_id,
+                        removal_frontier_id,
+                        leaf_start,
+                        leaf_width,
+                    )],
+                )
+                .map_err(|err| format!("delete leaf projection row: {err}"))?;
+        }
+    }
+
+    Ok(RetireDeletedMessageLeafReport {
+        leaf_id,
+        intermediate_id,
+        admitted_events,
+        purged_event_bytes,
+    })
+}
+
+/// Scan blocked content events whose missing dep is the per-message HKDF
+/// leaf and derive each one's leaf if it is not already projected locally.
+/// The common worker's dependency-unblock pass then unblocks any blocked
+/// content event whose leaf has just been admitted.
+///
+/// Iteration is bounded by `batch_size` so the daemon never spends an
+/// unbounded fairness slice scanning all events. We walk only the
+/// `BLOCKED_EVENTS_BY_MISSING_DEP` index, which is empty unless an inbound
+/// content event is currently waiting on a leaf this peer has not yet
+/// derived; on the sender side that index does not grow.
+fn drain_pending_message_leaves<R: EventRegistry>(
+    store: &Store,
+    registry: &R,
+    batch_size: usize,
+) -> Result<DrainPendingLeavesReport, String> {
+    use crate::protocol::event_modules::content::{message, reaction};
+
+    let mut report = DrainPendingLeavesReport::default();
+    let blocked_pairs = store
+        .table_rows_with_key_prefix(
+            event_schema::BLOCKED_EVENTS_BY_MISSING_DEP,
+            &[],
+            batch_size,
+        )
+        .map_err(|err| format!("load blocked edges: {err}"))?;
+    for (key, _) in blocked_pairs {
+        if report.scanned_events >= batch_size {
+            break;
+        }
+        let Ok((_missing_dep_id, blocked_event_id)) = event_schema::split_edge_key(&key) else {
+            continue;
+        };
+        let Some(bytes) = event_schema::event_bytes(store, &blocked_event_id)
+            .map_err(|err| format!("load event bytes: {err}"))?
+        else {
+            continue;
+        };
+        let (workspace_id, removal_frontier_id, created_at_ms, leaf_id) = match bytes
+            .first()
+            .copied()
+        {
+            Some(message::codec::TYPE_SIGNED_MESSAGE) => {
+                let envelope = match message::codec::decode_signed(&bytes) {
+                    Ok(envelope) => envelope,
+                    Err(_) => continue,
+                };
+                let event = match message::codec::decode(&envelope.payload) {
+                    Ok(event) => event,
+                    Err(_) => continue,
+                };
+                (
+                    event.workspace_id,
+                    event.removal_frontier_id,
+                    event.created_at_ms,
+                    event.local_history_node_secret_id,
+                )
+            }
+            Some(reaction::codec::TYPE_SIGNED_REACTION) => {
+                let envelope = match reaction::codec::decode_signed(&bytes) {
+                    Ok(envelope) => envelope,
+                    Err(_) => continue,
+                };
+                let event = match reaction::codec::decode(&envelope.payload) {
+                    Ok(event) => event,
+                    Err(_) => continue,
+                };
+                (
+                    event.workspace_id,
+                    event.removal_frontier_id,
+                    event.created_at_ms,
+                    event.local_history_node_secret_id,
+                )
+            }
+            _ => continue,
+        };
+        report.scanned_events += 1;
+        // Skip if local_key_secret root is missing for this frontier — the
+        // common worker is still blocked on key wraps and will retry once the
+        // frontier has key material locally.
+        if local_key_secret::schema::get(store, workspace_id, removal_frontier_id)?.is_none() {
+            continue;
+        }
+        // Skip if the leaf event already lives in this peer's event store.
+        if event_schema::has_event(store, &leaf_id)
+            .map_err(|err| format!("look up leaf event: {err}"))?
+        {
+            continue;
+        }
+        let derived = derive_message_leaf(
+            store,
+            registry,
+            workspace_id,
+            removal_frontier_id,
+            created_at_ms,
+        )?;
+        if derived
+            .local_history_node_secret_id
+            .is_some_and(|id| id == leaf_id)
+        {
+            report.derived_leaves += 1;
+            report.admitted_events += derived.admitted_events;
+        }
+    }
+    Ok(report)
+}
+
+pub(crate) fn daemon_worker<C>() -> crate::core::daemon::Worker<C>
+where
+    C: crate::workers::DaemonWorkerContext,
+{
+    use crate::core::daemon::{StepContext, Worker};
+    fn step<C>(ctx: &mut StepContext<'_, C>) -> Result<(), String>
+    where
+        C: crate::workers::DaemonWorkerContext,
+    {
+        let app = &*ctx.app;
+        let store = app.store();
+        let report = drain_pending_message_leaves(store, app, ctx.options.work_limit)
+            .map_err(|err| format!("drain pending message leaves: {err}"))?;
+        ctx.report
+            .add("derived_message_leaves", report.derived_leaves);
+        Ok(())
+    }
+    Worker {
+        name: "encryption_message_leaves",
+        run: step::<C>,
+    }
 }
 
 fn recipient_key_row(
@@ -652,5 +1054,119 @@ mod tests {
         assert!(event_schema::event_bytes(&store, &local_key_secret_id)
             .expect("seeded event bytes")
             .is_some(),);
+    }
+
+    #[test]
+    fn derive_message_leaf_is_idempotent_and_returns_leaf_node_secret() {
+        let store = Protocol::open_memory_store().expect("store");
+        let protocol = Protocol::new();
+        let (frontier_id, _local_key_secret_id) = seed_local_key_secret(&store);
+
+        let first = run(
+            &store,
+            &protocol,
+            Work::DeriveMessageLeaf {
+                workspace_id: WORKSPACE,
+                removal_frontier_id: frontier_id,
+                created_at_ms: 17,
+            },
+        )
+        .expect("first derive");
+        let Output::DerivedMessageLeaf(first) = first else {
+            panic!("unexpected output");
+        };
+        let leaf_id = first
+            .local_history_node_secret_id
+            .expect("first call must produce leaf id");
+        assert!(first.leaf_node_secret.is_some());
+        // First call writes both intermediate and leaf events.
+        assert!(first.admitted_events >= 2);
+
+        // A second derive for the same triple returns the same leaf id and
+        // does not re-admit; the row lookup short-circuits derivation.
+        let second = run(
+            &store,
+            &protocol,
+            Work::DeriveMessageLeaf {
+                workspace_id: WORKSPACE,
+                removal_frontier_id: frontier_id,
+                created_at_ms: 17,
+            },
+        )
+        .expect("second derive");
+        let Output::DerivedMessageLeaf(second) = second else {
+            panic!("unexpected output");
+        };
+        assert_eq!(second.local_history_node_secret_id, Some(leaf_id));
+        assert_eq!(second.leaf_node_secret, first.leaf_node_secret);
+        assert_eq!(second.admitted_events, 0, "second call must be idempotent");
+    }
+
+    #[test]
+    fn retire_deleted_message_leaf_purges_leaf_and_intermediate_event_bytes() {
+        let store = Protocol::open_memory_store().expect("store");
+        let protocol = Protocol::new();
+        let (frontier_id, _local_key_secret_id) = seed_local_key_secret(&store);
+
+        let derived = run(
+            &store,
+            &protocol,
+            Work::DeriveMessageLeaf {
+                workspace_id: WORKSPACE,
+                removal_frontier_id: frontier_id,
+                created_at_ms: 21,
+            },
+        )
+        .expect("derive");
+        let Output::DerivedMessageLeaf(derived) = derived else {
+            panic!("unexpected output");
+        };
+        let leaf_id = derived.local_history_node_secret_id.expect("leaf id");
+
+        // Look up the intermediate id from the projection so the test can
+        // assert its event bytes vanish, not just the leaf's.
+        let intermediate_row =
+            crate::protocol::event_modules::encryption::local_history_node_secret::schema::get(
+                &store,
+                WORKSPACE,
+                frontier_id,
+                crate::protocol::event_modules::content::message::types::intermediate_parent_range_start(21),
+                crate::protocol::event_modules::content::message::types::LEAF_PARENT_WIDTH,
+            )
+            .expect("intermediate row")
+            .expect("intermediate must exist after derive");
+        let intermediate_id = intermediate_row.local_history_node_secret_id;
+
+        assert!(event_schema::event_bytes(&store, &leaf_id)
+            .expect("leaf bytes")
+            .is_some());
+        assert!(event_schema::event_bytes(&store, &intermediate_id)
+            .expect("intermediate bytes")
+            .is_some());
+
+        let retired = run(
+            &store,
+            &protocol,
+            Work::RetireDeletedMessageLeaf {
+                workspace_id: WORKSPACE,
+                removal_frontier_id: frontier_id,
+                created_at_ms: 21,
+            },
+        )
+        .expect("retire");
+        let Output::RetiredDeletedMessageLeaf(retired) = retired else {
+            panic!("unexpected output");
+        };
+        assert_eq!(retired.leaf_id, Some(leaf_id));
+        assert_eq!(retired.intermediate_id, Some(intermediate_id));
+        // Both leaf and intermediate canonical bytes must be purged.
+        assert!(retired.purged_event_bytes >= 2);
+
+        assert!(event_schema::event_bytes(&store, &leaf_id)
+            .expect("leaf bytes after retire")
+            .is_none());
+        assert!(event_schema::event_bytes(&store, &intermediate_id)
+            .expect("intermediate bytes after retire")
+            .is_none());
     }
 }
