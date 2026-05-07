@@ -61,6 +61,7 @@ impl SendSummary {
 pub struct MessageDisplay {
     pub index: usize,
     pub message_id: EventId,
+    pub author_user_id: EventId,
     pub author_username: String,
     pub created_at_ms: u64,
     pub text: String,
@@ -182,6 +183,7 @@ pub fn list_for_display(
         display.push(MessageDisplay {
             index: start + idx + 1,
             message_id: row.message_id,
+            author_user_id: row.author_user_id,
             author_username,
             created_at_ms: row.created_at_ms,
             text: row.text,
@@ -309,6 +311,28 @@ fn reactions_grouped_by_message_for_display(
     store: &Store,
     workspace_id: EventId,
 ) -> Result<BTreeMap<EventId, Vec<String>>, String> {
+    let rows = visible_reaction_rows(store, workspace_id)?;
+    let mut grouped: BTreeMap<EventId, Vec<(EventId, String)>> = BTreeMap::new();
+    for row in rows {
+        let entry = grouped.entry(row.target_message_id).or_default();
+        let key_pair = (row.author_user_id, row.emoji.clone());
+        if !entry.iter().any(|existing| existing == &key_pair) {
+            entry.push(key_pair);
+        }
+    }
+    Ok(grouped
+        .into_iter()
+        .map(|(target, pairs)| (target, pairs.into_iter().map(|(_, emoji)| emoji).collect()))
+        .collect())
+}
+
+/// All reactions visible to the local store for one workspace, including
+/// sealed rows that the local key secret can open. Sorted chronologically by
+/// `(created_at_ms, reaction_id)` so callers can group/dedupe deterministically.
+pub fn visible_reaction_rows(
+    store: &Store,
+    workspace_id: EventId,
+) -> Result<Vec<reaction::types::ReactionRow>, String> {
     let mut by_id = BTreeMap::new();
     for row in reaction::schema::list_for_workspace(store, workspace_id)? {
         by_id.insert(row.reaction_id, row);
@@ -325,18 +349,7 @@ fn reactions_grouped_by_message_for_display(
             .cmp(&b.created_at_ms)
             .then_with(|| a.reaction_id.cmp(&b.reaction_id))
     });
-    let mut grouped: BTreeMap<EventId, Vec<(EventId, String)>> = BTreeMap::new();
-    for row in rows {
-        let entry = grouped.entry(row.target_message_id).or_default();
-        let key_pair = (row.author_user_id, row.emoji.clone());
-        if !entry.iter().any(|existing| existing == &key_pair) {
-            entry.push(key_pair);
-        }
-    }
-    Ok(grouped
-        .into_iter()
-        .map(|(target, pairs)| (target, pairs.into_iter().map(|(_, emoji)| emoji).collect()))
-        .collect())
+    Ok(rows)
 }
 
 fn sealed_reaction_rows_for_workspace(
