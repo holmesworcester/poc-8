@@ -31,6 +31,14 @@ pub(crate) const BOOTSTRAP_WORKSPACES: TableName =
     TableName::new("connection.bootstrap_workspaces");
 pub(crate) const BOOTSTRAP_ENDPOINT_WORKSPACES: TableName =
     TableName::new("connection.bootstrap_endpoint_workspaces");
+/// Durable table of last-observed peer source addresses, keyed by
+/// `connection_id`. The bootstrap exchange worker records inbound source
+/// addresses here for the `connections` debug command. Sync intentionally does
+/// not read this table because inbound source ports are typically ephemeral
+/// and do not authorize a stable dial-back route. Storing the row durably lets
+/// the `connections` query show the last reachable address even after the
+/// listening process has exited.
+pub(crate) const RECENT_PEER_ADDRS: TableName = TableName::new("connection.recent_peer_addrs");
 
 pub const SCHEMAS: &[Schema] = &[
     Schema::durable_row_table("connection.connection_events.v1", CONNECTION_EVENTS),
@@ -45,6 +53,7 @@ pub const SCHEMAS: &[Schema] = &[
         "connection.connection_scoped_events.v1",
         CONNECTION_SCOPED_EVENTS,
     ),
+    Schema::durable_row_table("connection.recent_peer_addrs.v1", RECENT_PEER_ADDRS),
 ];
 
 pub(crate) fn connection_event_row(event_id: EventId, bytes: Vec<u8>) -> TableRow {
@@ -99,6 +108,14 @@ pub(crate) fn connection_scoped_event_row(event_id: EventId, canonical_bytes: Ve
         table: CONNECTION_SCOPED_EVENTS,
         key: event_id.to_vec(),
         value: canonical_bytes,
+    }
+}
+
+pub(crate) fn recent_peer_addr_row(connection_id: ConnectionId, addr: SocketAddr) -> TableRow {
+    TableRow {
+        table: RECENT_PEER_ADDRS,
+        key: connection_id.to_vec(),
+        value: addr.to_string().into_bytes(),
     }
 }
 

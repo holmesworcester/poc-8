@@ -184,10 +184,37 @@ where
     let mut frames = Vec::new();
     for inner in inners {
         if connection_request::codec::is_request(&inner) {
+            note_recent_peer_addr_for_request(store, &inner, target.addr())?;
             frames.extend(bootstrap_identity_frames_for_request(store, &inner)?);
         }
     }
     Ok(network_queues::outbound_rows(target, frames))
+}
+
+/// Record the inbound source address against the derived connection id so
+/// debuggability tools (`connections`) can show the most recent observed peer
+/// address. This is intentionally separate from `TRANSPORT_TARGETS` because
+/// inbound source ports are usually ephemeral and must not be promoted into
+/// dial-back routes used by sync.
+fn note_recent_peer_addr_for_request(
+    store: &Store,
+    request_bytes: &[u8],
+    addr: std::net::SocketAddr,
+) -> Result<(), String> {
+    let request = match connection_request::codec::decode(request_bytes) {
+        Ok(request) => request,
+        Err(_) => return Ok(()),
+    };
+    let local = local_endpoint(store)?;
+    if request.to_endpoint != local.endpoint {
+        return Ok(());
+    }
+    let request_id = event_id(request_bytes);
+    let connection_id = types::connection_id(&request_id, &local.endpoint);
+    store
+        .insert_table_rows(vec![schema::recent_peer_addr_row(connection_id, addr)])
+        .map_err(|err| format!("record recent peer addr: {err}"))?;
+    Ok(())
 }
 
 fn canonical_rows(output: &ProjectionOutput) -> Result<Vec<Vec<u8>>, String> {

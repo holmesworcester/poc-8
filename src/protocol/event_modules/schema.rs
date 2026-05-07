@@ -105,6 +105,38 @@ pub fn body_bytes(store: &Store) -> rusqlite::Result<usize> {
         .sum())
 }
 
+/// All durable events (shared and local) with their canonical bytes, scope, and
+/// timestamp. CLI reporting commands use this to walk the full event graph; row
+/// shape stays inside this module so callers cannot bypass scope filtering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventListing {
+    pub event_id: EventId,
+    pub timestamp: u64,
+    pub scope: EventScope,
+    pub status: EventStatus,
+    pub workspace_id: Option<EventId>,
+    pub canonical_bytes: Vec<u8>,
+}
+
+pub fn all_events(store: &Store) -> rusqlite::Result<Vec<EventListing>> {
+    store
+        .table_rows(EVENTS)?
+        .into_iter()
+        .map(|(key, value)| {
+            let event = decode_event_row_value(&value)?;
+            let event_id = vec_to_id(key)?;
+            Ok(EventListing {
+                event_id,
+                timestamp: event.timestamp,
+                scope: event.scope,
+                status: event.status,
+                workspace_id: event.workspace_id,
+                canonical_bytes: event.canonical_bytes,
+            })
+        })
+        .collect()
+}
+
 pub fn event_index_entries_in_timestamp_range(
     store: &Store,
     start_timestamp: u64,
