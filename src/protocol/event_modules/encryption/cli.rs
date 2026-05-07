@@ -342,6 +342,7 @@ fn run_key_node_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliO
             source_secret_id,
             range_start,
             range_width,
+            event_id_in_minute: None,
             tombstone_node_id,
         },
     )?;
@@ -399,6 +400,16 @@ fn run_keys_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
         &context.store,
         workspace_id,
     )?;
+    let cover_summary =
+        local_history_node_secret::schema::cover_summary(&context.store, workspace_id)?;
+    let leaf_count = history_nodes
+        .iter()
+        .filter(|node| node.event_id_in_minute.is_some())
+        .count();
+    let minute_node_count = history_nodes
+        .iter()
+        .filter(|node| node.event_id_in_minute.is_none())
+        .count();
 
     let mut lines = vec![
         format!("recipient_keys: {}", recipient_keys.len()),
@@ -411,10 +422,13 @@ fn run_keys_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
         format!("key_wraps: {}", key_wraps.len()),
         format!("local_key_secrets: {}", local_secrets.len()),
         format!("local_history_node_secrets: {}", history_nodes.len()),
+        format!("local_history_minute_nodes: {minute_node_count}"),
+        format!("local_history_leaves: {leaf_count}"),
         format!(
             "local_history_node_tombstones: {}",
             history_tombstones.len()
         ),
+        format!("cover_summary: {}", hex_bytes(&cover_summary)),
     ];
     for frontier in frontiers {
         let access = local_key_secret::schema::get(
@@ -431,15 +445,26 @@ fn run_keys_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
     }
     for node in history_nodes {
         lines.push(format!(
-            "history_node: {} frontier={} start={} width={} tombstones={}",
+            "history_node: {} frontier={} start={} width={} event_id_in_minute={} tombstones={}",
             hex_id(node.local_history_node_secret_id),
             hex_id(node.removal_frontier_id),
             node.range_start,
             node.range_width,
+            optional_hex_id(node.event_id_in_minute),
             optional_hex_id(node.tombstone_node_id)
         ));
     }
     Ok(CliOutput::lines(lines))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn require_membership(

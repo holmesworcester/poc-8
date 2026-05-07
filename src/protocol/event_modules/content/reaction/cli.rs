@@ -6,6 +6,7 @@
 //! reaction projector/schema and content purge worker.
 
 use crate::core::cli::{CliArgs, CliCommand, CliOutput};
+use crate::core::crypto;
 use crate::protocol::cli::Context;
 use crate::protocol::event_modules::content::message;
 use crate::protocol::event_modules::identity::endpoint;
@@ -60,12 +61,14 @@ fn run_react_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutp
     let timestamp = message::cli::next_timestamp(&context.store, workspace_id)?;
     let removal_frontier_id =
         message::cli::require_active_frontier_id(&context.store, workspace_id)?;
+    let leaf_nonce = crypto::random_bytes_32();
     let leaf = message::cli::derive_message_leaf(
         &context.store,
         &context.protocol,
         workspace_id,
         removal_frontier_id,
         timestamp,
+        leaf_nonce,
     )?;
     let post = commands::post(commands::PostReaction {
         workspace_id,
@@ -76,6 +79,7 @@ fn run_react_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutp
         signer_private_key: local.signing_secret,
         removal_frontier_id,
         local_history_node_secret_id: leaf.local_history_node_secret_id,
+        leaf_nonce,
         leaf_node_secret: leaf.leaf_node_secret,
         emoji,
     })?;

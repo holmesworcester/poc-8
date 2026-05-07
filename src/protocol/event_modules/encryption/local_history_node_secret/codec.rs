@@ -4,6 +4,11 @@
 //! edges to the source secret, removal frontier, and optional tombstoned node.
 //! The codec validates range shape and event metadata so the common worker can
 //! order local key history without a separate key scheduler.
+//!
+//! The wire layout carries an explicit `event_id_in_minute` slot. A 32-byte
+//! zero is encoded for the per-minute coarse-cover node; a non-zero
+//! `leaf_nonce` is encoded for a per-message leaf. The slot is always present
+//! so canonical bytes stay fixed-width per event type.
 
 use crate::core::crypto::XCHACHA20_POLY1305_KEY_BYTES;
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
@@ -13,7 +18,7 @@ use super::types::LocalHistoryNodeSecret;
 
 pub const TYPE_LOCAL_HISTORY_NODE_SECRET: u8 = 145;
 pub const LOCAL_HISTORY_NODE_SECRET_WIRE_SIZE: usize =
-    1 + 32 + 32 + 32 + 8 + 8 + 32 + XCHACHA20_POLY1305_KEY_BYTES;
+    1 + 32 + 32 + 32 + 8 + 8 + 32 + 32 + XCHACHA20_POLY1305_KEY_BYTES;
 
 pub fn encode(event: &LocalHistoryNodeSecret) -> Vec<u8> {
     let mut out = Writer::with_capacity(LOCAL_HISTORY_NODE_SECRET_WIRE_SIZE);
@@ -23,6 +28,7 @@ pub fn encode(event: &LocalHistoryNodeSecret) -> Vec<u8> {
     out.id(&event.source_secret_id);
     out.u64(event.range_start);
     out.u64(event.range_width);
+    out.id(&event.event_id_in_minute.unwrap_or([0; 32]));
     out.id(&event.tombstone_node_id.unwrap_or([0; 32]));
     out.id(&event.node_secret);
     out.finish()
@@ -39,6 +45,7 @@ pub fn decode(bytes: &[u8]) -> Result<LocalHistoryNodeSecret, String> {
     let source_secret_id = reader.id()?;
     let range_start = reader.u64()?;
     let range_width = reader.u64()?;
+    let event_id_in_minute = reader.id()?;
     let tombstone_node_id = reader.id()?;
     let event = LocalHistoryNodeSecret {
         workspace_id,
@@ -46,6 +53,7 @@ pub fn decode(bytes: &[u8]) -> Result<LocalHistoryNodeSecret, String> {
         source_secret_id,
         range_start,
         range_width,
+        event_id_in_minute: (!is_zero(&event_id_in_minute)).then_some(event_id_in_minute),
         tombstone_node_id: (!is_zero(&tombstone_node_id)).then_some(tombstone_node_id),
         node_secret: reader.id()?,
     };
@@ -99,6 +107,11 @@ fn validate(event: &LocalHistoryNodeSecret) -> Result<(), String> {
         return Err("local history node material cannot be empty".to_string());
     }
     validate_range(event.range_start, event.range_width)?;
+    // Per-message leaves carry `event_id_in_minute = Some(leaf_nonce)` and
+    // sit at `range_width = 1`. Per-minute coarse-cover nodes carry
+    // `event_id_in_minute = None` and also sit at `range_width = 1` (one
+    // node per `unix_minute`). The presence of `event_id_in_minute` is what
+    // distinguishes a leaf from a minute_node at the same range.
     Ok(())
 }
 
@@ -120,21 +133,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrips_local_history_node_secret() {
+    fn roundtrips_local_history_node_secret_for_minute_node() {
         let event = commands::derive(commands::DeriveHistoryNodeSecret {
             workspace_id: [1; 32],
             removal_frontier_id: [2; 32],
             source_secret_id: [3; 32],
             source_secret: [7; 32],
-            range_start: 8,
-            range_width: 8,
-            tombstone_node_id: Some([4; 32]),
+            range_start: 1_700_000,
+            range_width: 1,
+            event_id_in_minute: None,
+            tombstone_node_id: None,
         })
         .expect("derive")
         .value
         .event;
 
-        assert_eq!(decode(&encode(&event)).expect("decode"), event);
+        let encoded = encode(&event);
+        assert_eq!(encoded.len(), LOCAL_HISTORY_NODE_SECRET_WIRE_SIZE);
+        assert_eq!(decode(&encoded).expect("decode"), event);
+    }
+
+    #[test]
+    fn roundtrips_local_history_node_secret_for_per_message_leaf() {
+        let leaf_nonce = [9; 32];
+        let event = commands::derive(commands::DeriveHistoryNodeSecret {
+            workspace_id: [1; 32],
+            removal_frontier_id: [2; 32],
+            source_secret_id: [3; 32],
+            source_secret: [7; 32],
+            range_start: 1_700_000,
+            range_width: 1,
+            event_id_in_minute: Some(leaf_nonce),
+            tombstone_node_id: None,
+        })
+        .expect("derive")
+        .value
+        .event;
+
+        assert_eq!(event.event_id_in_minute, Some(leaf_nonce));
+        let encoded = encode(&event);
+        assert_eq!(encoded.len(), LOCAL_HISTORY_NODE_SECRET_WIRE_SIZE);
+        assert_eq!(decode(&encoded).expect("decode"), event);
     }
 
     #[test]
@@ -144,8 +183,9 @@ mod tests {
             removal_frontier_id: [2; 32],
             source_secret_id: [3; 32],
             source_secret: [7; 32],
-            range_start: 8,
-            range_width: 8,
+            range_start: 1_700_000,
+            range_width: 1,
+            event_id_in_minute: None,
             tombstone_node_id: Some([4; 32]),
         })
         .expect("derive");
@@ -158,22 +198,22 @@ mod tests {
 
     #[test]
     fn rejects_non_canonical_range() {
-        let mut event = commands::derive(commands::DeriveHistoryNodeSecret {
+        let event = commands::derive(commands::DeriveHistoryNodeSecret {
             workspace_id: [1; 32],
             removal_frontier_id: [2; 32],
             source_secret_id: [3; 32],
             source_secret: [7; 32],
             range_start: 3,
             range_width: 8,
+            event_id_in_minute: None,
             tombstone_node_id: None,
         })
         .expect_err("unaligned range must fail");
-
         assert_eq!(event, "local history node range start must align to width");
 
-        event = validate_range(0, 7).expect_err("non power of two must fail");
+        let err = validate_range(0, 7).expect_err("non power of two must fail");
         assert_eq!(
-            event,
+            err,
             "local history node range width must be a power of two"
         );
     }

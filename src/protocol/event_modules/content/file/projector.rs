@@ -170,6 +170,7 @@ mod tests {
             author_user_id,
             removal_frontier_id: frontier_id,
             local_history_node_secret_id,
+            leaf_nonce: [60; 32],
             nonce: [32; XCHACHA20_POLY1305_NONCE_BYTES],
             ciphertext: [33; message::types::MESSAGE_CIPHERTEXT_BYTES],
         });

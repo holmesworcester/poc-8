@@ -214,6 +214,13 @@ impl PerfFixture {
             signer_private_key: self.signer_private_key,
             removal_frontier_id: self.removal_frontier_id,
             local_history_node_secret_id: self.local_key_secret_id,
+            // Perf fixture uses a deterministic nonce derived from the
+            // sequence so admission/projection have a non-zero
+            // `leaf_nonce` without exercising the real worker derivation
+            // path (which is timed by other tests). The leaf event itself
+            // is also not minted here; this perf fixture intentionally
+            // exercises only the message admission + projection cost.
+            leaf_nonce: leaf_nonce_for(sequence),
             leaf_node_secret: self.key_secret,
             text: format!("perf message {sequence}"),
         })
@@ -566,6 +573,12 @@ fn derive_file_id(fixture: &PerfFixture, message_id: EventId, blob_bytes: u64) -
     input.extend_from_slice(&message_id);
     input.extend_from_slice(&blob_bytes.to_be_bytes());
     crypto::hash(&input)
+}
+
+fn leaf_nonce_for(sequence: usize) -> EventId {
+    // Deterministic non-zero nonce keyed by the message sequence. Hash the
+    // sequence so two sequences cannot accidentally produce the same nonce.
+    crypto::hash(format!("perf-leaf-nonce-{sequence}").as_bytes())
 }
 
 fn fill_payload_slice(out: &mut [u8], slice_number: u32) {

@@ -104,12 +104,14 @@ fn run_send_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
 
     let timestamp = next_timestamp(&context.store, workspace_id)?;
     let removal_frontier_id = require_active_frontier_id(&context.store, workspace_id)?;
+    let leaf_nonce = crypto::random_bytes_32();
     let leaf = derive_message_leaf(
         &context.store,
         &context.protocol,
         workspace_id,
         removal_frontier_id,
         timestamp,
+        leaf_nonce,
     )?;
     let send = commands::send(commands::SendMessage {
         workspace_id,
@@ -119,6 +121,7 @@ fn run_send_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
         signer_private_key: local.signing_secret,
         removal_frontier_id,
         local_history_node_secret_id: leaf.local_history_node_secret_id,
+        leaf_nonce,
         leaf_node_secret: leaf.leaf_node_secret,
         text,
     })?;
@@ -270,14 +273,13 @@ fn open_sealed_message_row(
     store: &Store,
     row: schema::SealedMessageRow,
 ) -> Result<Option<super::types::MessageRow>, String> {
-    let leaf_start = super::types::leaf_range_start(row.created_at_ms);
-    let leaf_width = super::types::LEAF_RANGE_WIDTH;
-    let Some(leaf) = local_history_node_secret::schema::get(
+    let unix_minute = super::types::unix_minute_for(row.created_at_ms);
+    let Some(leaf) = local_history_node_secret::schema::get_leaf(
         store,
         row.workspace_id,
         row.removal_frontier_id,
-        leaf_start,
-        leaf_width,
+        unix_minute,
+        row.leaf_nonce,
     )?
     else {
         return Ok(None);
@@ -293,6 +295,7 @@ fn open_sealed_message_row(
         author_user_id: row.author_user_id,
         removal_frontier_id: row.removal_frontier_id,
         local_history_node_secret_id: row.local_history_node_secret_id,
+        leaf_nonce: row.leaf_nonce,
         nonce: row.nonce,
         ciphertext: row.ciphertext,
     };
@@ -391,14 +394,13 @@ fn open_sealed_reaction_row(
     store: &Store,
     row: reaction::schema::SealedReactionRow,
 ) -> Result<Option<reaction::types::ReactionRow>, String> {
-    let leaf_start = super::types::leaf_range_start(row.created_at_ms);
-    let leaf_width = super::types::LEAF_RANGE_WIDTH;
-    let Some(leaf) = local_history_node_secret::schema::get(
+    let unix_minute = super::types::unix_minute_for(row.created_at_ms);
+    let Some(leaf) = local_history_node_secret::schema::get_leaf(
         store,
         row.workspace_id,
         row.removal_frontier_id,
-        leaf_start,
-        leaf_width,
+        unix_minute,
+        row.leaf_nonce,
     )?
     else {
         return Ok(None);
@@ -415,6 +417,7 @@ fn open_sealed_reaction_row(
         author_user_id: row.author_user_id,
         removal_frontier_id: row.removal_frontier_id,
         local_history_node_secret_id: row.local_history_node_secret_id,
+        leaf_nonce: row.leaf_nonce,
         nonce: row.nonce,
         ciphertext: row.ciphertext,
     };
@@ -515,15 +518,20 @@ pub(crate) fn require_active_frontier_id(
     Ok(removal_frontier_id)
 }
 
-/// Idempotently derive the per-message intermediate path-node and leaf for one
-/// `(workspace_id, removal_frontier_id, created_at_ms)` triple. Returns the
-/// leaf id and the leaf's `node_secret` for AEAD use.
+/// Derive (or look up) the per-message minute_node and leaf for one
+/// `(workspace_id, removal_frontier_id, created_at_ms, leaf_nonce)` quadruple.
+///
+/// The minute_node is shared across every message in the same `unix_minute`,
+/// so first call admits it and subsequent calls reuse the row. The leaf is
+/// per-message and never shared. Returns the leaf id and the leaf's
+/// `node_secret` for AEAD use.
 pub(crate) fn derive_message_leaf<R>(
     store: &Store,
     registry: &R,
     workspace_id: EventId,
     removal_frontier_id: EventId,
     created_at_ms: u64,
+    leaf_nonce: EventId,
 ) -> Result<MessageLeafKey, String>
 where
     R: crate::workers::pipeline_helpers::event_pipeline::EventRegistry,
@@ -535,6 +543,7 @@ where
             workspace_id,
             removal_frontier_id,
             created_at_ms,
+            leaf_nonce,
         },
     )?;
     let encryption_worker::Output::DerivedMessageLeaf(report) = output else {

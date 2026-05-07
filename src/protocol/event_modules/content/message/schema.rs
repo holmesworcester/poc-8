@@ -34,6 +34,7 @@ pub struct SealedMessageRow {
     pub signer_endpoint_shared_id: EventId,
     pub removal_frontier_id: EventId,
     pub local_history_node_secret_id: EventId,
+    pub leaf_nonce: EventId,
     pub nonce: crate::core::crypto::XChaCha20Poly1305Nonce,
     pub ciphertext: MessageCiphertext,
 }
@@ -84,6 +85,7 @@ pub fn decode_sealed_message_row(key: &[u8], value: &[u8]) -> Result<SealedMessa
     let signer_endpoint_shared_id = reader.id()?;
     let removal_frontier_id = reader.id()?;
     let local_history_node_secret_id = reader.id()?;
+    let leaf_nonce = reader.id()?;
     let nonce = reader
         .bytes(crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES)?
         .try_into()
@@ -101,6 +103,7 @@ pub fn decode_sealed_message_row(key: &[u8], value: &[u8]) -> Result<SealedMessa
         signer_endpoint_shared_id,
         removal_frontier_id,
         local_history_node_secret_id,
+        leaf_nonce,
         nonce,
         ciphertext,
     })
@@ -219,6 +222,7 @@ fn encode_sealed_value(signer_endpoint_shared_id: EventId, event: &MessageEvent)
             + 32
             + 32
             + 32
+            + 32
             + crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES
             + MESSAGE_CIPHERTEXT_BYTES,
     );
@@ -227,6 +231,7 @@ fn encode_sealed_value(signer_endpoint_shared_id: EventId, event: &MessageEvent)
     out.id(&signer_endpoint_shared_id);
     out.id(&event.removal_frontier_id);
     out.id(&event.local_history_node_secret_id);
+    out.id(&event.leaf_nonce);
     out.raw(&event.nonce);
     out.raw(&event.ciphertext);
     out.finish()

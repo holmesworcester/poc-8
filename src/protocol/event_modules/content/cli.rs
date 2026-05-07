@@ -112,16 +112,18 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
     let mut timestamp = starting_timestamp;
     let removal_frontier_id =
         message::cli::require_active_frontier_id(&context.store, parsed.workspace_id)?;
+    let leaf_nonce = crypto::random_bytes_32();
     let leaf = message::cli::derive_message_leaf(
         &context.store,
         &context.protocol,
         parsed.workspace_id,
         removal_frontier_id,
         timestamp,
+        leaf_nonce,
     )?;
     // Files attached to a message reuse the parent message's per-message leaf
-    // key. On message deletion, retiring the leaf path tombstones the same key
-    // for both the message body and the file ciphertext, so file forward
+    // key. On message deletion, retiring the leaf retires the same key for
+    // both the message body and the file ciphertext, so file forward
     // secrecy follows the per-message FS rule from encryption_plan.md.
     let signer_endpoint = membership.endpoint_shared_id;
 
@@ -134,6 +136,7 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
         signer_private_key: local.signing_secret,
         removal_frontier_id,
         local_history_node_secret_id: leaf.local_history_node_secret_id,
+        leaf_nonce,
         leaf_node_secret: leaf.leaf_node_secret,
         text: parsed.text,
     })?;
@@ -181,7 +184,7 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
         root_hash,
         filename: filename.clone(),
         mime_type: parsed.mime_type.clone(),
-        removal_frontier_id: removal_frontier_id,
+        removal_frontier_id,
         local_key_secret_id: leaf.local_history_node_secret_id,
         key_secret: leaf.leaf_node_secret,
     })?;

@@ -3,6 +3,22 @@
 //! A sibling node can name an already-projected local node to retire. The event
 //! depends on that node, so the common worker applies the sibling only after the
 //! path node exists, then writes the sibling row and purges the retired row.
+//!
+//! After the per-message FS leaf-coord redesign the tree shape is:
+//!
+//! ```text
+//!   local_key_secret (frontier root, range_width=1, event_id_in_minute=None)
+//!     └── minute_node (range_start=unix_minute, range_width=1, event_id_in_minute=None)
+//!           ├── leaf (range_start=unix_minute, range_width=1, event_id_in_minute=Some(nonce_a))
+//!           └── leaf (range_start=unix_minute, range_width=1, event_id_in_minute=Some(nonce_b))
+//! ```
+//!
+//! The projector validates that:
+//!   - A minute_node's source is a `local_key_secret` (frontier root) under
+//!     the same workspace and frontier.
+//!   - A per-message leaf's source is a `local_history_node_secret` minute_node
+//!     under the same workspace and frontier with the same `range_start`
+//!     (i.e. the leaf lives in the same minute as its parent minute_node).
 
 use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput, TableDelete};
 
@@ -16,7 +32,7 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
     }
     let source_node = validate_source(event, &node)?;
     if let Some(source_node) = &source_node {
-        validate_child_range(source_node, &node)?;
+        validate_child_addressing(source_node, &node)?;
         if let Some(tombstone_node_id) = node.tombstone_node_id {
             if tombstone_node_id != node.source_secret_id {
                 return Err(
@@ -39,8 +55,11 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
         {
             return Err("local history node tombstone workspace or frontier mismatch".to_string());
         }
-        if retired.range_start == node.range_start && retired.range_width == node.range_width {
-            return Err("local history node cannot tombstone its own range".to_string());
+        if retired.range_start == node.range_start
+            && retired.range_width == node.range_width
+            && retired.event_id_in_minute == node.event_id_in_minute
+        {
+            return Err("local history node cannot tombstone its own coordinate".to_string());
         }
         output.rows.push(schema::local_history_node_tombstone_row(
             &node,
@@ -54,6 +73,7 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
                 retired.removal_frontier_id,
                 retired.range_start,
                 retired.range_width,
+                retired.event_id_in_minute,
             ),
         });
     }
@@ -86,26 +106,33 @@ fn validate_source(
     Ok(None)
 }
 
-fn validate_child_range(
+fn validate_child_addressing(
     source: &super::types::LocalHistoryNodeSecret,
     node: &super::types::LocalHistoryNodeSecret,
 ) -> Result<(), String> {
-    let child_width = source
-        .range_width
-        .checked_div(2)
-        .filter(|width| *width > 0)
-        .ok_or_else(|| "local history node source range cannot be split".to_string())?;
-    if node.range_width != child_width {
-        return Err("local history node range must be one child of the source range".to_string());
+    // Two valid parent/child relationships in the new tree:
+    //   * minute_node parented by another minute_node only when the child
+    //     retires the parent (a tombstone path); for non-tombstone derivation
+    //     a minute_node is sourced from the frontier root, which is a
+    //     `local_key_secret` and reaches `validate_source -> Ok(None)` instead
+    //     of this function.
+    //   * leaf (event_id_in_minute = Some) parented by a minute_node
+    //     (event_id_in_minute = None) at the same `range_start`.
+    let same_minute = source.range_start == node.range_start && source.range_width == 1;
+    let parent_is_minute_node = source.event_id_in_minute.is_none() && source.range_width == 1;
+    let child_is_leaf = node.event_id_in_minute.is_some() && node.range_width == 1;
+    if same_minute && parent_is_minute_node && child_is_leaf {
+        return Ok(());
     }
-    let right_start = source
-        .range_start
-        .checked_add(child_width)
-        .ok_or_else(|| "local history node source range overflows".to_string())?;
-    if node.range_start != source.range_start && node.range_start != right_start {
-        return Err("local history node range must be one child of the source range".to_string());
+    if node.tombstone_node_id.is_some() {
+        // Tombstone-only sibling node: allowed regardless of the standard
+        // parent/child relationship as long as workspace+frontier match. The
+        // tombstone target is the source itself; the validity of the retire
+        // is checked by the caller via the `tombstone_node_id == source`
+        // rule.
+        return Ok(());
     }
-    Ok(())
+    Err("local history node coordinate is not a valid child of the source range".to_string())
 }
 
 fn decode_history_node(
@@ -146,6 +173,7 @@ mod tests {
         source_secret: [u8; 32],
         range_start: u64,
         range_width: u64,
+        event_id_in_minute: Option<[u8; 32]>,
         tombstone_node_id: Option<[u8; 32]>,
     ) -> Record {
         commands::derive(commands::DeriveHistoryNodeSecret {
@@ -155,6 +183,7 @@ mod tests {
             source_secret,
             range_start,
             range_width,
+            event_id_in_minute,
             tombstone_node_id,
         })
         .expect("derive node")
@@ -182,13 +211,13 @@ mod tests {
     }
 
     #[test]
-    fn projects_node_row_from_valid_source_secret() {
+    fn projects_minute_node_row_from_valid_key_secret_source() {
         let key_record = key_secret_record();
         let key_id = event_id(&key_record.canonical_bytes);
-        let record = history_record(key_id, [7; 32], 0, 8, None);
+        let record = history_record(key_id, [7; 32], 1_700_000, 1, None, None);
         let event = event_with_context(&record, vec![(key_id, key_record)]);
 
-        let output = project(&event).expect("project node");
+        let output = project(&event).expect("project minute node");
 
         assert_eq!(output.rows.len(), 1);
         assert_eq!(output.rows[0].table, schema::LOCAL_HISTORY_NODE_SECRETS);
@@ -197,40 +226,42 @@ mod tests {
             &output.rows[0].value,
         )
         .expect("decode row");
-        assert_eq!(row.range_start, 0);
-        assert_eq!(row.range_width, 8);
+        assert_eq!(row.range_start, 1_700_000);
+        assert_eq!(row.range_width, 1);
+        assert_eq!(row.event_id_in_minute, None);
         assert_eq!(row.local_history_node_secret_id, event.context.event_id);
     }
 
     #[test]
-    fn sibling_node_tombstones_retired_path_node_by_exact_row_key() {
+    fn projects_per_message_leaf_under_minute_node() {
         let key_record = key_secret_record();
         let key_id = event_id(&key_record.canonical_bytes);
-        let parent_record = history_record(key_id, [7; 32], 0, 8, None);
-        let parent_id = event_id(&parent_record.canonical_bytes);
-        let parent = codec::decode(&parent_record.canonical_bytes).expect("parent");
-        let sibling_record = history_record(parent_id, parent.node_secret, 4, 4, Some(parent_id));
+        let minute_record = history_record(key_id, [7; 32], 1_700_000, 1, None, None);
+        let minute_id = event_id(&minute_record.canonical_bytes);
+        let minute = codec::decode(&minute_record.canonical_bytes).expect("minute");
+        let leaf_nonce = [9; 32];
+        let leaf_record = history_record(
+            minute_id,
+            minute.node_secret,
+            1_700_000,
+            1,
+            Some(leaf_nonce),
+            None,
+        );
         let event = event_with_context(
-            &sibling_record,
-            vec![(key_id, key_record), (parent_id, parent_record)],
+            &leaf_record,
+            vec![(key_id, key_record), (minute_id, minute_record)],
         );
 
-        let output = project(&event).expect("project sibling");
+        let output = project(&event).expect("project leaf");
 
-        assert_eq!(output.rows.len(), 2);
-        assert_eq!(output.deletes.len(), 1);
-        assert_eq!(output.rows[1].table, schema::LOCAL_HISTORY_NODE_TOMBSTONES);
-        assert_eq!(
-            output.deletes[0].key,
-            schema::local_history_node_secret_key([1; 32], [2; 32], 0, 8)
-        );
-        let row = schema::decode_local_history_node_tombstone_row(
-            &output.rows[1].key,
-            &output.rows[1].value,
+        assert_eq!(output.rows.len(), 1);
+        let row = schema::decode_local_history_node_secret_row(
+            &output.rows[0].key,
+            &output.rows[0].value,
         )
-        .expect("decode tombstone");
-        assert_eq!(row.tombstone_node_id, parent_id);
-        assert_eq!(row.replacement_node_id, event.context.event_id);
+        .expect("decode leaf");
+        assert_eq!(row.event_id_in_minute, Some(leaf_nonce));
     }
 
     #[test]
@@ -242,8 +273,9 @@ mod tests {
             removal_frontier_id: [9; 32],
             source_secret_id: key_id,
             source_secret: [7; 32],
-            range_start: 0,
-            range_width: 8,
+            range_start: 1_700_000,
+            range_width: 1,
+            event_id_in_minute: None,
             tombstone_node_id: None,
         })
         .expect("derive")
@@ -259,18 +291,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_history_node_that_is_not_source_child() {
+    fn leaf_in_different_minute_than_source_is_rejected() {
         let key_record = key_secret_record();
         let key_id = event_id(&key_record.canonical_bytes);
-        let parent_record = history_record(key_id, [7; 32], 0, 8, None);
-        let parent_id = event_id(&parent_record.canonical_bytes);
-        let parent = codec::decode(&parent_record.canonical_bytes).expect("parent");
-        let record = history_record(parent_id, parent.node_secret, 8, 4, None);
-        let event = event_with_context(&record, vec![(parent_id, parent_record)]);
+        let minute_record = history_record(key_id, [7; 32], 1_700_000, 1, None, None);
+        let minute_id = event_id(&minute_record.canonical_bytes);
+        let minute = codec::decode(&minute_record.canonical_bytes).expect("minute");
+        // Authoring a leaf at a different unix_minute than its parent
+        // minute_node is structurally invalid.
+        let leaf_record = history_record(
+            minute_id,
+            minute.node_secret,
+            1_700_001,
+            1,
+            Some([9; 32]),
+            None,
+        );
+        let event = event_with_context(
+            &leaf_record,
+            vec![(key_id, key_record), (minute_id, minute_record)],
+        );
 
-        assert_eq!(
-            project(&event).expect_err("non-child range must fail"),
-            "local history node range must be one child of the source range"
+        let err = project(&event).expect_err("non-matching minute must fail");
+        assert!(
+            err.contains("not a valid child"),
+            "expected child range error, got {err}"
         );
     }
 }

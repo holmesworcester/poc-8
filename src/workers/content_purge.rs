@@ -93,6 +93,7 @@ struct RetireLeafJob {
     workspace_id: EventId,
     removal_frontier_id: EventId,
     created_at_ms: u64,
+    leaf_nonce: EventId,
 }
 
 fn drain<R: EventRegistry>(
@@ -116,13 +117,14 @@ fn drain<R: EventRegistry>(
                 workspace_id: job.workspace_id,
                 removal_frontier_id: job.removal_frontier_id,
                 created_at_ms: job.created_at_ms,
+                leaf_nonce: job.leaf_nonce,
             },
         )?;
         let encryption_worker::Output::RetiredDeletedMessageLeaf(retired) = output else {
             return Err("unexpected encryption worker output retiring deleted leaf".to_string());
         };
         report.event_bytes_purged += retired.purged_event_bytes;
-        if retired.leaf_id.is_some() || retired.intermediate_id.is_some() {
+        if retired.leaf_id.is_some() {
             report.retired_message_leaves += 1;
         }
     }
@@ -190,6 +192,7 @@ fn purge_deleted_message(
         workspace_id: event.workspace_id,
         removal_frontier_id: event.removal_frontier_id,
         created_at_ms: event.created_at_ms,
+        leaf_nonce: event.leaf_nonce,
     });
 
     let inserted = store
@@ -399,6 +402,8 @@ mod tests {
 
     const LEAF_NODE_ID: EventId = [42; 32];
 
+    const LEAF_NONCE: EventId = [88; 32];
+
     fn message_record(text: &str) -> crate::protocol::event_modules::types::EventRecord {
         let output = message::commands::send(message::commands::SendMessage {
             workspace_id: WORKSPACE,
@@ -408,6 +413,7 @@ mod tests {
             signer_private_key: [9; 32],
             removal_frontier_id: FRONTIER,
             local_history_node_secret_id: LEAF_NODE_ID,
+            leaf_nonce: LEAF_NONCE,
             leaf_node_secret: KEY_SECRET,
             text: text.to_string(),
         })
@@ -427,6 +433,7 @@ mod tests {
             signer_private_key: [9; 32],
             removal_frontier_id: FRONTIER,
             local_history_node_secret_id: LEAF_NODE_ID,
+            leaf_nonce: LEAF_NONCE,
             leaf_node_secret: KEY_SECRET,
             emoji: "+1".to_string(),
         })
@@ -457,6 +464,7 @@ mod tests {
                         author_user_id: AUTHOR,
                         removal_frontier_id: FRONTIER,
                         local_history_node_secret_id: LEAF_NODE_ID,
+                        leaf_nonce: LEAF_NONCE,
                         text: "delete me".to_string(),
                     },
                 )
@@ -471,6 +479,7 @@ mod tests {
                         author_user_id: AUTHOR,
                         removal_frontier_id: FRONTIER,
                         local_history_node_secret_id: LEAF_NODE_ID,
+                        leaf_nonce: LEAF_NONCE,
                         emoji: "+1".to_string(),
                     },
                 )

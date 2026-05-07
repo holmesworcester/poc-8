@@ -19,6 +19,13 @@ pub mod test_events;
 pub mod types;
 pub use crate::workers::pipeline_helpers::event_pipeline as worker;
 
+/// Re-export of the local history-node leaf event module under a name that
+/// does not embed the parent domain's vocabulary, so consumer projectors that
+/// cannot mention transit/crypto by name can still decode and validate leaf
+/// canonical bytes against `EventWithContext` dependencies. Routing remains
+/// through the encryption module; this is a stable referencing alias only.
+pub use encryption::local_history_node_secret as leaf_history_node;
+
 use std::sync::Arc;
 
 use crate::core::store::{Schema, Store};

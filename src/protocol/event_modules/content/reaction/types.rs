@@ -21,6 +21,7 @@ pub struct ReactionEvent {
     pub author_user_id: EventId,
     pub removal_frontier_id: EventId,
     pub local_history_node_secret_id: EventId,
+    pub leaf_nonce: EventId,
     pub nonce: XChaCha20Poly1305Nonce,
     pub ciphertext: ReactionCiphertext,
 }
@@ -33,6 +34,7 @@ pub struct ReactionPlaintext {
     pub author_user_id: EventId,
     pub removal_frontier_id: EventId,
     pub local_history_node_secret_id: EventId,
+    pub leaf_nonce: EventId,
     pub emoji: String,
 }
 

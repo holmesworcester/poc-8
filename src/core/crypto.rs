@@ -37,6 +37,26 @@ pub fn hash(bytes: &[u8]) -> Hash {
     *blake3::hash(bytes).as_bytes()
 }
 
+/// BLAKE3 keyed-hash with explicit domain separation.
+///
+/// `key` is the 32-byte parent secret (BLAKE3 keyed-hash takes a 32-byte key).
+/// `domain` is a fixed ASCII tag prefixing the input; pick one tag per
+/// distinct derivation purpose so two purposes can share the same key without
+/// colliding. `info` is the variable-length per-input data appended after the
+/// domain tag.
+///
+/// This is BLAKE3's published keyed-hash mode (`blake3::keyed_hash`), not a
+/// home-grown KDF. Two callers passing the same `(key, domain, info)` triple
+/// produce the same 32-byte output; changing any byte of any input changes
+/// the output.
+pub fn blake3_keyed_hash(key: &[u8; HASH_BYTES], domain: &[u8], info: &[u8]) -> [u8; HASH_BYTES] {
+    let mut input = Vec::with_capacity(domain.len() + 1 + info.len());
+    input.extend_from_slice(domain);
+    input.push(0);
+    input.extend_from_slice(info);
+    *blake3::keyed_hash(key, &input).as_bytes()
+}
+
 pub fn random_bytes_32() -> [u8; 32] {
     let mut out = [0; 32];
     OsRng.fill_bytes(&mut out);
@@ -316,6 +336,24 @@ mod tests {
         let mut tampered_ciphertext = ciphertext;
         tampered_ciphertext[0] ^= 1;
         assert!(xchacha20poly1305_decrypt(&key, aad, &nonce, &tampered_ciphertext).is_err());
+    }
+
+    #[test]
+    fn blake3_keyed_hash_is_deterministic_and_context_bound() {
+        let key = [3; HASH_BYTES];
+        let domain = b"topo test domain v1";
+        let info = b"some+associated+data";
+
+        let left = blake3_keyed_hash(&key, domain, info);
+        let right = blake3_keyed_hash(&key, domain, info);
+        let other_key = blake3_keyed_hash(&[4; HASH_BYTES], domain, info);
+        let other_domain = blake3_keyed_hash(&key, b"topo test domain v2", info);
+        let other_info = blake3_keyed_hash(&key, domain, b"different info");
+
+        assert_eq!(left, right);
+        assert_ne!(left, other_key);
+        assert_ne!(left, other_domain);
+        assert_ne!(left, other_info);
     }
 
     #[test]

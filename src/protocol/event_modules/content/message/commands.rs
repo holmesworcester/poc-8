@@ -23,6 +23,11 @@ pub struct SendMessage {
     pub signer_private_key: Ed25519PrivateKey,
     pub removal_frontier_id: EventId,
     pub local_history_node_secret_id: EventId,
+    /// Per-message random committed in canonical bytes. The leaf
+    /// `local_history_node_secret_id` is derived from this nonce; both
+    /// sender and receiver derive the same leaf id by replaying the same
+    /// nonce through `blake3_keyed_hash`.
+    pub leaf_nonce: EventId,
     pub leaf_node_secret: XChaCha20Poly1305Key,
     pub text: String,
 }
@@ -40,6 +45,9 @@ pub fn send(input: SendMessage) -> Result<CommandOutput<SendMessageOutput>, Stri
     if input.text.trim().is_empty() {
         return Err("message text must not be empty".to_string());
     }
+    if input.leaf_nonce.iter().all(|byte| *byte == 0) {
+        return Err("message leaf_nonce must not be zero".to_string());
+    }
     let plaintext = codec::encode_text_slot(&input.text)?;
     let mut event = MessageEvent {
         workspace_id: input.workspace_id,
@@ -47,6 +55,7 @@ pub fn send(input: SendMessage) -> Result<CommandOutput<SendMessageOutput>, Stri
         author_user_id: input.author_user_id,
         removal_frontier_id: input.removal_frontier_id,
         local_history_node_secret_id: input.local_history_node_secret_id,
+        leaf_nonce: input.leaf_nonce,
         nonce: crypto::random_xchacha20poly1305_nonce(),
         ciphertext: [0; super::types::MESSAGE_CIPHERTEXT_BYTES],
     };
@@ -92,6 +101,7 @@ mod tests {
             signer_private_key: [9; 32],
             removal_frontier_id: [4; 32],
             local_history_node_secret_id: [5; 32],
+            leaf_nonce: [11; 32],
             leaf_node_secret: [6; 32],
             text: "private message".to_string(),
         })
@@ -109,6 +119,7 @@ mod tests {
 
         let envelope = codec::decode_signed(&record.canonical_bytes).expect("signed");
         let event = codec::decode(&envelope.payload).expect("event");
+        assert_eq!(event.leaf_nonce, [11; 32]);
         let plaintext = crypto::xchacha20poly1305_decrypt(
             &[6; 32],
             &codec::associated_data(&event, [3; 32]),
