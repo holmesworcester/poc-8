@@ -23,7 +23,7 @@ where
 {
     let (db_path, command_args) = parse_global_args(args)?;
     let mut context = P::open_context(db_path)?;
-    let mut commands = vec![daemon::command::<P>()];
+    let mut commands = daemon::commands::<P>();
     commands.extend(P::commands());
     let output = cli::run(&commands, &mut context, &command_args)?;
     for line in output.lines {

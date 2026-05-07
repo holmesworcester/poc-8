@@ -1049,6 +1049,7 @@ dependencies = [
  "crux_core",
  "ed25519-dalek",
  "hkdf",
+ "libc",
  "rand_core",
  "rusqlite",
  "sha2",
