@@ -857,6 +857,7 @@ fn functional_cli_and_network_tests_use_black_box_setup() {
         "tests/encryption_cli_test.rs",
         "tests/generate_cli_test.rs",
         "tests/invite_accept_cli_test.rs",
+        "tests/view_cli_test.rs",
     ];
     let forbidden = [
         "use topo::core::",
