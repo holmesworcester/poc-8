@@ -1,23 +1,67 @@
-//! Protocol-neutral daemon runner and `start` command.
+//! Protocol-neutral daemon runner and lifecycle commands.
 //!
 //! Core owns the reusable mechanics of long-lived operation: parse generic
 //! daemon options, acquire the per-store lock, bind a TCP listener, run a set
 //! of caller-supplied worker steps, and print generic counters. Protocols
 //! supply the worker objects; core only sees names and function pointers.
+//!
+//! In addition to `start`, this file owns the matching `stop` and `reset`
+//! lifecycle commands. They operate on the same `<db>.daemon.lock` file the
+//! runner writes at startup, so all three commands stay in one place rather
+//! than scattering daemon-lifecycle plumbing across the codebase.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::core::cli::{CliArgs, CliCommand, CliOutput};
 use crate::core::{runtime, tcp};
 
 const START_USAGE: &str = "start --listen IP PORT [--tick-ms N] [--quiet-ms N]";
+const STOP_USAGE: &str = "stop";
+const RESET_USAGE: &str = "reset";
 const DEFAULT_TICK_MS: u64 = 250;
 const DEFAULT_WORK_LIMIT: usize = 4096;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Shared shutdown flag set by SIGTERM/SIGINT. The runtime checks this each
+/// tick so the daemon can finish a round of work and release its lock cleanly.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_termination_signal(_signal: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+fn install_termination_handlers() {
+    // Idempotent: only install once per process. Callers may invoke `run`
+    // multiple times in tests, but the handler simply flips a flag so a stale
+    // installation is harmless. Still, avoid replacing per-call to keep tests
+    // that toggle the flag manually predictable.
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // SAFETY: `sigaction` is async-signal-safe to install, and our handler only
+    // touches an `AtomicBool` (also async-signal-safe). `sigaction` is preferred
+    // over `signal` because the BSD/SysV semantics of the latter vary across
+    // platforms; `sigaction` gives explicit control over the flags and mask.
+    let handler = handle_termination_signal as *const () as libc::sighandler_t;
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handler;
+        // SA_RESTART so blocking IO calls (e.g. `accept`, `nanosleep`) restart
+        // automatically once the handler returns, instead of failing with EINTR
+        // for callers that do not handle that case.
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
+        libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+    }
+}
 
 /// A protocol-supplied daemon worker step.
 #[derive(Clone, Copy)]
@@ -93,11 +137,36 @@ where
     }
 }
 
+/// All daemon-lifecycle commands the generic app shell wires up: `start`,
+/// `stop`, and `reset`. They all key off the same `<db>.daemon.lock` file the
+/// runner writes at startup.
+pub fn commands<P>() -> Vec<CliCommand<P::Context>>
+where
+    P: DaemonProtocol,
+{
+    vec![
+        command::<P>(),
+        CliCommand {
+            name: "stop",
+            usage: STOP_USAGE,
+            help: "Stop a running daemon for this store.",
+            run: run_stop_command::<P>,
+        },
+        CliCommand {
+            name: "reset",
+            usage: RESET_USAGE,
+            help: "Stop the daemon (if any) and delete this store's local files.",
+            run: run_reset_command::<P>,
+        },
+    ]
+}
+
 fn run_start_command<P>(context: &mut P::Context, args: CliArgs<'_>) -> Result<CliOutput, String>
 where
     P: DaemonProtocol,
 {
     let options = StartOptions::parse(args)?;
+    install_termination_handlers();
     let _lock = DaemonLock::acquire(P::daemon_db_path(context))?;
     let report = run_after_bind(
         context,
@@ -139,6 +208,9 @@ pub fn run_after_bind<C>(
         workers,
         options.idle,
         || {
+            if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+                return true;
+            }
             options
                 .duration
                 .is_some_and(|duration| started.elapsed() >= duration)
@@ -167,6 +239,187 @@ pub fn run_after_bind<C>(
 
 pub fn is_retryable_store_busy(err: &str) -> bool {
     err.contains("database is locked") || err.contains("database is busy")
+}
+
+fn run_stop_command<P>(context: &mut P::Context, args: CliArgs<'_>) -> Result<CliOutput, String>
+where
+    P: DaemonProtocol,
+{
+    args.require_len(0, STOP_USAGE)?;
+    let db_path = P::daemon_db_path(context).to_path_buf();
+    Ok(CliOutput::lines(stop_daemon(&db_path)?))
+}
+
+fn run_reset_command<P>(context: &mut P::Context, args: CliArgs<'_>) -> Result<CliOutput, String>
+where
+    P: DaemonProtocol,
+{
+    args.require_len(0, RESET_USAGE)?;
+    let db_path = P::daemon_db_path(context).to_path_buf();
+    let mut lines = stop_daemon(&db_path)?;
+    lines.extend(reset_db_files(&db_path)?);
+    Ok(CliOutput::lines(lines))
+}
+
+/// Best-effort stop of any daemon currently holding `<db>.daemon.lock`.
+///
+/// Returns the lines a CLI should print: either "no daemon running" or
+/// "stopped daemon" plus a stale-lock note when applicable.
+fn stop_daemon(db_path: &Path) -> Result<Vec<String>, String> {
+    let lock = lock_path(db_path);
+    let pid = match read_lock_pid(&lock)? {
+        LockState::Missing => {
+            return Ok(vec!["no daemon running".to_string()]);
+        }
+        LockState::Unreadable => {
+            // Treat an unparseable lock file as a stale artifact rather than a
+            // running daemon: if a current daemon owned it, the file would
+            // contain a fresh PID. Removing the file unblocks future starts.
+            let _ = fs::remove_file(&lock);
+            return Ok(vec!["no daemon running (cleared unreadable lock)".to_string()]);
+        }
+        LockState::Pid(pid) => pid,
+    };
+
+    if !process_exists(pid) {
+        let _ = fs::remove_file(&lock);
+        return Ok(vec![format!(
+            "no daemon running (cleared stale lock for pid {pid})"
+        )]);
+    }
+
+    send_termination_signal(pid)?;
+    // The lock file is removed by `DaemonLock::drop` immediately before the
+    // daemon process exits, so its disappearance is the signal that the
+    // daemon shut down cleanly. We also check the process for cases where the
+    // lock was removed manually but the process is still alive.
+    let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+    while Instant::now() < deadline {
+        if !lock.exists() {
+            return Ok(vec![format!("stopped daemon (pid {pid})")]);
+        }
+        if !process_exists(pid) {
+            // Process gone but lock still present means an unclean exit.
+            let _ = fs::remove_file(&lock);
+            return Ok(vec![format!(
+                "daemon process exited (pid {pid}); cleared remaining lock"
+            )]);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!(
+        "daemon (pid {pid}) did not exit within {}s",
+        SHUTDOWN_TIMEOUT.as_secs()
+    ))
+}
+
+/// Delete the local-only files this store owns: the SQLite db and its WAL/SHM
+/// side files, plus the daemon lock if a stale one is still on disk.
+///
+/// Reset never recurses or globs: it unlinks an exact list and refuses paths
+/// that look like they would escape the db's parent directory.
+fn reset_db_files(db_path: &Path) -> Result<Vec<String>, String> {
+    let safe_db_path = validate_reset_path(db_path)?;
+    let lock = lock_path(&safe_db_path);
+    let shm = sibling_path(&safe_db_path, "-shm");
+    let wal = sibling_path(&safe_db_path, "-wal");
+    let mut deleted = Vec::new();
+    for candidate in [&safe_db_path, &shm, &wal, &lock] {
+        match fs::remove_file(candidate) {
+            Ok(()) => deleted.push(format!("deleted: {}", candidate.display())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!("delete {}: {err}", candidate.display()));
+            }
+        }
+    }
+    if deleted.is_empty() {
+        deleted.push("nothing to reset".to_string());
+    } else {
+        deleted.push("reset complete".to_string());
+    }
+    Ok(deleted)
+}
+
+/// Refuse paths that look unsafe to reset. The intent is "this is a regular
+/// file in a normal directory the user owns" — root, mountpoints, and special
+/// files are not appropriate targets for `reset`.
+fn validate_reset_path(db_path: &Path) -> Result<PathBuf, String> {
+    if db_path.as_os_str().is_empty() {
+        return Err("reset: empty db path".to_string());
+    }
+    let parent = db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "reset: refusing to operate on db path with no parent directory ({})",
+                db_path.display()
+            )
+        })?;
+    if db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_none_or(|name| name.is_empty() || name == "." || name == "..")
+    {
+        return Err(format!(
+            "reset: refusing to operate on db path without a file name ({})",
+            db_path.display()
+        ));
+    }
+    let parent_abs = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    if parent_abs.as_os_str().is_empty() || parent_abs == Path::new("/") {
+        return Err(format!(
+            "reset: refusing to operate inside `{}`",
+            parent_abs.display()
+        ));
+    }
+    Ok(db_path.to_path_buf())
+}
+
+fn sibling_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut sibling = db_path.as_os_str().to_owned();
+    sibling.push(suffix);
+    PathBuf::from(sibling)
+}
+
+enum LockState {
+    Missing,
+    Unreadable,
+    Pid(u32),
+}
+
+fn read_lock_pid(lock: &Path) -> Result<LockState, String> {
+    match fs::read_to_string(lock) {
+        Ok(text) => match text.trim().parse::<u32>() {
+            Ok(pid) if pid > 0 => Ok(LockState::Pid(pid)),
+            _ => Ok(LockState::Unreadable),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(LockState::Missing),
+        Err(err) => Err(format!("read daemon lock: {err}")),
+    }
+}
+
+fn process_exists(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn send_termination_signal(pid: u32) -> Result<(), String> {
+    // SAFETY: `kill` is safe to call with any pid; `errno` is read through libc
+    // before any other syscall could overwrite it.
+    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if result == 0 {
+        Ok(())
+    } else {
+        let errno = std::io::Error::last_os_error();
+        if errno.raw_os_error() == Some(libc::ESRCH) {
+            // The process already exited between the lock-file read and the
+            // signal call; treat that as success and let the poll loop notice.
+            Ok(())
+        } else {
+            Err(format!("send SIGTERM to {pid}: {errno}"))
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
