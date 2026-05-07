@@ -153,6 +153,14 @@ pub enum Work {
     Start {
         selection: SyncSelection,
     },
+    /// Start a sync round against exactly one routed peer. Used by the peer
+    /// supervisor so a single slow peer cannot starve the rotation: `Start`
+    /// fans out across every routed peer in one call, while this variant
+    /// drives one peer per call.
+    StartForConnection {
+        connection_id: connection::types::ConnectionId,
+        selection: SyncSelection,
+    },
     DrainIn {
         limit: usize,
     },
@@ -203,6 +211,19 @@ pub fn run(store: &Store, index: &SyncIndex, work: Work) -> Result<Output, Strin
         Work::Start { selection } => {
             prepare_index_for_response(store, index, DEFAULT_INDEX_BATCH)?;
             start(store, index, selected_range(store, selection)?).map(Output::Started)
+        }
+        Work::StartForConnection {
+            connection_id,
+            selection,
+        } => {
+            prepare_index_for_response(store, index, DEFAULT_INDEX_BATCH)?;
+            start_one(
+                store,
+                index,
+                connection_id,
+                selected_range(store, selection)?,
+            )
+            .map(Output::Started)
         }
         Work::DrainIn { limit } => {
             prepare_index_for_response(store, index, DEFAULT_INDEX_BATCH)?;
@@ -374,6 +395,38 @@ fn local_starts_sync_round(
 ) -> Result<bool, String> {
     let remote = connection::schema::remote_endpoint(store, connection_id)?;
     Ok(local_endpoint < remote)
+}
+
+/// Run a sync start command against exactly one routed peer.
+///
+/// The peer supervisor calls this so a single slow peer can fail one tick
+/// without starving the rotation. Unlike `start`, this function does not
+/// apply the leader rule: the supervisor is operating outside the leader
+/// inhibition because its job is to ensure either side periodically pushes
+/// fresh content. The non-leader still suppresses redundant rounds because
+/// the inbound compare events are deterministic in projected state, but it
+/// no longer waits silently for the leader to start every round.
+fn start_one(
+    store: &Store,
+    index: &SyncIndex,
+    connection_id: connection::types::ConnectionId,
+    range: TimestampRange,
+) -> Result<CommandOutput<SyncStartReport>, String> {
+    let local = local_endpoint(store)?;
+    if connection::schema::remote_endpoint(store, connection_id).is_err() {
+        return Ok(CommandOutput::new(SyncStartReport::default()));
+    }
+    let context = StoreSyncContext::for_connection(store, index, local.endpoint, connection_id)?;
+    if context.workspace_ids.is_empty() {
+        return Ok(CommandOutput::new(SyncStartReport::default()));
+    }
+    let output = commands::start_for_connection(&context, connection_id, range)?;
+    Ok(CommandOutput::with_proposed_events(
+        SyncStartReport {
+            sent_events: output.value.sent_events,
+        },
+        output.events,
+    ))
 }
 
 fn drain_in_events(

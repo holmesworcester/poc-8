@@ -28,6 +28,8 @@
 //! - The returned bytes are transport bytes only. They are not stored as the
 //!   semantic fact; the inner request event is.
 
+use std::net::SocketAddr;
+
 use crate::core::crypto;
 use crate::protocol::event_modules::identity::{endpoint, invite};
 use crate::protocol::event_modules::types::EventId;
@@ -61,6 +63,7 @@ pub struct OutboundRequest {
 pub fn create(
     local: endpoint::types::EndpointKeypair,
     invite_link: &str,
+    from_listen_addr: Option<SocketAddr>,
 ) -> Result<CommandOutput<OutboundRequest>, String> {
     // The invite link gives this endpoint local bootstrap authority. Propose
     // that local fact first, then make the request depend on it explicitly.
@@ -83,6 +86,7 @@ pub fn create(
         nonce: nonce32(),
         bootstrap_hash: invite_secret.bootstrap_hash,
         invite_secret_event_id,
+        from_listen_addr,
     };
     let inner = codec::encode(&event);
     let request_id = types::event_id(&inner);
@@ -104,12 +108,18 @@ pub fn create(
 /// Endpoint creation remains a command-produced fact as well: if no local
 /// endpoint exists, the endpoint command's proposed local event is prepended so
 /// admission sees the endpoint material before the request uses it.
+///
+/// `from_listen_addr` is the local steady-state listener advertised inside the
+/// request body. Callers read it from `connection::schema::local_listen_addr`
+/// before invoking this command; passing `None` keeps the request asymmetric
+/// and still bootstraps correctly when no daemon is running.
 pub fn create_with_local(
     context: &impl endpoint::commands::LocalEndpointRead,
     invite_link: &str,
+    from_listen_addr: Option<SocketAddr>,
 ) -> Result<CommandOutput<OutboundRequest>, String> {
     let local = endpoint::commands::local_or_create(context)?;
-    Ok(create(local.value, invite_link)?.prepend_events(local.events))
+    Ok(create(local.value, invite_link, from_listen_addr)?.prepend_events(local.events))
 }
 
 /// Generate the request nonce that separates repeated requests to the same
@@ -131,7 +141,7 @@ mod tests {
         let addr = "127.0.0.1:49000".parse::<SocketAddr>().expect("test addr");
         let invite_link = invite::commands::create(inviter, addr).value;
 
-        let output = create(connector, &invite_link).expect("create request");
+        let output = create(connector, &invite_link, None).expect("create request");
 
         assert_eq!(output.events.len(), 2);
         let invite_secret_event_id = output.events[0].event_id();
@@ -142,5 +152,22 @@ mod tests {
             output.events[1].record().dependencies,
             vec![invite_secret_event_id]
         );
+        assert!(request.from_listen_addr.is_none());
+    }
+
+    #[test]
+    fn create_advertises_local_listen_addr_when_provided() {
+        let connector = endpoint::commands::create_local_keypair().value;
+        let inviter = endpoint::commands::create_local_keypair().value;
+        let invite_addr = "127.0.0.1:49000".parse::<SocketAddr>().expect("test addr");
+        let invite_link = invite::commands::create(inviter, invite_addr).value;
+        let local_listen = "127.0.0.1:50000".parse::<SocketAddr>().expect("listen");
+
+        let output =
+            create(connector, &invite_link, Some(local_listen)).expect("create request");
+        let request =
+            codec::decode(&output.events[1].record().canonical_bytes).expect("decode request");
+
+        assert_eq!(request.from_listen_addr, Some(local_listen));
     }
 }

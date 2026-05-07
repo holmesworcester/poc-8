@@ -31,6 +31,17 @@ pub(crate) const BOOTSTRAP_WORKSPACES: TableName =
     TableName::new("connection.bootstrap_workspaces");
 pub(crate) const BOOTSTRAP_ENDPOINT_WORKSPACES: TableName =
     TableName::new("connection.bootstrap_endpoint_workspaces");
+/// Durable row recording the steady-state listener this endpoint advertises.
+///
+/// The daemon overwrites this row on every startup so connection commands run
+/// from sibling CLI processes can read it and quote the address inside
+/// outbound connection requests. Memory-only storage cannot work here: CLI
+/// processes share the database file with the daemon but each opens its own
+/// in-process memory tables, so a memory row written by the daemon would be
+/// invisible to a sibling `accept`/`connect` invocation. Stale rows are
+/// possible after a crash and a config change; the next daemon launch
+/// overwrites them.
+pub(crate) const LOCAL_LISTEN_ADDR: TableName = TableName::new("connection.local_listen_addr");
 
 pub const SCHEMAS: &[Schema] = &[
     Schema::durable_row_table("connection.connection_events.v1", CONNECTION_EVENTS),
@@ -45,6 +56,7 @@ pub const SCHEMAS: &[Schema] = &[
         "connection.connection_scoped_events.v1",
         CONNECTION_SCOPED_EVENTS,
     ),
+    Schema::durable_row_table("connection.local_listen_addr.v1", LOCAL_LISTEN_ADDR),
 ];
 
 pub(crate) fn connection_event_row(event_id: EventId, bytes: Vec<u8>) -> TableRow {
@@ -100,6 +112,31 @@ pub(crate) fn connection_scoped_event_row(event_id: EventId, canonical_bytes: Ve
         key: event_id.to_vec(),
         value: canonical_bytes,
     }
+}
+
+/// Single-row key used by `LOCAL_LISTEN_ADDR`.
+pub(crate) const LOCAL_LISTEN_ADDR_KEY: &[u8] = b"";
+
+pub(crate) fn local_listen_addr_row(addr: SocketAddr) -> TableRow {
+    TableRow {
+        table: LOCAL_LISTEN_ADDR,
+        key: LOCAL_LISTEN_ADDR_KEY.to_vec(),
+        value: addr.to_string().into_bytes(),
+    }
+}
+
+pub(crate) fn local_listen_addr(store: &Store) -> Result<Option<SocketAddr>, String> {
+    let Some(value) = store
+        .table_row(LOCAL_LISTEN_ADDR, LOCAL_LISTEN_ADDR_KEY)
+        .map_err(|err| format!("load local listen addr: {err}"))?
+    else {
+        return Ok(None);
+    };
+    let text = String::from_utf8(value)
+        .map_err(|err| format!("local listen addr is not utf8: {err}"))?;
+    text.parse::<SocketAddr>()
+        .map(Some)
+        .map_err(|err| format!("local listen addr is invalid: {err}"))
 }
 
 pub(crate) fn remote_endpoint(

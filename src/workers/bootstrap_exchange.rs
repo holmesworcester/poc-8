@@ -18,6 +18,7 @@
 
 use std::net::SocketAddr;
 
+use crate::core::daemon::{StepContext, Worker};
 use crate::core::network_queues::{self, InboundNetworkRow, NetworkTarget, OutboundNetworkRow};
 use crate::core::store::Store;
 use crate::core::tcp;
@@ -28,7 +29,7 @@ use crate::protocol::event_modules::types::{event_id, EventId, EventRecord};
 use crate::workers::common::event_pipeline::{
     self as pipeline, DrainUntilIdle, EventRegistry, ProjectionOutput,
 };
-use crate::workers::{event_admission, schema as worker_schema};
+use crate::workers::{event_admission, schema as worker_schema, DaemonWorkerContext};
 
 const READY_BATCH: usize = 4096;
 
@@ -85,8 +86,10 @@ where
     R: EventRegistry,
 {
     let parsed_invite = invite::commands::parse(&invite_link)?;
-    let output = connection_request::commands::create_with_local(store, &invite_link)
-        .map_err(|err| format!("create connection request: {err}"))?;
+    let from_listen_addr = schema::local_listen_addr(store)?;
+    let output =
+        connection_request::commands::create_with_local(store, &invite_link, from_listen_addr)
+            .map_err(|err| format!("create connection request: {err}"))?;
     let (request, _) = pipeline::run(store, registry, output)
         .map_err(|err| format!("record connection request: {err}"))?;
     store
@@ -184,10 +187,79 @@ where
     let mut frames = Vec::new();
     for inner in inners {
         if connection_request::codec::is_request(&inner) {
+            // After admission, the connection_request is in `event_modules.events`
+            // and its dependency on the local invite-secret has applied. The
+            // worker is the right place to write a transport target from the
+            // requester's advertised steady-state listener: that lets sync dial
+            // back to the requester's daemon after the bootstrap stream closes.
+            remember_advertised_listener(store, &inner)?;
             frames.extend(bootstrap_identity_frames_for_request(store, &inner)?);
         }
     }
     Ok(network_queues::outbound_rows(target, frames))
+}
+
+/// Persist a transport target for the requester's advertised listener.
+///
+/// Called per-frame after admission of a received connection_request. The
+/// helper:
+///
+/// - Decodes the request to read its `from_listen_addr`. The field is
+///   optional: a one-shot CLI requester sets it to `None`, so this helper
+///   leaves routes alone in that case.
+/// - Skips when this endpoint already has a routed connection to the same
+///   remote endpoint. The receive side runs without knowing which connection
+///   the local side already initiated; piling on a second route per peer turns
+///   one sync round into N redundant rounds for the same workspace and shows
+///   up in tests as broken convergence even though the messages cross the
+///   wire. The "first route wins" rule keeps fan-out per peer at one TT.
+/// - Otherwise writes a transport target keyed by the connection id derived
+///   from the request id and this local endpoint, with the remote-advertised
+///   socket address as the routed destination.
+fn remember_advertised_listener(store: &Store, request_bytes: &[u8]) -> Result<(), String> {
+    let request = connection_request::codec::decode(request_bytes)?;
+    let Some(addr) = request.from_listen_addr else {
+        return Ok(());
+    };
+    let local = local_endpoint(store)?;
+    let request_id = event_id(request_bytes);
+    let connection_id = types::connection_id(&request_id, &local.endpoint);
+    if endpoint_has_routed_connection(store, &request.from_endpoint)? {
+        return Ok(());
+    }
+    let row = schema::transport_target_row(connection_id, addr);
+    store
+        .insert_table_rows(vec![row])
+        .map(|_| ())
+        .map_err(|err| format!("remember received connection route: {err}"))
+}
+
+/// Check whether any existing routed connection's remote is `endpoint`.
+///
+/// `connection.transport_targets` rows are keyed by `connection_id`, so the
+/// only way to ask "do we have a routed connection to this endpoint?" is to
+/// scan the table and resolve each connection's remote endpoint. Routed peer
+/// counts are bounded by the local daemon's known peer set, so the scan is
+/// cheap in practice.
+fn endpoint_has_routed_connection(
+    store: &Store,
+    endpoint: &endpoint::types::EndpointId,
+) -> Result<bool, String> {
+    for (key, _) in store
+        .table_rows(schema::TRANSPORT_TARGETS)
+        .map_err(|err| format!("load transport targets: {err}"))?
+    {
+        let connection_id = types::connection_id_from_bytes(&key)?;
+        match schema::remote_endpoint(store, connection_id) {
+            Ok(remote) => {
+                if remote == *endpoint {
+                    return Ok(true);
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    Ok(false)
 }
 
 fn canonical_rows(output: &ProjectionOutput) -> Result<Vec<Vec<u8>>, String> {
@@ -274,6 +346,44 @@ fn workspace_identity_event_bytes(
         out.push(bytes);
     }
     Ok(out)
+}
+
+/// Daemon worker that serves bootstrap and inbound transit on the long-lived
+/// listener. Each tick accepts at most one available stream; the inbound
+/// callback runs the same `process_inbound` pipeline used by the one-shot
+/// `Serve` variant so bootstrap responses go out on the same stream the
+/// requester opened. Steady-state inbound frames return an empty reply, the
+/// stream's write side shuts, and reads continue until the peer closes.
+pub(crate) fn daemon_worker<C>() -> Worker<C>
+where
+    C: DaemonWorkerContext,
+{
+    Worker {
+        name: "bootstrap_serve",
+        run: daemon_step::<C>,
+    }
+}
+
+fn daemon_step<C>(ctx: &mut StepContext<'_, C>) -> Result<(), String>
+where
+    C: DaemonWorkerContext,
+{
+    let app = &*ctx.app;
+    let accept = ctx.listener.accept_exchange_available(
+        app.store(),
+        ExchangeState::default(),
+        |inbound, state| process_inbound(app.store(), app, inbound, state),
+        |rows, state| {
+            state.sent_events += rows.len();
+            Ok(())
+        },
+    )?;
+    ctx.report
+        .add("accepted_connections", accept.accepted_connections);
+    ctx.report.add("received_events", accept.value.received_events);
+    ctx.report
+        .add("sent_bootstrap_events", accept.value.sent_events);
+    Ok(())
 }
 
 fn local_endpoint(store: &Store) -> Result<endpoint::types::EndpointKeypair, String> {

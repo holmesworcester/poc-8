@@ -50,11 +50,9 @@ where
     C: DaemonWorkerContext,
 {
     let app = &*ctx.app;
-    let accept = ctx.listener.accept_available(app.store())?;
-    ctx.report
-        .add("accepted_connections", accept.accepted_connections);
-    ctx.report
-        .add("received_frames", accept.value.received_frames);
+    // The bootstrap_serve worker owns the accept side. transit_in is the
+    // drain step that consumes already-staged inbound network rows the accept
+    // handler enqueued through `process_inbound`.
     let report = run(
         app.store(),
         app,

@@ -32,6 +32,10 @@ pub struct Context {
     pub db_path: std::path::PathBuf,
     pub store: Store,
     pub protocol: Protocol,
+    /// Process-local rotation cursor for the daemon's peer supervisor. Lives
+    /// alongside the rest of the warm worker state because it is restart-fresh
+    /// and naturally per-process, not per-store.
+    pub peer_supervisor_cursor: crate::workers::peer_supervisor::PeerCursor,
 }
 
 impl Context {
@@ -40,6 +44,7 @@ impl Context {
         Ok(Self {
             store: Protocol::open_store(&db_path).map_err(|err| format!("open store: {err}"))?,
             protocol: Protocol::new(),
+            peer_supervisor_cursor: crate::workers::peer_supervisor::PeerCursor::new(),
             db_path,
         })
     }
@@ -87,6 +92,10 @@ impl DaemonWorkerContext for Context {
 
     fn sync_index(&self) -> &event_modules::sync::SyncIndex {
         self.protocol.sync_index()
+    }
+
+    fn peer_supervisor_cursor(&self) -> &crate::workers::peer_supervisor::PeerCursor {
+        &self.peer_supervisor_cursor
     }
 }
 

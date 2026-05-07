@@ -5,6 +5,7 @@
 //! scheduling uses the core daemon runner and the `src/workers` catalog.
 
 use super::connection_request;
+use super::schema;
 use crate::core::cli::{CliArgs, CliCommand, CliOutput};
 use crate::protocol::cli::Context;
 use crate::protocol::event_modules::worker;
@@ -23,9 +24,11 @@ pub fn commands() -> Vec<CliCommand<Context>> {
 
 fn run_connect_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutput, String> {
     args.require_len(1, CONNECT_USAGE)?;
+    let from_listen_addr = schema::local_listen_addr(&context.store)?;
     let output = connection_request::commands::create_with_local(
         &context.store,
         args.get(0).expect("length checked"),
+        from_listen_addr,
     )?;
     let (request, _) = worker::run(&context.store, &context.protocol, output)
         .map_err(|err| format!("record connection request: {err}"))?;

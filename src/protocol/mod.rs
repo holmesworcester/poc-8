@@ -116,6 +116,22 @@ impl DaemonProtocol for Protocol {
     fn daemon_workers() -> Vec<Worker<Self::Context>> {
         crate::workers::daemon_workers()
     }
+
+    fn after_listener_bound(
+        context: &mut Self::Context,
+        local_addr: std::net::SocketAddr,
+    ) -> Result<(), String> {
+        // Memory-only advertisement so connection commands can quote the daemon
+        // listener inside outbound requests. Restart clears the row, so the
+        // next launch rewrites it for the new bound address.
+        context
+            .store
+            .insert_table_rows(vec![
+                event_modules::connection::schema::local_listen_addr_row(local_addr),
+            ])
+            .map(|_| ())
+            .map_err(|err| format!("advertise daemon listen addr: {err}"))
+    }
 }
 
 // Core app integration: the binary shell asks the selected protocol for its

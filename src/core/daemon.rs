@@ -40,6 +40,13 @@ pub trait DaemonProtocol {
 
     fn daemon_db_path(context: &Self::Context) -> &Path;
     fn daemon_workers() -> Vec<Worker<Self::Context>>;
+    /// Called once after the listener is bound but before any worker step
+    /// runs. The protocol may use this hook to advertise the bound address as
+    /// memory-only state. The default implementation does nothing so most
+    /// protocols can ignore the hook.
+    fn after_listener_bound(_context: &mut Self::Context, _local_addr: SocketAddr) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,8 +106,16 @@ where
 {
     let options = StartOptions::parse(args)?;
     let _lock = DaemonLock::acquire(P::daemon_db_path(context))?;
-    let report = run_after_bind(
+    let listener = tcp::listen(options.listen)?;
+    let local_addr = listener.local_addr();
+    // Advertise the bound address before printing the visibility line so a
+    // sibling CLI process that synchronizes on `listening: <addr>` can rely
+    // on the advertised row being already committed.
+    P::after_listener_bound(context, local_addr)?;
+    print_line_now(&format!("listening: {local_addr}"))?;
+    let report = run_with_listener(
         context,
+        listener,
         &P::daemon_workers(),
         DaemonOptions {
             listen: options.listen,
@@ -108,7 +123,6 @@ where
             idle: Duration::from_millis(options.tick_ms),
             work_limit: DEFAULT_WORK_LIMIT,
         },
-        |addr| print_line_now(&format!("listening: {addr}")),
     )?;
     Ok(CliOutput::lines(report.lines()))
 }
@@ -129,6 +143,15 @@ pub fn run_after_bind<C>(
 ) -> Result<DaemonReport, String> {
     let listener = tcp::listen(options.listen)?;
     after_bind(listener.local_addr())?;
+    run_with_listener(context, listener, workers, options)
+}
+
+fn run_with_listener<C>(
+    context: &mut C,
+    listener: tcp::Listener,
+    workers: &[Worker<C>],
+    options: DaemonOptions,
+) -> Result<DaemonReport, String> {
     let started = Instant::now();
     let mut report = DaemonReport {
         local_addr: Some(listener.local_addr()),
