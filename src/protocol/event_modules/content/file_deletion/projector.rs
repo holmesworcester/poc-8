@@ -36,13 +36,16 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
         .context
         .dependency(&envelope.signer_endpoint_shared_id)
         .ok_or_else(|| "file deletion signer endpoint_shared dependency is missing".to_string())?;
-    let signer_envelope = signed::codec::decode(&signer.canonical_bytes)
-        .map_err(|_| "file deletion signer dependency is not a signed endpoint_shared".to_string())?;
+    let signer_envelope = signed::codec::decode(&signer.canonical_bytes).map_err(|_| {
+        "file deletion signer dependency is not a signed endpoint_shared".to_string()
+    })?;
     if signer_envelope.inner_type != endpoint_shared::codec::TYPE_ENDPOINT_SHARED {
         return Err("file deletion signer dependency is not a signed endpoint_shared".to_string());
     }
-    let signer_endpoint_shared = endpoint_shared::codec::decode(&signer_envelope.payload)
-        .map_err(|_| "file deletion signer dependency is not a signed endpoint_shared".to_string())?;
+    let signer_endpoint_shared =
+        endpoint_shared::codec::decode(&signer_envelope.payload).map_err(|_| {
+            "file deletion signer dependency is not a signed endpoint_shared".to_string()
+        })?;
     if signer_endpoint_shared.workspace_id != deletion.workspace_id {
         return Err(
             "file deletion signer endpoint_shared workspace does not match deletion".to_string(),

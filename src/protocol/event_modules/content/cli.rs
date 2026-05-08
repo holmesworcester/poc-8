@@ -22,9 +22,7 @@ use crate::core::crypto::XCHACHA20_POLY1305_TAG_BYTES;
 use crate::core::store::Store;
 use crate::protocol::cli::Context;
 use crate::protocol::event_modules::content::{file, file_slice, message};
-use crate::protocol::event_modules::identity::{
-    endpoint, endpoint_shared, user, workspace,
-};
+use crate::protocol::event_modules::identity::{endpoint, endpoint_shared, user, workspace};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker::{self, CommandOutput, ProposedEvent};
 
@@ -386,8 +384,7 @@ fn run_view_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
         .table_row(workspace::schema::WORKSPACES, &workspace_id)
         .map_err(|err| format!("load workspace: {err}"))?
         .ok_or_else(|| "workspace row is missing".to_string())?;
-    let workspace_row =
-        workspace::schema::decode_workspace_row(&workspace_id, &workspace_value)?;
+    let workspace_row = workspace::schema::decode_workspace_row(&workspace_id, &workspace_value)?;
 
     let users = workspace_user_view(&context.store, workspace_id, local.endpoint)?;
     let messages = message::cli::list_for_display(&context.store, workspace_id, 0)?;
@@ -404,7 +401,10 @@ fn run_view_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
     let now_ms = current_unix_ms();
     let mut lines = Vec::new();
     lines.push("IDENTITY:".to_string());
-    lines.push(format!("  endpoint_id: {}", message::cli::hex_id(local.endpoint)));
+    lines.push(format!(
+        "  endpoint_id: {}",
+        message::cli::hex_id(local.endpoint)
+    ));
     lines.push(format!(
         "  signing_public_key: {}",
         message::cli::hex_id(local.signing_public_key)
@@ -556,8 +556,7 @@ fn reactions_with_authors(
     // cleartext rows; the visible set must match the `messages` listing.
     let rows = message::cli::visible_reaction_rows(store, workspace_id)?;
     let mut grouped: BTreeMap<EventId, Vec<(String, EventId)>> = BTreeMap::new();
-    let mut seen: BTreeMap<EventId, std::collections::HashSet<(EventId, String)>> =
-        BTreeMap::new();
+    let mut seen: BTreeMap<EventId, std::collections::HashSet<(EventId, String)>> = BTreeMap::new();
     for row in rows {
         let entry = seen.entry(row.target_message_id).or_default();
         let key = (row.author_user_id, row.emoji.clone());
@@ -621,11 +620,7 @@ fn format_file_display(
     slices_received: u32,
 ) -> String {
     let complete = total_slices > 0 && slices_received >= total_slices;
-    let status = if complete {
-        "\u{2714}"
-    } else {
-        "\u{23f3}"
-    };
+    let status = if complete { "\u{2714}" } else { "\u{23f3}" };
     let size = format_byte_size(blob_bytes);
     if !complete && total_slices > 0 {
         let pct = (slices_received as f64 / total_slices as f64 * 100.0) as u32;

@@ -17,8 +17,7 @@ use crate::protocol::event_modules::worker::CommandOutput;
 
 use super::codec;
 use super::types::{
-    FileDescriptorCiphertext, FileDescriptorPlaintext, FileEvent,
-    FILE_DESCRIPTOR_CIPHERTEXT_BYTES,
+    FileDescriptorCiphertext, FileDescriptorPlaintext, FileEvent, FILE_DESCRIPTOR_CIPHERTEXT_BYTES,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,13 +155,9 @@ mod tests {
             .expect("decode signed");
         let event = codec::decode(&envelope.payload).expect("decode event");
         let aad = codec::descriptor_associated_data(&event, input.signer_endpoint_shared_id);
-        let plaintext = codec::open_descriptor_slot(
-            &input.key_secret,
-            &event.nonce,
-            &aad,
-            &event.ciphertext,
-        )
-        .expect("open slot");
+        let plaintext =
+            codec::open_descriptor_slot(&input.key_secret, &event.nonce, &aad, &event.ciphertext)
+                .expect("open slot");
         assert_eq!(plaintext.filename, "secret-name.bin");
         assert_eq!(plaintext.mime_type, "application/x-secret");
     }

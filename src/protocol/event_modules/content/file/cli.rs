@@ -84,8 +84,8 @@ impl FileSummary {
         let row = if self.is_complete() {
             format!("  {}. {}  {} ({})", self.index, status, self.filename, size)
         } else if self.total_slices > 0 {
-            let pct = (f64::from(self.slices_received) / f64::from(self.total_slices) * 100.0)
-                as u32;
+            let pct =
+                (f64::from(self.slices_received) / f64::from(self.total_slices) * 100.0) as u32;
             format!(
                 "  {}. {}  {} ({}, {}%)",
                 self.index, status, self.filename, size, pct
@@ -143,10 +143,7 @@ fn run_files_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutp
     let summaries = list_summaries(&context.store, workspace_id, limit)?;
     // poc-7 prints `FILES (N total):` followed by a blank line, then one row
     // per file.
-    let mut lines = vec![
-        format!("FILES ({} total):", summaries.len()),
-        String::new(),
-    ];
+    let mut lines = vec![format!("FILES ({} total):", summaries.len()), String::new()];
     for summary in &summaries {
         lines.extend(summary.lines());
     }
@@ -266,11 +263,7 @@ pub(crate) fn visible_file_rows(
     let sealed_rows = schema::list_sealed_for_workspace(store, workspace_id)?;
     let mut out = Vec::with_capacity(sealed_rows.len());
     for sealed in sealed_rows {
-        if message::cli::is_deleted_by_author(
-            store,
-            &sealed.message_id,
-            &sealed.author_user_id,
-        )? {
+        if message::cli::is_deleted_by_author(store, &sealed.message_id, &sealed.author_user_id)? {
             continue;
         }
         let Some(row) = open_sealed_file_row(store, &sealed)? else {
@@ -310,13 +303,9 @@ pub(crate) fn open_sealed_file_row(
         ciphertext: sealed.ciphertext,
     };
     let aad = codec::descriptor_associated_data(&event, sealed.signer_endpoint_shared_id);
-    let plaintext = codec::open_descriptor_slot(
-        &secret_bytes,
-        &sealed.nonce,
-        &aad,
-        &sealed.ciphertext,
-    )
-    .map_err(|err| format!("decode file descriptor: {err}"))?;
+    let plaintext =
+        codec::open_descriptor_slot(&secret_bytes, &sealed.nonce, &aad, &sealed.ciphertext)
+            .map_err(|err| format!("decode file descriptor: {err}"))?;
     Ok(Some(FileRow {
         workspace_id: sealed.workspace_id,
         file_event_id: sealed.file_event_id,

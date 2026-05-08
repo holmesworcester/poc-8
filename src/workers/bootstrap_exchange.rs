@@ -9,8 +9,9 @@
 //!
 //! - send unscoped invite connection requests for the `connect` CLI path
 //! - send one invite-key batch for identity invite acceptance
-//! - accept daemon or finite-listener streams and admit their frames
-//! - reply to an invite-key batch only when this store already owns the invite
+//! - accept finite-listener streams and admit their frames
+//! - reply to an invite-key batch only on the legacy finite-listener path when
+//!   this store already owns the invite
 //!   event named by the envelope, using one batch for the current workspace
 //!   identity bootstrap set excluding the acceptor's just-submitted events
 //!
@@ -33,7 +34,6 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 
-use crate::core::daemon::{StepContext, Worker};
 use crate::core::network_queues::{self, InboundNetworkRow, NetworkTarget, OutboundNetworkRow};
 use crate::core::store::Store;
 use crate::core::tcp;
@@ -44,7 +44,7 @@ use crate::protocol::event_modules::types::{event_id, EventId, EventRecord};
 use crate::workers::pipeline_helpers::event_pipeline::{
     self as pipeline, DrainUntilIdle, EventRegistry, ProjectionOutput,
 };
-use crate::workers::{event_admission, schema as worker_schema, DaemonWorkerContext};
+use crate::workers::{event_admission, schema as worker_schema};
 
 const READY_BATCH: usize = 4096;
 
@@ -384,8 +384,7 @@ fn canonical_rows(output: &ProjectionOutput) -> Result<Vec<DecodedCanonical>, St
         .iter()
         .filter(|row| row.table == worker_schema::CANONICAL_IN)
         .map(|row| {
-            let (canonical_bytes, _, provenance) =
-                worker_schema::decode_canonical_in(&row.value)?;
+            let (canonical_bytes, _, provenance) = worker_schema::decode_canonical_in(&row.value)?;
             Ok(DecodedCanonical {
                 provenance,
                 canonical_bytes: Some(canonical_bytes),
@@ -531,44 +530,6 @@ fn workspace_identity_bootstrap_event_bytes(
         }
     }
     Ok(out)
-}
-
-/// Daemon worker that serves bootstrap and inbound transit on the long-lived
-/// listener. Each tick accepts at most one available stream; the inbound
-/// callback runs the same `process_inbound` pipeline used by the one-shot
-/// `Serve` variant so bootstrap responses go out on the same stream the
-/// requester opened. Steady-state inbound frames return an empty reply, the
-/// stream's write side shuts, and reads continue until the peer closes.
-pub(crate) fn daemon_worker<C>() -> Worker<C>
-where
-    C: DaemonWorkerContext,
-{
-    Worker {
-        name: "bootstrap_serve",
-        run: daemon_step::<C>,
-    }
-}
-
-fn daemon_step<C>(ctx: &mut StepContext<'_, C>) -> Result<(), String>
-where
-    C: DaemonWorkerContext,
-{
-    let app = &*ctx.app;
-    let accept = ctx.listener.accept_exchange_available(
-        app.store(),
-        ExchangeState::default(),
-        |inbound, state| process_inbound(app.store(), app, inbound, state),
-        |rows, state| {
-            state.sent_events += rows.len();
-            Ok(())
-        },
-    )?;
-    ctx.report
-        .add("accepted_connections", accept.accepted_connections);
-    ctx.report.add("received_events", accept.value.received_events);
-    ctx.report
-        .add("sent_bootstrap_events", accept.value.sent_events);
-    Ok(())
 }
 
 fn local_endpoint(store: &Store) -> Result<endpoint::types::EndpointKeypair, String> {

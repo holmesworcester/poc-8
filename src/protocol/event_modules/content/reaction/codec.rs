@@ -20,15 +20,8 @@ pub const TYPE_REACTION: u8 = 7;
 pub const TYPE_SIGNED_REACTION: u8 = 8;
 pub const REACTION_ENCRYPTION_PURPOSE: &[u8] = b"topo reaction emoji v2";
 /// Reaction canonical wire size after the deterministic-leaf-coord redesign.
-pub const REACTION_WIRE_SIZE: usize = 1
-    + 32
-    + 8
-    + 32
-    + 32
-    + 32
-    + 32
-    + XCHACHA20_POLY1305_NONCE_BYTES
-    + REACTION_CIPHERTEXT_BYTES;
+pub const REACTION_WIRE_SIZE: usize =
+    1 + 32 + 8 + 32 + 32 + 32 + 32 + XCHACHA20_POLY1305_NONCE_BYTES + REACTION_CIPHERTEXT_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReactionMetadata {

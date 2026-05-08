@@ -125,7 +125,10 @@ fn cli_stop_terminates_running_daemon_and_releases_lock() {
     let pid = daemon.pid();
 
     let lock = lock_path(&db);
-    assert!(Path::new(&lock).exists(), "lock should exist while daemon runs");
+    assert!(
+        Path::new(&lock).exists(),
+        "lock should exist while daemon runs"
+    );
 
     let stop_out = assert_success(topo(&["--db", &db, "stop"]));
     assert!(
@@ -148,7 +151,10 @@ fn cli_stop_terminates_running_daemon_and_releases_lock() {
     // A subsequent `start` must succeed without lock contention.
     let next_port = free_port();
     let again = start_daemon(&db, next_port);
-    assert!(Path::new(&lock).exists(), "second daemon should re-acquire lock");
+    assert!(
+        Path::new(&lock).exists(),
+        "second daemon should re-acquire lock"
+    );
     drop(again);
 }
 
@@ -208,10 +214,7 @@ fn cli_reset_deletes_db_and_lock_files() {
 
     for suffix in ["", "-wal", "-shm", ".daemon.lock"] {
         let path = format!("{db}{suffix}");
-        assert!(
-            !Path::new(&path).exists(),
-            "reset should delete {path}"
-        );
+        assert!(!Path::new(&path).exists(), "reset should delete {path}");
     }
 
     // A fresh `start` succeeds against the (recreated) empty db.
@@ -244,9 +247,6 @@ fn cli_reset_stops_running_daemon_first() {
     );
     for suffix in ["", "-wal", "-shm", ".daemon.lock"] {
         let path = format!("{db}{suffix}");
-        assert!(
-            !Path::new(&path).exists(),
-            "reset should delete {path}"
-        );
+        assert!(!Path::new(&path).exists(), "reset should delete {path}");
     }
 }

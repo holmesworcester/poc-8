@@ -25,9 +25,9 @@ use crate::protocol::event_modules::content::{
 };
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::types::EventId;
+use crate::workers::encryption as encryption_worker;
 use crate::workers::pipeline_helpers::event_pipeline::EventRegistry;
 use crate::workers::pipeline_helpers::purging;
-use crate::workers::encryption as encryption_worker;
 use crate::workers::DaemonWorkerContext;
 
 use message_deletion::schema as message_deletion_schema;
@@ -115,14 +115,14 @@ fn drain<R: EventRegistry>(
         let output = encryption_worker::run(
             store,
             registry,
-            encryption_worker::Work::RetireDeletedMessageLeaf {
+            encryption_worker::Work::RetireDeletedEventLeaf {
                 workspace_id: job.workspace_id,
                 removal_frontier_id: job.removal_frontier_id,
                 created_at_ms: job.created_at_ms,
                 event_id_in_minute: job.event_id_in_minute,
             },
         )?;
-        let encryption_worker::Output::RetiredDeletedMessageLeaf(retired) = output else {
+        let encryption_worker::Output::RetiredDeletedEventLeaf(retired) = output else {
             return Err("unexpected encryption worker output retiring deleted leaf".to_string());
         };
         report.event_bytes_purged += retired.purged_event_bytes;
@@ -133,10 +133,7 @@ fn drain<R: EventRegistry>(
     Ok(report)
 }
 
-fn drain_in_tx(
-    store: &Store,
-    limit: usize,
-) -> Result<(PurgeReport, Vec<RetireLeafJob>), String> {
+fn drain_in_tx(store: &Store, limit: usize) -> Result<(PurgeReport, Vec<RetireLeafJob>), String> {
     let entries = event_schema::event_index_entries_in_timestamp_range(store, 0, u64::MAX)
         .map_err(|err| format!("load event index: {err}"))?;
     let mut report = PurgeReport::default();
@@ -340,16 +337,14 @@ fn purge_file_slice_for_deleted_file(
 ) -> Result<(), String> {
     let envelope = file_slice::codec::decode_signed(bytes)?;
     let (slice, file_event_id) = file_slice::codec::decode(&envelope.payload)?;
-    let descriptor_purged =
-        event_schema::event_bytes(store, &file_event_id)
-            .map_err(|err| format!("load descriptor bytes: {err}"))?
-            .is_none();
+    let descriptor_purged = event_schema::event_bytes(store, &file_event_id)
+        .map_err(|err| format!("load descriptor bytes: {err}"))?
+        .is_none();
     let message_id_tombstoned = if descriptor_purged {
         // The descriptor was already purged. We rely on the file_id index
         // also being gone: confirm by looking up by file_id; if the
         // descriptor row is still present we honor it as live.
-        file::schema::file_event_id_for_file_id(store, slice.workspace_id, slice.file_id)?
-            .is_none()
+        file::schema::file_event_id_for_file_id(store, slice.workspace_id, slice.file_id)?.is_none()
     } else {
         // Descriptor still exists. Look up its message_id and check whether
         // that message has a tombstone; if yes, this slice should also be

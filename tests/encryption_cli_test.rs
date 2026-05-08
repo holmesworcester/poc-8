@@ -609,7 +609,6 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-
 fn create_workspace(db: &str, name: &str, username: &str, device_name: &str) -> String {
     let out = assert_success(topo(&[
         "--db",

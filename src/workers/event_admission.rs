@@ -14,7 +14,9 @@
 
 use crate::core::daemon::{StepContext, Worker};
 use crate::core::store::Store;
-use crate::workers::pipeline_helpers::event_pipeline::{self as pipeline, AdmitReport, EventRegistry};
+use crate::workers::pipeline_helpers::event_pipeline::{
+    self as pipeline, AdmitReport, EventRegistry,
+};
 use crate::workers::DaemonWorkerContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -160,8 +160,7 @@ mod tests {
         let bytes_none = encode(&request);
         assert_eq!(decode(&bytes_none).expect("decode"), request);
 
-        request.from_listen_addr =
-            Some("127.0.0.1:55555".parse().expect("ipv4 socket addr"));
+        request.from_listen_addr = Some("127.0.0.1:55555".parse().expect("ipv4 socket addr"));
         let bytes_v4 = encode(&request);
         assert_eq!(decode(&bytes_v4).expect("decode"), request);
         assert_eq!(bytes_none.len(), bytes_v4.len());

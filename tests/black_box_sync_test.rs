@@ -304,12 +304,7 @@ fn invite_link_from_output(output: &str) -> String {
         .to_string()
 }
 
-fn accept_with_identity_retry(
-    db: &str,
-    invite: &str,
-    username: &str,
-    device_name: &str,
-) -> String {
+fn accept_with_identity_retry(db: &str, invite: &str, username: &str, device_name: &str) -> String {
     let mut last = String::new();
     for _ in 0..200 {
         let output = topo(&[
@@ -615,11 +610,7 @@ impl Drop for RunningDaemon {
         if let Some(stderr) = self.stderr.take() {
             if let Ok(text) = stderr.join() {
                 if !text.trim().is_empty() {
-                    eprintln!(
-                        "[daemon-stderr label={}] {}",
-                        self.label,
-                        text.trim_end()
-                    );
+                    eprintln!("[daemon-stderr label={}] {}", self.label, text.trim_end());
                 }
             }
         }

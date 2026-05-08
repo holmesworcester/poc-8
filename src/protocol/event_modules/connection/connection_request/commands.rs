@@ -163,8 +163,7 @@ mod tests {
         let invite_link = invite::commands::create(inviter, invite_addr).value;
         let local_listen = "127.0.0.1:50000".parse::<SocketAddr>().expect("listen");
 
-        let output =
-            create(connector, &invite_link, Some(local_listen)).expect("create request");
+        let output = create(connector, &invite_link, Some(local_listen)).expect("create request");
         let request =
             codec::decode(&output.events[1].record().canonical_bytes).expect("decode request");
 

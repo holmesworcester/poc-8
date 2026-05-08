@@ -11,8 +11,8 @@
 //! decryption can run at read time without a separate blocking system.
 
 use crate::core::crypto::{
-    self, Ed25519PrivateKey, XChaCha20Poly1305Key, XChaCha20Poly1305Nonce,
-    ED25519_SIGNATURE_BYTES, XCHACHA20_POLY1305_NONCE_BYTES,
+    self, Ed25519PrivateKey, XChaCha20Poly1305Key, XChaCha20Poly1305Nonce, ED25519_SIGNATURE_BYTES,
+    XCHACHA20_POLY1305_NONCE_BYTES,
 };
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
 use crate::protocol::wire::{Reader, Writer};
@@ -218,7 +218,10 @@ fn validate(event: &FileEvent) -> Result<(), String> {
     validate_id("file author_user_id", &event.author_user_id)?;
     validate_id("file file_id", &event.file_id)?;
     validate_id("file removal_frontier_id", &event.removal_frontier_id)?;
-    validate_id("file local_history_node_secret_id", &event.local_history_node_secret_id)?;
+    validate_id(
+        "file local_history_node_secret_id",
+        &event.local_history_node_secret_id,
+    )?;
     if event.blob_bytes == 0 {
         if event.total_slices != 0 {
             return Err("zero-byte file must declare zero slices".to_string());
