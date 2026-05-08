@@ -91,7 +91,9 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
     if leaf.range_start != expected_minute || leaf.range_width != message::types::LEAF_RANGE_WIDTH {
         return Err("file leaf coordinate does not match file minute".to_string());
     }
-    if leaf.event_id_in_minute != Some(file.event_id_in_minute_derived()) {
+    if leaf.bit_depth != leaf_history_node::types::TRIE_LEAF_BIT_DEPTH
+        || leaf.event_id_prefix != file.event_id_in_minute_derived()
+    {
         return Err(
             "file leaf event_id_in_minute does not match deterministic file coord".to_string(),
         );
@@ -226,17 +228,21 @@ mod tests {
             &frontier_id,
             created_at_ms,
         );
-        let leaf_output = leaf_module::commands::derive(leaf_module::commands::DeriveHistoryNodeSecret {
-            workspace_id,
-            removal_frontier_id: frontier_id,
-            source_secret_id: [205; 32],
-            source_secret: [206; 32],
-            range_start: message::types::unix_minute_for(created_at_ms),
-            range_width: message::types::LEAF_RANGE_WIDTH,
-            event_id_in_minute: Some(event_id_in_minute),
-            tombstone_node_id: None,
-        })
-        .expect("derive leaf");
+        let leaf_output =
+            leaf_module::commands::derive_trie_split(leaf_module::commands::DeriveTrieSplit {
+                workspace_id,
+                removal_frontier_id: frontier_id,
+                parent_secret_id: [205; 32],
+                parent_secret: [206; 32],
+                range_start: message::types::unix_minute_for(created_at_ms),
+                parent_bit_depth: 0,
+                parent_event_id_prefix: [0; 32],
+                child_side: leaf_module::types::bit_at(&event_id_in_minute, 0),
+                child_bit_depth: leaf_module::types::TRIE_LEAF_BIT_DEPTH,
+                child_event_id_prefix: event_id_in_minute,
+                tombstone_node_id: None,
+            })
+            .expect("derive leaf");
         let leaf_id = leaf_output.value.local_history_node_secret_id;
         let leaf_record = leaf_output.events[0].record().clone();
         let leaf_node_secret = leaf_output.value.event.node_secret;
@@ -362,13 +368,9 @@ mod tests {
             },
             row.signer_endpoint_shared_id,
         );
-        let plaintext = codec::open_descriptor_slot(
-            &built.leaf_node_secret,
-            &row.nonce,
-            &aad,
-            &row.ciphertext,
-        )
-        .expect("open descriptor");
+        let plaintext =
+            codec::open_descriptor_slot(&built.leaf_node_secret, &row.nonce, &aad, &row.ciphertext)
+                .expect("open descriptor");
         assert_eq!(plaintext.filename, "photo.jpg");
         assert_eq!(plaintext.mime_type, "image/jpeg");
     }
@@ -381,8 +383,7 @@ mod tests {
         built.parent_id = event_id(&other_parent.canonical_bytes);
         built.parent_record = other_parent;
 
-        let envelope =
-            codec::decode_signed(&built.record.canonical_bytes).expect("decode signed");
+        let envelope = codec::decode_signed(&built.record.canonical_bytes).expect("decode signed");
         let mut file = codec::decode(&envelope.payload).expect("decode file");
         file.message_id = built.parent_id;
         let payload = codec::encode(&file).expect("re-encode");
@@ -404,22 +405,25 @@ mod tests {
         // Mint a different leaf event that does not match the deterministic
         // file coord, then point the file at it. The projector must reject so
         // that two clients cannot fake idempotency by aliasing leaves.
-        let other_leaf = leaf_module::commands::derive(leaf_module::commands::DeriveHistoryNodeSecret {
-            workspace_id: built.workspace_id,
-            removal_frontier_id: [30; 32],
-            source_secret_id: [205; 32],
-            source_secret: [206; 32],
-            range_start: message::types::unix_minute_for(5),
-            range_width: message::types::LEAF_RANGE_WIDTH,
-            event_id_in_minute: Some([222; 32]),
-            tombstone_node_id: None,
-        })
-        .expect("derive other leaf");
+        let other_leaf =
+            leaf_module::commands::derive_trie_split(leaf_module::commands::DeriveTrieSplit {
+                workspace_id: built.workspace_id,
+                removal_frontier_id: [30; 32],
+                parent_secret_id: [205; 32],
+                parent_secret: [206; 32],
+                range_start: message::types::unix_minute_for(5),
+                parent_bit_depth: 0,
+                parent_event_id_prefix: [0; 32],
+                child_side: leaf_module::types::bit_at(&[222; 32], 0),
+                child_bit_depth: leaf_module::types::TRIE_LEAF_BIT_DEPTH,
+                child_event_id_prefix: [222; 32],
+                tombstone_node_id: None,
+            })
+            .expect("derive other leaf");
         let other_leaf_id = other_leaf.value.local_history_node_secret_id;
         let other_leaf_record = other_leaf.events[0].record().clone();
 
-        let envelope =
-            codec::decode_signed(&built.record.canonical_bytes).expect("decode signed");
+        let envelope = codec::decode_signed(&built.record.canonical_bytes).expect("decode signed");
         let mut file = codec::decode(&envelope.payload).expect("decode file");
         file.local_history_node_secret_id = other_leaf_id;
         let payload = codec::encode(&file).expect("re-encode");
@@ -484,8 +488,7 @@ mod tests {
     #[test]
     fn raw_file_bytes_are_not_admissible() {
         let built = build_descriptor("a.bin", "application/octet-stream");
-        let envelope =
-            codec::decode_signed(&built.record.canonical_bytes).expect("decode signed");
+        let envelope = codec::decode_signed(&built.record.canonical_bytes).expect("decode signed");
         assert_eq!(
             crate::protocol::event_modules::record_from_bytes(envelope.payload)
                 .expect_err("raw file must fail"),

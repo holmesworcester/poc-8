@@ -79,7 +79,9 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
     if leaf.range_start != expected_minute || leaf.range_width != super::types::LEAF_RANGE_WIDTH {
         return Err("message leaf coordinate does not match message minute".to_string());
     }
-    if leaf.event_id_in_minute != Some(message.event_id_in_minute_derived()) {
+    if leaf.bit_depth != leaf_history_node::types::TRIE_LEAF_BIT_DEPTH
+        || leaf.event_id_prefix != message.event_id_in_minute_derived()
+    {
         return Err(
             "message leaf event_id_in_minute does not match deterministic message coord"
                 .to_string(),
@@ -198,17 +200,21 @@ mod tests {
             &removal_frontier_id,
             created_at_ms,
         );
-        let leaf_output = leaf_module::commands::derive(leaf_module::commands::DeriveHistoryNodeSecret {
-            workspace_id,
-            removal_frontier_id,
-            source_secret_id: [200; 32],
-            source_secret: [201; 32],
-            range_start: unix_minute_for(created_at_ms),
-            range_width: super::super::types::LEAF_RANGE_WIDTH,
-            event_id_in_minute: Some(event_id_in_minute),
-            tombstone_node_id: None,
-        })
-        .expect("derive leaf for projector test");
+        let leaf_output =
+            leaf_module::commands::derive_trie_split(leaf_module::commands::DeriveTrieSplit {
+                workspace_id,
+                removal_frontier_id,
+                parent_secret_id: [200; 32],
+                parent_secret: [201; 32],
+                range_start: unix_minute_for(created_at_ms),
+                parent_bit_depth: 0,
+                parent_event_id_prefix: [0; 32],
+                child_side: leaf_module::types::bit_at(&event_id_in_minute, 0),
+                child_bit_depth: leaf_module::types::TRIE_LEAF_BIT_DEPTH,
+                child_event_id_prefix: event_id_in_minute,
+                tombstone_node_id: None,
+            })
+            .expect("derive leaf for projector test");
         let leaf_record = leaf_output.events[0].record().clone();
         let leaf_id = leaf_output.value.local_history_node_secret_id;
         let output = super::super::commands::send(super::super::commands::SendMessage {

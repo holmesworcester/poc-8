@@ -1,8 +1,11 @@
 //! Schema for local history range-node secret rows and tombstones.
 //!
-//! Secret rows are keyed by `(workspace_id, removal_frontier_id, range_start,
-//! range_width, event_id_in_minute)` so per-minute coarse-cover nodes and the
-//! per-message leaves they parent never collide on the same projection key.
+//! Secret rows are keyed by
+//! `(workspace_id, removal_frontier_id, range_start, range_width, bit_depth,
+//!   event_id_prefix)`. The full key disambiguates time-tree internals
+//! (`bit_depth=0, event_id_prefix=0`), minute_nodes (`bit_depth=0,
+//! range_width=1`), trie internals (`1..=255`), and trie leaves (`256`).
+//!
 //! Tombstone rows map retired node ids to replacement node ids. These are
 //! local retention and derivation aids, not shared removal facts.
 
@@ -12,7 +15,8 @@ use crate::protocol::event_modules::types::EventId;
 use crate::protocol::wire::{Reader, Writer};
 
 use super::types::{
-    LocalHistoryNodeSecret, LocalHistoryNodeSecretRow, LocalHistoryNodeTombstoneRow,
+    is_leaf_row, is_minute_node_row, mask_prefix_to_depth, LocalHistoryNodeSecret,
+    LocalHistoryNodeSecretRow, LocalHistoryNodeTombstoneRow,
 };
 
 pub const LOCAL_HISTORY_NODE_SECRETS: TableName =
@@ -22,7 +26,7 @@ pub const LOCAL_HISTORY_NODE_TOMBSTONES: TableName =
 
 pub const SCHEMAS: &[Schema] = &[
     Schema::durable_row_table(
-        "encryption.local_history_node_secrets.v2",
+        "encryption.local_history_node_secrets.v3",
         LOCAL_HISTORY_NODE_SECRETS,
     ),
     Schema::durable_row_table(
@@ -31,11 +35,10 @@ pub const SCHEMAS: &[Schema] = &[
     ),
 ];
 
-/// Length of the encoded `local_history_node_secrets` row key. Two
-/// `EventId` slots (workspace + frontier), eight bytes for `range_start`,
-/// eight bytes for `range_width`, and a fixed 32-byte slot for
-/// `event_id_in_minute` (zero-encoded for `None`).
-pub const LOCAL_HISTORY_NODE_SECRET_KEY_LEN: usize = 32 + 32 + 8 + 8 + 32;
+/// Length of the encoded `local_history_node_secrets` row key:
+/// `workspace_id (32) || removal_frontier_id (32) || range_start (8)
+///   || range_width (8) || bit_depth (2) || event_id_prefix (32)`.
+pub const LOCAL_HISTORY_NODE_SECRET_KEY_LEN: usize = 32 + 32 + 8 + 8 + 2 + 32;
 
 pub fn local_history_node_secret_row(
     local_history_node_secret_id: EventId,
@@ -48,7 +51,8 @@ pub fn local_history_node_secret_row(
             event.removal_frontier_id,
             event.range_start,
             event.range_width,
-            event.event_id_in_minute,
+            event.bit_depth,
+            event.event_id_prefix,
         ),
         value: encode_secret_value(local_history_node_secret_id, event),
     }
@@ -75,14 +79,16 @@ pub fn local_history_node_secret_key(
     removal_frontier_id: EventId,
     range_start: u64,
     range_width: u64,
-    event_id_in_minute: Option<EventId>,
+    bit_depth: u16,
+    event_id_prefix: EventId,
 ) -> Vec<u8> {
     let mut key = Vec::with_capacity(LOCAL_HISTORY_NODE_SECRET_KEY_LEN);
     key.extend_from_slice(&workspace_id);
     key.extend_from_slice(&removal_frontier_id);
     key.extend_from_slice(&range_start.to_be_bytes());
     key.extend_from_slice(&range_width.to_be_bytes());
-    key.extend_from_slice(&event_id_in_minute.unwrap_or([0; 32]));
+    key.extend_from_slice(&bit_depth.to_be_bytes());
+    key.extend_from_slice(&mask_prefix_to_depth(event_id_prefix, bit_depth));
     key
 }
 
@@ -115,23 +121,22 @@ pub fn list_for_frontier(
 }
 
 /// Look up a node by its full coordinate.
-///
-/// Pass `event_id_in_minute = None` to find the per-minute coarse-cover
-/// node at this range; pass `Some(leaf_nonce)` to find a per-message leaf.
 pub fn get(
     store: &Store,
     workspace_id: EventId,
     removal_frontier_id: EventId,
     range_start: u64,
     range_width: u64,
-    event_id_in_minute: Option<EventId>,
+    bit_depth: u16,
+    event_id_prefix: EventId,
 ) -> Result<Option<LocalHistoryNodeSecretRow>, String> {
     let key = local_history_node_secret_key(
         workspace_id,
         removal_frontier_id,
         range_start,
         range_width,
-        event_id_in_minute,
+        bit_depth,
+        event_id_prefix,
     );
     store
         .table_row(LOCAL_HISTORY_NODE_SECRETS, &key)
@@ -140,13 +145,14 @@ pub fn get(
         .transpose()
 }
 
-/// Convenience: look up a per-message leaf row by `(unix_minute, leaf_nonce)`.
+/// Convenience: look up a per-event leaf row by `(unix_minute,
+/// event_id_in_minute)`.
 pub fn get_leaf(
     store: &Store,
     workspace_id: EventId,
     removal_frontier_id: EventId,
     unix_minute: u64,
-    leaf_nonce: EventId,
+    event_id_in_minute: EventId,
 ) -> Result<Option<LocalHistoryNodeSecretRow>, String> {
     get(
         store,
@@ -154,7 +160,26 @@ pub fn get_leaf(
         removal_frontier_id,
         unix_minute,
         1,
-        Some(leaf_nonce),
+        super::types::TRIE_LEAF_BIT_DEPTH,
+        event_id_in_minute,
+    )
+}
+
+/// Convenience: look up a minute_node row by `unix_minute`.
+pub fn get_minute_node(
+    store: &Store,
+    workspace_id: EventId,
+    removal_frontier_id: EventId,
+    unix_minute: u64,
+) -> Result<Option<LocalHistoryNodeSecretRow>, String> {
+    get(
+        store,
+        workspace_id,
+        removal_frontier_id,
+        unix_minute,
+        1,
+        super::types::TIME_TREE_BIT_DEPTH,
+        [0; 32],
     )
 }
 
@@ -182,58 +207,82 @@ pub fn list_tombstones_for_workspace(
         .collect()
 }
 
+/// Return all materialized minute_node rows for a workspace+frontier.
+pub fn list_minute_nodes(
+    store: &Store,
+    workspace_id: EventId,
+) -> Result<Vec<LocalHistoryNodeSecretRow>, String> {
+    Ok(list_for_workspace(store, workspace_id)?
+        .into_iter()
+        .filter(is_minute_node_row)
+        .collect())
+}
+
+/// Return all materialized leaf rows (`bit_depth = 256`) for a workspace.
+pub fn list_leaves(
+    store: &Store,
+    workspace_id: EventId,
+) -> Result<Vec<LocalHistoryNodeSecretRow>, String> {
+    Ok(list_for_workspace(store, workspace_id)?
+        .into_iter()
+        .filter(is_leaf_row)
+        .collect())
+}
+
 /// Canonical, workspace-independent encoding of every retained node-secret
 /// coordinate in this store.
 ///
 /// The encoding is deliberately stable and platform-agnostic:
 ///
 /// ```text
-/// "topo cover summary v2"
+/// "topo cover summary v3"
 /// || u32_be(rows.len())
 /// || (for each row, sorted by (frontier_id, range_start, range_width,
-///                              event_id_in_minute_or_zero):
+///                              bit_depth, event_id_prefix):
 ///       removal_frontier_id (32B)
 ///       || u64_be(range_start)
 ///       || u64_be(range_width)
-///       || event_id_in_minute (32B; zero for minute_nodes)
+///       || u16_be(bit_depth)
+///       || event_id_prefix (32B; masked to bit_depth)
 ///   )
 /// ```
+///
+/// Each row encodes 32 + 8 + 8 + 2 + 32 = **82 bytes**; total summary length
+/// is `21 + 4 + 82 * rows.len()` and therefore O(materialized_rows).
 ///
 /// Two stores that have admitted the same shared event set and run the same
 /// retain/retire operations against it must produce byte-equal cover summaries
 /// modulo `workspace_id`. Two stores with different workspace_ids will differ;
 /// the workspace_id is intentionally not in the summary so it functions as the
 /// pure structural fingerprint of the retained tree.
-pub fn cover_summary(
-    store: &Store,
-    workspace_id: EventId,
-) -> Result<Vec<u8>, String> {
+pub fn cover_summary(store: &Store, workspace_id: EventId) -> Result<Vec<u8>, String> {
     let mut rows = list_for_workspace(store, workspace_id)?;
     rows.sort_by(|a, b| {
         a.removal_frontier_id
             .cmp(&b.removal_frontier_id)
             .then_with(|| a.range_start.cmp(&b.range_start))
             .then_with(|| a.range_width.cmp(&b.range_width))
-            .then_with(|| {
-                a.event_id_in_minute
-                    .unwrap_or([0; 32])
-                    .cmp(&b.event_id_in_minute.unwrap_or([0; 32]))
-            })
+            .then_with(|| a.bit_depth.cmp(&b.bit_depth))
+            .then_with(|| a.event_id_prefix.cmp(&b.event_id_prefix))
     });
     let mut out = Writer::with_capacity(
-        b"topo cover summary v2".len() + 4 + rows.len() * (32 + 8 + 8 + 32),
+        b"topo cover summary v3".len() + 4 + rows.len() * COVER_SUMMARY_ROW_LEN,
     );
-    out.raw(b"topo cover summary v2");
+    out.raw(b"topo cover summary v3");
     let len = u32::try_from(rows.len()).unwrap_or(u32::MAX);
     out.raw(&len.to_be_bytes());
     for row in &rows {
         out.id(&row.removal_frontier_id);
         out.raw(&row.range_start.to_be_bytes());
         out.raw(&row.range_width.to_be_bytes());
-        out.id(&row.event_id_in_minute.unwrap_or([0; 32]));
+        out.raw(&row.bit_depth.to_be_bytes());
+        out.id(&mask_prefix_to_depth(row.event_id_prefix, row.bit_depth));
     }
     Ok(out.finish())
 }
+
+/// Bytes per row in the `cover_summary` encoding.
+pub const COVER_SUMMARY_ROW_LEN: usize = 32 + 8 + 8 + 2 + 32;
 
 pub fn decode_local_history_node_secret_row(
     key: &[u8],
@@ -256,13 +305,13 @@ pub fn decode_local_history_node_secret_row(
             .try_into()
             .map_err(|_| "local history node range width malformed".to_string())?,
     );
-    let mut event_id_in_minute_bytes = [0; 32];
-    event_id_in_minute_bytes.copy_from_slice(&key[80..112]);
-    let event_id_in_minute = if event_id_in_minute_bytes.iter().all(|byte| *byte == 0) {
-        None
-    } else {
-        Some(event_id_in_minute_bytes)
-    };
+    let bit_depth = u16::from_be_bytes(
+        key[80..82]
+            .try_into()
+            .map_err(|_| "local history node bit depth malformed".to_string())?,
+    );
+    let mut event_id_prefix = [0; 32];
+    event_id_prefix.copy_from_slice(&key[82..114]);
 
     let mut reader = Reader::new(value, "local history node secret row");
     let local_history_node_secret_id = reader.id()?;
@@ -283,7 +332,8 @@ pub fn decode_local_history_node_secret_row(
         source_secret_id,
         range_start,
         range_width,
-        event_id_in_minute,
+        bit_depth,
+        event_id_prefix,
         tombstone_node_id: (!is_zero(&tombstone_node_id)).then_some(tombstone_node_id),
         node_secret,
     })
