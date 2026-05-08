@@ -560,14 +560,14 @@ where
     let output = encryption_worker::run(
         store,
         registry,
-        encryption_worker::Work::DeriveMessageLeaf {
+        encryption_worker::Work::DeriveEventLeaf {
             workspace_id,
             removal_frontier_id,
             created_at_ms,
             event_id_in_minute,
         },
     )?;
-    let encryption_worker::Output::DerivedMessageLeaf(report) = output else {
+    let encryption_worker::Output::DerivedEventLeaf(report) = output else {
         return Err("unexpected encryption worker output".to_string());
     };
     let local_history_node_secret_id = report
