@@ -5,7 +5,8 @@
 //! protocol transit projector.
 //! Step: claim up to `limit` inbound network rows, ask the protocol registry to
 //! unwrap each row, and write the recovered inner bytes to `canonical.in` with
-//! transit provenance. Socket accept/exchange belongs to `bootstrap_exchange`.
+//! transit provenance. Socket accept belongs to `transport_accept`; this worker
+//! handles both ordinary connection frames and invite-bootstrap frames.
 //! Outputs: `canonical.in` rows for the event admission worker.
 //! Consume: accepted network rows are deleted after their projection rows are
 //! written; rejected rows are deleted so malformed transport bytes do not poison
@@ -17,7 +18,9 @@
 
 use crate::core::daemon::{StepContext, Worker};
 use crate::core::store::Store;
-use crate::workers::pipeline_helpers::event_pipeline::{self as pipeline, EventRegistry, TransitInReport};
+use crate::workers::pipeline_helpers::event_pipeline::{
+    self as pipeline, EventRegistry, TransitInReport,
+};
 use crate::workers::DaemonWorkerContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,9 +52,8 @@ where
     C: DaemonWorkerContext,
 {
     let app = &*ctx.app;
-    // The bootstrap_serve worker owns the accept side. transit_in is the
-    // drain step that consumes already-staged inbound network rows the accept
-    // handler enqueued through `process_inbound`.
+    // The accept worker owns sockets. transit_in is the drain step that consumes
+    // already-staged inbound network rows and applies transit authentication.
     let report = run(
         app.store(),
         app,
@@ -69,7 +71,7 @@ where
 mod tests {
     use crate::core::network_queues::{self, InboundNetworkRow, NetworkSource};
     use crate::protocol::event_modules::connection::{schema, transit, types};
-    use crate::protocol::event_modules::identity::endpoint;
+    use crate::protocol::event_modules::identity::{endpoint, invite};
     use crate::protocol::Protocol;
     use crate::workers::schema as worker_schema;
 
@@ -123,5 +125,70 @@ mod tests {
             queued[0].provenance.is_some(),
             "canonical admission receives transit provenance as queue metadata"
         );
+    }
+
+    #[test]
+    fn drains_invite_bootstrap_frames_through_the_same_inbound_queue() {
+        let local = keypair();
+        let remote = keypair();
+        let bootstrap_secret = [7; 32];
+        let bootstrap_hash = invite::types::bootstrap_secret_hash(&bootstrap_secret);
+        let workspace_id = [8; 32];
+        let invite_event_id = [9; 32];
+        let store = Protocol::open_memory_store().expect("open store");
+        let mut rows = endpoint::projector::local_endpoint(local);
+        rows.extend(invite::projector::invite_secret(
+            bootstrap_hash,
+            bootstrap_secret,
+            Some(workspace_id),
+            Some(invite_event_id),
+        ));
+        store.insert_table_rows(rows).expect("insert local rows");
+        let first = b"first identity bytes".to_vec();
+        let second = b"second identity bytes".to_vec();
+        let frame = transit::commands::create_invite_bootstrap_batch(
+            &remote,
+            local.endpoint,
+            &bootstrap_secret,
+            workspace_id,
+            invite_event_id,
+            vec![first.clone(), second.clone()],
+        )
+        .expect("create invite bootstrap frame");
+        let inbound = InboundNetworkRow::new(
+            NetworkSource::new("127.0.0.1:41002".parse().expect("source addr")),
+            frame,
+        );
+        network_queues::enqueue_inbound(&store, &[inbound]).expect("enqueue inbound frame");
+
+        let report =
+            run(&store, &Protocol::new(), Work::Drain { limit: 1 }).expect("drain transit in");
+
+        assert_eq!(report.network_frames, 1);
+        assert_eq!(report.canonical_rows, 2);
+        assert_eq!(
+            store
+                .table_row_count(network_queues::INBOUND_TABLE)
+                .expect("count inbound"),
+            0,
+            "invite bootstrap frames are consumed by the normal transit_in drain"
+        );
+        let mut queued = worker_schema::claim_canonical_in(&store, 2).expect("claim canonical in");
+        queued.sort_by(|left, right| left.canonical_bytes.cmp(&right.canonical_bytes));
+        assert_eq!(queued[0].canonical_bytes, first);
+        assert_eq!(queued[1].canonical_bytes, second);
+        for row in queued {
+            let provenance = row.provenance.expect("invite bootstrap provenance");
+            assert_eq!(provenance.local_endpoint, local.endpoint);
+            assert_eq!(provenance.sender_endpoint, remote.endpoint);
+            assert_eq!(
+                provenance.unwrapped_with,
+                worker_schema::TransitUnwrap::InviteBootstrap {
+                    bootstrap_hash,
+                    workspace_id,
+                    invite_event_id,
+                }
+            );
+        }
     }
 }

@@ -140,19 +140,21 @@ fn workspace_invite_accept_builds_identity_graph_over_two_cli_processes() {
 }
 
 #[test]
-fn workspace_invite_accept_against_start_daemon_receives_bootstrap_ancestry_without_sync() {
-    // Invariant: a long-running daemon uses the same bootstrap exchange as a
-    // finite invite listener, so the acceptor receives invite ancestry during
-    // `accept` and does not need a separate manual sync to validate the invite.
+fn workspace_invite_accept_against_start_daemon_completes_through_daemon_sync() {
+    // Invariant: a long-running daemon stages invite-bootstrap bytes through the
+    // normal inbound transit queue. `accept` may return before the invite ancestry
+    // has projected locally; daemon sync is responsible for eventual convergence.
     let tmp = tempfile::tempdir().unwrap();
     let host = temp_db(&tmp, "host.db");
     let joiner = temp_db(&tmp, "joiner.db");
     let port = free_port();
+    let joiner_port = free_port();
 
     let created = create_workspace(&host, "Alpha", "alice", "alice-laptop");
     let workspace_id = line_value(&created, "workspace_id");
     let invite = workspace_invite_link(&host, &workspace_id, port);
     let _daemon = spawn_daemon(&host, port);
+    let _joiner_daemon = spawn_daemon(&joiner, joiner_port);
 
     let accepted = try_accept_with_identity_timeout(
         &joiner,
@@ -164,6 +166,7 @@ fn workspace_invite_accept_against_start_daemon_receives_bootstrap_ancestry_with
     .expect("accept against daemon");
     assert!(accepted.contains("connected:"), "{accepted}");
     assert_eq!(line_value(&accepted, "workspace_id"), workspace_id);
+    assert_eq!(line_value(&accepted, "status"), "pending_sync");
 
     wait_for_users_containing(&joiner, &workspace_id, &["alice", "bob"]);
     wait_for_users_containing(&host, &workspace_id, &["alice", "bob"]);

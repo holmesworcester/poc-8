@@ -14,7 +14,9 @@
 
 use crate::core::daemon::{StepContext, Worker};
 use crate::core::store::Store;
-use crate::workers::pipeline_helpers::event_pipeline::{self as pipeline, AdmitReport, EventRegistry};
+use crate::workers::pipeline_helpers::event_pipeline::{
+    self as pipeline, AdmitReport, EventRegistry,
+};
 use crate::workers::DaemonWorkerContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,11 +65,13 @@ where
 #[cfg(test)]
 mod tests {
     use crate::core::store::Store;
-    use crate::protocol::event_modules::connection::types;
+    use crate::protocol::event_modules::connection::{
+        connection_request, schema as connection_schema, types,
+    };
     use crate::protocol::event_modules::content::content_event;
-    use crate::protocol::event_modules::identity::{endpoint, endpoint_shared, workspace};
+    use crate::protocol::event_modules::identity::{endpoint, endpoint_shared, invite, workspace};
     use crate::protocol::event_modules::schema as event_schema;
-    use crate::protocol::event_modules::types::event_id;
+    use crate::protocol::event_modules::types::{event_id, EventStatus};
     use crate::protocol::Protocol;
     use crate::workers::schema as worker_schema;
 
@@ -170,6 +174,43 @@ mod tests {
                 &event,
             )])
             .expect("insert endpoint membership");
+    }
+
+    fn add_invite_authorized_connection(
+        store: &Store,
+        local: endpoint::types::EndpointKeypair,
+        remote: endpoint::types::EndpointKeypair,
+        workspace_id: [u8; 32],
+    ) -> types::ConnectionId {
+        let invite_secret =
+            invite::types::InviteSecretEvent::scoped([7; 32], workspace_id, [8; 32]);
+        let invite_record = invite::codec::record_from_bytes(invite::codec::encode(&invite_secret))
+            .expect("invite secret record");
+        let invite_secret_event_id = event_id(&invite_record.canonical_bytes);
+        let request_bytes =
+            connection_request::codec::encode(&connection_request::types::RequestEvent {
+                from_endpoint: local.endpoint,
+                to_endpoint: remote.endpoint,
+                nonce: [9; 32],
+                bootstrap_hash: invite_secret.bootstrap_hash,
+                invite_secret_event_id,
+                from_listen_addr: None,
+            });
+        let request_id = event_id(&request_bytes);
+        let connection_id = types::connection_id(&request_id, &remote.endpoint);
+        let rows = vec![
+            event_schema::event_row(
+                &invite_secret_event_id,
+                &invite_record,
+                EventStatus::Applied,
+            )
+            .expect("invite secret event row"),
+            connection_schema::connection_event_row(request_id, request_bytes),
+        ];
+        store
+            .insert_table_rows(rows)
+            .expect("insert invite-authorized connection rows");
+        connection_id
     }
 
     fn signed_content_bytes(workspace_id: [u8; 32]) -> Vec<u8> {
@@ -307,6 +348,62 @@ mod tests {
         assert!(
             event_schema::has_event(&store, &content_id).expect("check event table"),
             "shared remote event should enter durable admission"
+        );
+    }
+
+    #[test]
+    fn connection_transit_admits_shared_event_for_invite_authorized_workspace() {
+        let local = keypair();
+        let remote = keypair();
+        let workspace_id = [7; 32];
+        let store = store();
+        let connection_id = add_invite_authorized_connection(&store, local, remote, workspace_id);
+        let content = signed_content_bytes(workspace_id);
+        let content_id = event_id(&content);
+        enqueue_connection_canonical_in(
+            &store,
+            content,
+            local.endpoint,
+            remote.endpoint,
+            connection_id,
+        );
+
+        let admitted = run(&store, &Protocol::new(), Work::Drain { limit: 1 })
+            .expect("invite-authorized shared event should enter admission");
+
+        assert_eq!(admitted.blocked_events, 1);
+        assert!(
+            event_schema::has_event(&store, &content_id).expect("check event table"),
+            "valid invite authority should allow shared workspace events onto the dependency pipeline"
+        );
+    }
+
+    #[test]
+    fn connection_transit_rejects_invite_authorized_event_outside_invite_workspace() {
+        let local = keypair();
+        let remote = keypair();
+        let store = store();
+        let connection_id = add_invite_authorized_connection(&store, local, remote, [7; 32]);
+        let content = signed_content_bytes([6; 32]);
+        let content_id = event_id(&content);
+        enqueue_connection_canonical_in(
+            &store,
+            content,
+            local.endpoint,
+            remote.endpoint,
+            connection_id,
+        );
+
+        let err = run(&store, &Protocol::new(), Work::Drain { limit: 1 })
+            .expect_err("wrong workspace must reject");
+
+        assert!(
+            err.contains("transit shared in rejected event outside sender workspace"),
+            "{err}"
+        );
+        assert!(
+            !event_schema::has_event(&store, &content_id).expect("check event table"),
+            "invite authority must stay scoped to the invite workspace"
         );
     }
 

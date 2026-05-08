@@ -13,7 +13,7 @@
 //!   -> verify invite-secret dependency authorizes bootstrap hash
 //!   -> store request bytes
 //!   -> project local connection(request_id, receive.local_endpoint)
-//!   -> optionally remember the observed route
+//!   -> optionally remember the advertised or observed route
 //! ```
 //!
 //! The distinction is important. A local request is this node's own intent to
@@ -75,14 +75,16 @@ pub fn project(envelope: &EventWithContext<'_>) -> Result<ProjectionOutput, Stri
             connection_id,
             event.from_endpoint,
         ));
-        if receive.remember_route() {
+        let route = event
+            .from_listen_addr
+            .or_else(|| receive.remember_route().then_some(receive.origin()));
+        if let Some(addr) = route {
             // Route learning is local metadata, not a shared event. The worker
-            // only sets this flag when the observed origin is stable enough to
-            // be used for later sends.
-            rows.push(projection::transport_target_row(
-                connection_id,
-                receive.origin(),
-            ));
+            // only records an observed origin when the receive path marks it
+            // stable enough to be used for later sends. An advertised listener in
+            // the request is preferred because CLI accepts commonly arrive from
+            // an ephemeral socket while the peer daemon listens elsewhere.
+            rows.push(projection::transport_target_row(connection_id, addr));
         }
     } else {
         // Local requests have no receive metadata because this node created
@@ -247,6 +249,47 @@ mod tests {
         );
         assert_eq!(output.rows[1].value, [1; 32]);
         assert_eq!(output.rows[2].value, origin.to_string().into_bytes());
+    }
+
+    #[test]
+    fn received_request_prefers_advertised_listener_over_socket_origin() {
+        let invite_secret = invite::types::InviteSecretEvent::new([7; 32]);
+        let invite_record = invite::codec::record_from_bytes(invite::codec::encode(&invite_secret))
+            .expect("invite record");
+        let invite_secret_event_id = types::event_id(&invite_record.canonical_bytes);
+        let advertised = "127.0.0.1:9100"
+            .parse::<SocketAddr>()
+            .expect("advertised addr");
+        let record = codec::record_from_bytes(codec::encode(&RequestEvent {
+            from_endpoint: [1; 32],
+            to_endpoint: [9; 32],
+            nonce: [2; 32],
+            bootstrap_hash: invite_secret.bootstrap_hash,
+            invite_secret_event_id,
+            from_listen_addr: Some(advertised),
+        }))
+        .expect("request record");
+        let origin = "127.0.0.1:9000".parse::<SocketAddr>().expect("origin addr");
+
+        let output = project(&EventWithContext {
+            record: &record,
+            context: EventContext {
+                event_id: types::event_id(&record.canonical_bytes),
+                dependencies: vec![DependencyContext {
+                    event_id: invite_secret_event_id,
+                    record: invite_record,
+                }],
+                labels: Vec::new(),
+                receive: Some(ReceiveMetadata::bootstrap_invite(
+                    origin, [9; 32], [1; 32], true,
+                )),
+            },
+        })
+        .expect("project received request");
+
+        assert_eq!(output.rows.len(), 3);
+        assert_eq!(output.rows[2].table, schema::TRANSPORT_TARGETS);
+        assert_eq!(output.rows[2].value, advertised.to_string().into_bytes());
     }
 
     #[test]

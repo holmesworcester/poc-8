@@ -28,6 +28,7 @@ pub mod schema;
 pub mod sync;
 pub mod transit_in;
 pub mod transit_out;
+pub mod transport_accept;
 
 /// Drain pending content-purge work triggered during admission.
 ///
@@ -67,13 +68,10 @@ where
     C: DaemonWorkerContext,
 {
     vec![
-        // Accept any available inbound stream first so bootstrap responses
-        // (workspace identity events) ride out on the same TCP connection the
-        // requester opened. The same accept handler also writes a transport
-        // target row from the requester's advertised steady-state listener so
-        // the daemon can dial that peer back after the bootstrap stream
-        // closes.
-        bootstrap_exchange::daemon_worker(),
+        // Accept available inbound streams first. The accept worker only stages
+        // opaque network rows; `transit_in` handles normal connection transit
+        // and invite-bootstrap transit through the same inbound queue.
+        transport_accept::daemon_worker(),
         transit_in::daemon_worker(),
         event_admission::daemon_worker(),
         event_projection::daemon_worker(),
@@ -95,7 +93,7 @@ mod tests {
             .iter()
             .map(|w| w.name)
             .collect();
-        assert!(names.contains(&"bootstrap_serve"));
+        assert!(names.contains(&"transport_accept"));
         assert!(names.contains(&"transit_in"));
         assert!(names.contains(&"sync_tick"));
         assert!(names.contains(&"transit_out"));
