@@ -20,6 +20,8 @@
 pub mod cli;
 pub mod event_modules;
 pub mod wire;
+pub mod wire_schema;
+pub mod wire_schema_preview;
 
 use std::path::Path;
 
