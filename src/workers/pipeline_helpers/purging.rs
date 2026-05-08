@@ -121,7 +121,8 @@ mod tests {
             Vec::<EventId>::new()
         );
         assert!(
-            !event_lifecycle::blocked_event_has_missing_deps(&store, &target_id).expect("reverse deps")
+            !event_lifecycle::blocked_event_has_missing_deps(&store, &target_id)
+                .expect("reverse deps")
         );
         assert_eq!(
             event_schema::event_labels(&store, &target_id).expect("labels"),

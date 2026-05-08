@@ -111,8 +111,10 @@ fn resolve_file_selector(
         if number == 0 {
             return Err(format!("invalid file selector: {selector}"));
         }
-        let rows =
-            crate::protocol::event_modules::content::file::cli::visible_file_rows(store, workspace_id)?;
+        let rows = crate::protocol::event_modules::content::file::cli::visible_file_rows(
+            store,
+            workspace_id,
+        )?;
         let row = rows
             .get(number - 1)
             .ok_or_else(|| format!("file #{number} does not exist"))?;

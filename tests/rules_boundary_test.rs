@@ -248,7 +248,7 @@ fn daemon_runner_is_core_and_protocol_supplies_workers() {
     let workers = source_text(&root.join("src/workers/mod.rs"));
     assert!(
         workers.contains("pub fn daemon_workers")
-            && workers.contains("transport_accept::daemon_worker")
+            && workers.contains("bootstrap_exchange::daemon_worker")
             && workers.contains("transit_in::daemon_worker")
             && workers.contains("event_admission::daemon_worker")
             && workers.contains("sync::daemon_worker"),
@@ -617,7 +617,6 @@ fn workers_folder_has_standard_catalog_shape() {
         "pipeline_helpers/event_lifecycle.rs",
         "pipeline_helpers/purging.rs",
         "bootstrap_exchange.rs",
-        "transport_accept.rs",
         "transit_in.rs",
         "content_purge.rs",
         "event_admission.rs",
@@ -640,11 +639,11 @@ fn workers_folder_has_standard_catalog_shape() {
 }
 
 #[test]
-fn socket_receive_is_transport_accept_transit_in_and_outbound_is_transit_out() {
+fn socket_receive_is_bootstrap_exchange_transit_in_and_outbound_is_transit_out() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     assert!(
         !root.join("src/workers/connection_io.rs").exists(),
-        "transit mechanics should live behind transport_accept, transit_in, and transit_out"
+        "transit mechanics should live behind bootstrap_exchange, transit_in, and transit_out"
     );
     assert!(
         !root.join("src/workers/connection.rs").exists(),
@@ -654,10 +653,10 @@ fn socket_receive_is_transport_accept_transit_in_and_outbound_is_transit_out() {
     let catalog = source_text(&root.join("src/workers/mod.rs"));
     assert!(
         catalog.contains("transit_in::daemon_worker()")
-            && catalog.contains("transport_accept::daemon_worker()")
+            && catalog.contains("bootstrap_exchange::daemon_worker()")
             && catalog.contains("event_admission::daemon_worker()")
             && catalog.contains("transit_out::daemon_worker()"),
-        "the daemon catalog should schedule transport_accept, transit_in, event_admission, and transit_out workers"
+        "the daemon catalog should schedule bootstrap_exchange, transit_in, event_admission, and transit_out workers"
     );
     assert!(
         !catalog.contains("connection_io::daemon_worker()"),
@@ -1737,7 +1736,6 @@ fn new_poc8_modules_document_responsibility_boundaries() {
         root.join("src/protocol/event_modules/content/cli.rs"),
         root.join("src/protocol/event_modules/identity/cli.rs"),
         root.join("src/workers/bootstrap_exchange.rs"),
-        root.join("src/workers/transport_accept.rs"),
         root.join("src/workers/pipeline_helpers/mod.rs"),
         root.join("src/workers/content_purge.rs"),
         root.join("src/workers/encryption.rs"),

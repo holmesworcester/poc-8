@@ -249,21 +249,17 @@ fn run_accept_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOut
     let value = context
         .store
         .table_row(user_invite::schema::USER_INVITES, &key)
-        .map_err(|err| format!("load user invite: {err}"))?;
-    let mut status = None;
-    if let Some(value) = value {
-        let row = user_invite::schema::decode_user_invite_row(&key, &value)
-            .map_err(|err| err.to_string())?;
-        if row.public_key != crypto::ed25519_public_key(&invite.bootstrap_secret) {
-            return Err("invite private key does not match user invite".to_string());
-        }
-        reject_duplicate_join(&context.store, local.endpoint, invite.workspace_id)?;
-    } else {
-        status = Some("pending_sync");
+        .map_err(|err| format!("load user invite: {err}"))?
+        .ok_or_else(|| "user invite was not received".to_string())?;
+    let row =
+        user_invite::schema::decode_user_invite_row(&key, &value).map_err(|err| err.to_string())?;
+    if row.public_key != crypto::ed25519_public_key(&invite.bootstrap_secret) {
+        return Err("invite private key does not match user invite".to_string());
     }
+    reject_duplicate_join(&context.store, local.endpoint, invite.workspace_id)?;
     admit_proposed_events(context, proposed)?;
 
-    let mut lines = vec![
+    Ok(CliOutput::lines(vec![
         format!("connected: {}", connected.addr),
         format!("workspace_id: {}", encode_hex(&invite.workspace_id)),
         format!("user_id: {}", encode_hex(&user_id)),
@@ -271,11 +267,7 @@ fn run_accept_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOut
             "endpoint_shared_id: {}",
             encode_hex(&endpoint_join.endpoint_shared_id)
         ),
-    ];
-    if let Some(status) = status {
-        lines.push(format!("status: {status}"));
-    }
-    Ok(CliOutput::lines(lines))
+    ]))
 }
 
 fn run_invite_server_command(

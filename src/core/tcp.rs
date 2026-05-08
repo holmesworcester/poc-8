@@ -91,13 +91,6 @@ impl Listener {
         stream
             .set_nodelay(true)
             .map_err(|err| format!("set stream nodelay: {err}"))?;
-        // This accept shape stages inbound bytes for later workers and never
-        // sends same-stream replies. Half-close our write side before draining
-        // so callers using `connect_exchange` can finish after sending their
-        // initial frames instead of waiting for a reply that will not exist.
-        stream
-            .shutdown(Shutdown::Write)
-            .map_err(|err| format!("shutdown accepted stream write: {err}"))?;
         let value = read_inbound_frames(store, &mut stream, NetworkSource::new(source_addr))?;
         Ok(AcceptReport {
             accepted_connections: 1,

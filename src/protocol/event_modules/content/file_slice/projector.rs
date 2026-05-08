@@ -76,13 +76,14 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
     let plaintext_per_full = u64::from(descriptor_file.slice_bytes);
     let chunk = plaintext_per_full + SLICE_TAG_BYTES;
     let slice_start = u64::from(slice.slice_number) * chunk;
-    let total_ciphertext_len = descriptor_file.blob_bytes
-        + u64::from(descriptor_file.total_slices) * SLICE_TAG_BYTES;
+    let total_ciphertext_len =
+        descriptor_file.blob_bytes + u64::from(descriptor_file.total_slices) * SLICE_TAG_BYTES;
 
-    let expected_plaintext_len = plaintext_per_full
-        .min(descriptor_file.blob_bytes.saturating_sub(
-            u64::from(slice.slice_number) * plaintext_per_full,
-        ));
+    let expected_plaintext_len = plaintext_per_full.min(
+        descriptor_file
+            .blob_bytes
+            .saturating_sub(u64::from(slice.slice_number) * plaintext_per_full),
+    );
     let expected_plaintext_len_u32 = u32::try_from(expected_plaintext_len)
         .map_err(|_| "file slice plaintext length overflows u32".to_string())?;
     if expected_plaintext_len_u32 != slice.plaintext_len {
@@ -237,9 +238,8 @@ mod tests {
         let plaintext: Vec<u8> = (0..blob_total).map(|byte| byte as u8).collect();
 
         // Slice AAD does not bind file_event_id, so seal once.
-        let mut ciphertext_total = Vec::with_capacity(
-            blob_total + (total_slices as usize) * XCHACHA20_POLY1305_TAG_BYTES,
-        );
+        let mut ciphertext_total =
+            Vec::with_capacity(blob_total + (total_slices as usize) * XCHACHA20_POLY1305_TAG_BYTES);
         for k in 0..total_slices {
             let start = (k as usize) * slice_bytes as usize;
             let end = ((k + 1) as usize * slice_bytes as usize).min(plaintext.len());
@@ -358,8 +358,7 @@ mod tests {
     #[test]
     fn rejects_slice_whose_proof_does_not_match_descriptor_root_hash() {
         let mut built = build_slice(0, 1024, 1);
-        let envelope =
-            codec::decode_signed(&built.record.canonical_bytes).expect("decode signed");
+        let envelope = codec::decode_signed(&built.record.canonical_bytes).expect("decode signed");
         let (mut slice, descriptor_id) = codec::decode(&envelope.payload).expect("decode");
         slice.proof[0] ^= 1;
         let payload = codec::encode(&slice, &descriptor_id).expect("re-encode");
@@ -379,8 +378,7 @@ mod tests {
         // Construct a slice whose local_history_node_secret_id diverges from the
         // descriptor's. We do that by re-encoding the slice payload with a
         // tampered local_history_node_secret_id and re-signing.
-        let envelope =
-            codec::decode_signed(&built.record.canonical_bytes).expect("decode signed");
+        let envelope = codec::decode_signed(&built.record.canonical_bytes).expect("decode signed");
         let (mut slice, descriptor_id) = codec::decode(&envelope.payload).expect("decode");
         slice.local_history_node_secret_id = [200; 32];
         let payload = codec::encode(&slice, &descriptor_id).expect("re-encode");

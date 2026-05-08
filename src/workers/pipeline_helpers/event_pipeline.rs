@@ -86,8 +86,8 @@ use crate::protocol::event_modules::types::{
 };
 
 use crate::protocol::event_modules::schema;
-use crate::workers::pipeline_helpers::event_lifecycle;
 use crate::workers::dependency_unblock;
+use crate::workers::pipeline_helpers::event_lifecycle;
 use crate::workers::schema as worker_schema;
 
 /// Default upper bound for one ready-event drain.
@@ -932,7 +932,8 @@ fn project_ready_event_tx(
     event_id: &EventId,
 ) -> rusqlite::Result<ApplyReadyReport> {
     let mut report = ApplyReadyReport::default();
-    if event_lifecycle::set_event_status(store, event_id, EventStatus::Ready, EventStatus::Applied)? {
+    if event_lifecycle::set_event_status(store, event_id, EventStatus::Ready, EventStatus::Applied)?
+    {
         // The status change is the claim. Projection runs only for the worker
         // that successfully moved Ready -> Applied, which keeps duplicate drain
         // attempts idempotent when callers retry.
@@ -959,7 +960,8 @@ fn project_ready_event_record_in_tx(
     receive: Option<ReceiveMetadata>,
 ) -> rusqlite::Result<ApplyReadyReport> {
     let mut report = ApplyReadyReport::default();
-    if event_lifecycle::set_event_status(store, event_id, EventStatus::Ready, EventStatus::Applied)? {
+    if event_lifecycle::set_event_status(store, event_id, EventStatus::Ready, EventStatus::Applied)?
+    {
         let changes = project_event_with_context_in_tx(store, modules, event_id, record, receive)?;
         write_projection_output_in_tx(store, changes)?;
         write_applied_event_outputs_in_tx(store, event_id, record)?;

@@ -88,7 +88,10 @@ pub trait DaemonProtocol {
     /// runs. The protocol may use this hook to advertise the bound address as
     /// memory-only state. The default implementation does nothing so most
     /// protocols can ignore the hook.
-    fn after_listener_bound(_context: &mut Self::Context, _local_addr: SocketAddr) -> Result<(), String> {
+    fn after_listener_bound(
+        _context: &mut Self::Context,
+        _local_addr: SocketAddr,
+    ) -> Result<(), String> {
         Ok(())
     }
 }
@@ -300,7 +303,9 @@ fn stop_daemon(db_path: &Path) -> Result<Vec<String>, String> {
             // running daemon: if a current daemon owned it, the file would
             // contain a fresh PID. Removing the file unblocks future starts.
             let _ = fs::remove_file(&lock);
-            return Ok(vec!["no daemon running (cleared unreadable lock)".to_string()]);
+            return Ok(vec![
+                "no daemon running (cleared unreadable lock)".to_string()
+            ]);
         }
         LockState::Pid(pid) => pid,
     };
@@ -391,7 +396,9 @@ fn validate_reset_path(db_path: &Path) -> Result<PathBuf, String> {
             db_path.display()
         ));
     }
-    let parent_abs = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    let parent_abs = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
     if parent_abs.as_os_str().is_empty() || parent_abs == Path::new("/") {
         return Err(format!(
             "reset: refusing to operate inside `{}`",

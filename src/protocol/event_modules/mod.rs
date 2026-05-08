@@ -222,7 +222,7 @@ fn record_from_transit_canonical_in(
             }
         }
     }
-    let TransitUnwrap::Connection { connection_id } = provenance.unwrapped_with else {
+    let TransitUnwrap::Connection { .. } = provenance.unwrapped_with else {
         return Err("transit provenance cannot admit this event".to_string());
     };
     let record = record_from_bytes(bytes)?;
@@ -239,21 +239,13 @@ fn record_from_transit_canonical_in(
         provenance.local_endpoint,
         provenance.sender_endpoint,
     )?;
-    if allowed_workspaces
+    if !allowed_workspaces
         .iter()
         .any(|allowed| allowed == &workspace_id)
-        || connection::connection_request::registry_meta::invite_authorizes_shared_event(
-            store,
-            &record,
-            provenance.local_endpoint,
-            provenance.sender_endpoint,
-            connection_id,
-        )?
     {
-        Ok(ReceivedRecord::new(record))
-    } else {
         return Err("transit shared in rejected event outside sender workspace".to_string());
     }
+    Ok(ReceivedRecord::new(record))
 }
 
 pub(crate) fn is_identity_bootstrap_event(bytes: &[u8]) -> Result<bool, String> {

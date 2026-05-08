@@ -74,7 +74,7 @@ for worker in workers:
 The daemon's current worker catalog is:
 
 ```text
-transport_accept
+bootstrap_exchange
 transit_in
 event_admission
 event_projection
@@ -89,15 +89,14 @@ single route/frame boundary.
 
 ## Current Workers
 
-- `bootstrap_exchange`: accepts finite-listener TCP streams and runs the legacy
-  pre-route exchange. Unscoped invites carry connection requests. Identity
-  invites carry one invite-key batch of shared identity bootstrap events. Ongoing
-  daemon accept no longer lives here; daemon sockets are staged by
-  `transport_accept` and projected by `transit_in`.
-- `transport_accept`: accepts one available daemon TCP stream and stages opaque
-  length-prefixed frames as `core.network.inbound`. It does not inspect transit
-  mode, decrypt invite-bootstrap payloads, admit events, or send same-stream
-  replies.
+- `bootstrap_exchange`: accepts daemon or finite-listener TCP streams and runs
+  the pre-route exchange. Unscoped invites carry connection requests. Identity
+  invites carry one invite-key batch of shared identity bootstrap events and, on
+  the invite owner, produce one reply batch containing the invite event's
+  current workspace identity-bootstrap set, excluding the acceptor's
+  just-submitted events. It is a socket adapter over transit projection and the
+  common event pipeline; it does not project identity facts directly or make a
+  normal connection exist.
 - `transit_in`: consumes raw `core.network.inbound` frames. It runs the
   protocol transit projector, unwraps/authenticates transport envelopes using
   explicit local context, and writes recovered inner bytes to `canonical.in`
