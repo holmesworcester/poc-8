@@ -74,7 +74,6 @@ for worker in workers:
 The daemon's current worker catalog is:
 
 ```text
-bootstrap_exchange
 transit_in
 event_admission
 event_projection
@@ -89,19 +88,16 @@ single route/frame boundary.
 
 ## Current Workers
 
-- `bootstrap_exchange`: accepts daemon or finite-listener TCP streams and runs
-  the pre-route exchange. Unscoped invites carry connection requests. Identity
-  invites carry one invite-key batch of shared identity bootstrap events and, on
-  the invite owner, produce one reply batch containing the invite event's
-  current workspace identity-bootstrap set, excluding the acceptor's
-  just-submitted events. It is a socket adapter over transit projection and the
-  common event pipeline; it does not project identity facts directly or make a
-  normal connection exist.
-- `transit_in`: consumes raw `core.network.inbound` frames. It runs the
-  protocol transit projector, unwraps/authenticates transport envelopes using
-  explicit local context, and writes recovered inner bytes to `canonical.in`
-  with provenance. It does not decode the inner event type or admit semantic
-  facts.
+- `bootstrap_connect`: sends outbound invite connection requests before a
+  steady-state route has done useful work. Unscoped invites carry connection
+  requests. Identity invites carry one invite-key batch of shared identity
+  bootstrap events and can receive same-stream bootstrap response frames from
+  the inviter.
+- `transit_in`: accepts one available daemon TCP stream, stages opaque
+  length-prefixed frames as `core.network.inbound`, unwraps/authenticates
+  transport envelopes using explicit local context, admits recovered inner
+  bytes, and writes any same-stream invite-bootstrap response frames. It also
+  drains already-staged inbound rows for tests and retry paths.
 - `event_admission`: consumes `canonical.in` rows. It inserts/dedupes events,
   performs the initial dependency check, keeps receive metadata beside blocked
   received events, and writes `event_modules.ready_events` or blocker indexes.
@@ -120,20 +116,20 @@ single route/frame boundary.
 - `sync`: consumes `event_modules.applied_shared_events`, `sync.in`, and
   explicit sync-start requests. It catches up the protocol-owned warm sync
   index before responding, calls sync commands for compare/have/need decisions,
-  writes sync protocol events through canonical in, and writes durable send ids to
-  `transit.out`. Inbound sync work is authorized by the receiving
-  connection id, but responses are queued on a routed connection to the same
-  remote endpoint so daemon sync does not depend on same-stream replies. The
-  daemon drains inbound sync work before starting new compares, and either side
-  may start an idempotent compare against its routed peers.
+  writes sync protocol events through canonical in, and writes durable send ids
+  to `transit.out`. Inbound sync work is authorized by the receiving connection
+  id, and daemon transit exchange may return resulting responses on the same
+  stream that delivered the request. The daemon drains inbound sync work before
+  starting new compares, and either side may start an idempotent compare against
+  its routed peers.
 - `transit_out`: consumes `transit.out`, loads event bytes,
   enforces route/scope/workspace policy, wraps transit frames, and writes
   outbound transport rows.
 - `common::event_pipeline` is not a daemon worker. It provides the shared
   admission/projection/block-unblock machinery and finite command/test helpers
-  over the explicit workers above. The remaining one-shot connect path only
-  sends the initial request and records the invite address as outbound route
-  state; inbound responses still enter through transit in and event admission.
+  over the explicit workers above. The CLI connect command sends the initial
+  request and records the invite address as outbound route state; inbound
+  responses still enter through transit in and event admission.
 
 ## Runtime Boundaries Outside This Folder
 

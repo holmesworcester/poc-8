@@ -159,6 +159,29 @@ pub fn event_bytes(store: &Store, event_id: &EventId) -> rusqlite::Result<Option
     read_event(store, event_id).map(|event| event.map(|event| event.canonical_bytes))
 }
 
+pub(crate) fn all_applied_event_bytes(store: &Store) -> rusqlite::Result<Vec<Vec<u8>>> {
+    store
+        .table_rows(EVENTS)?
+        .into_iter()
+        .filter_map(|(_, value)| match decode_event_row_value(&value) {
+            Ok(event) if event.status == EventStatus::Applied => Some(Ok(event.canonical_bytes)),
+            Ok(_) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .collect()
+}
+
+pub(crate) fn applied_event_bytes(
+    store: &Store,
+    event_id: &EventId,
+) -> rusqlite::Result<Option<Vec<u8>>> {
+    read_event(store, event_id).map(|event| {
+        event.and_then(|event| {
+            (event.status == EventStatus::Applied).then_some(event.canonical_bytes)
+        })
+    })
+}
+
 pub fn event_label_rows(labels: Vec<EventLabel>) -> Vec<TableRow> {
     labels
         .into_iter()
@@ -291,10 +314,11 @@ fn encode_event_row_value(
     out.push(partition);
     out.push(scope.durable_tag().map_err(table_error)?);
     out.push(status.as_u8());
-    match workspace_id {
-        Some(workspace_id) => {
+    let context_id = scope.durable_context_id().or(workspace_id);
+    match context_id {
+        Some(context_id) => {
             out.push(1);
-            out.extend_from_slice(&workspace_id);
+            out.extend_from_slice(&context_id);
         }
         None => {
             out.push(0);
@@ -316,9 +340,14 @@ fn decode_event_row_value(value: &[u8]) -> rusqlite::Result<StoredEvent> {
     let timestamp = read_u64(value, &mut offset)?;
     let body_len = read_u64(value, &mut offset)? as usize;
     let partition = read_u8(value, &mut offset)?;
-    let scope = EventScope::from_durable_tag(read_u8(value, &mut offset)?).map_err(table_error)?;
+    let scope_tag = read_u8(value, &mut offset)?;
     let status = EventStatus::from_u8(read_u8(value, &mut offset)?).map_err(table_error)?;
-    let workspace_id = read_optional_id(value, &mut offset)?;
+    let context_id = read_optional_id(value, &mut offset)?;
+    let scope = EventScope::from_durable_parts(scope_tag, context_id).map_err(table_error)?;
+    let workspace_id = match scope {
+        EventScope::Connection(_) => None,
+        _ => context_id,
+    };
     let canonical_bytes = value[offset..].to_vec();
     Ok(StoredEvent {
         timestamp,

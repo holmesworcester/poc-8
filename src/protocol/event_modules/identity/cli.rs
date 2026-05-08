@@ -20,6 +20,7 @@ use crate::protocol::event_modules::connection::{
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::types::{EventId, EventRecord};
 use crate::protocol::event_modules::worker::{self, CommandOutput};
+use crate::workers::transit_in;
 
 use super::{
     admin, device_invite, endpoint, endpoint_shared, invite, invite_server, user, user_invite,
@@ -245,21 +246,32 @@ fn run_accept_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOut
     let initial_records = proposed_records(&proposed);
     let connected = connect_invite_with_initial_records(context, &options.invite, initial_records)?;
 
+    // A daemon-served invite can acknowledge the TCP exchange before this CLI
+    // process has locally projected the inviter's ancestry. That is fine:
+    // `accept` records Bob's proposed identity facts now, and daemon sync keeps
+    // retrying until the invite ancestry arrives and the workspace converges.
+    // A finite `--listen` peer often replies on the same stream, so the row may
+    // already be present and we can report `joined` immediately.
     let key = user_invite::schema::user_invite_key(&invite.workspace_id, &invite.invite_event_id);
     let value = context
         .store
         .table_row(user_invite::schema::USER_INVITES, &key)
-        .map_err(|err| format!("load user invite: {err}"))?
-        .ok_or_else(|| "user invite was not received".to_string())?;
-    let row =
-        user_invite::schema::decode_user_invite_row(&key, &value).map_err(|err| err.to_string())?;
-    if row.public_key != crypto::ed25519_public_key(&invite.bootstrap_secret) {
-        return Err("invite private key does not match user invite".to_string());
+        .map_err(|err| format!("load user invite: {err}"))?;
+    let status;
+    if let Some(value) = value {
+        let row = user_invite::schema::decode_user_invite_row(&key, &value)
+            .map_err(|err| err.to_string())?;
+        if row.public_key != crypto::ed25519_public_key(&invite.bootstrap_secret) {
+            return Err("invite private key does not match user invite".to_string());
+        }
+        reject_duplicate_join(&context.store, local.endpoint, invite.workspace_id)?;
+        status = "joined";
+    } else {
+        status = "pending_sync";
     }
-    reject_duplicate_join(&context.store, local.endpoint, invite.workspace_id)?;
     admit_proposed_events(context, proposed)?;
 
-    Ok(CliOutput::lines(vec![
+    let mut lines = vec![
         format!("connected: {}", connected.addr),
         format!("workspace_id: {}", encode_hex(&invite.workspace_id)),
         format!("user_id: {}", encode_hex(&user_id)),
@@ -267,7 +279,9 @@ fn run_accept_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOut
             "endpoint_shared_id: {}",
             encode_hex(&endpoint_join.endpoint_shared_id)
         ),
-    ]))
+    ];
+    lines.push(format!("status: {status}"));
+    Ok(CliOutput::lines(lines))
 }
 
 fn run_invite_server_command(
@@ -761,6 +775,7 @@ fn parse_workspace_and_listen(
     let mut public_addr = None;
     let mut listen = None;
     let mut accept_count = 1usize;
+    let mut accept_seen = false;
     let mut idx = 0;
     while idx < args.values().len() {
         match args.get(idx).expect("index in bounds") {
@@ -781,29 +796,39 @@ fn parse_workspace_and_listen(
                 idx += 2;
             }
             "--listen" => {
-                let ip = args.get(idx + 1).ok_or_else(|| usage.to_string())?;
-                let port = args.get(idx + 2).ok_or_else(|| usage.to_string())?;
-                listen = Some(
-                    format!("{ip}:{port}")
-                        .parse::<SocketAddr>()
-                        .map_err(|_| usage.to_string())?,
-                );
+                let ip = args
+                    .get(idx + 1)
+                    .ok_or_else(|| usage.to_string())?
+                    .parse::<std::net::IpAddr>()
+                    .map_err(|_| usage.to_string())?;
+                let port = args
+                    .get(idx + 2)
+                    .ok_or_else(|| usage.to_string())?
+                    .parse::<u16>()
+                    .map_err(|_| usage.to_string())?;
+                listen = Some(SocketAddr::new(ip, port));
                 idx += 3;
             }
             "--accept" => {
                 accept_count = args.parse_positive_usize(idx + 1, usage)?;
+                accept_seen = true;
                 idx += 2;
             }
             other => return Err(format!("unknown invite option `{other}`\n{usage}")),
         }
     }
     let listen = match (public_addr, listen) {
-        (Some(public_addr), None) => ListenMode::Print { public_addr },
+        (Some(_), Some(_)) => return Err(usage.to_string()),
+        // `--public-addr` only prints a link. There is no local listener loop
+        // to count accepts against, so `--accept` is meaningful only with
+        // `--listen`.
+        (Some(public_addr), None) if !accept_seen => ListenMode::Print { public_addr },
+        (Some(_), None) => return Err(usage.to_string()),
         (None, Some(listen)) => ListenMode::Listen {
             listen,
             accept_count,
         },
-        _ => return Err(usage.to_string()),
+        (None, None) => return Err(usage.to_string()),
     };
     Ok((workspace_id, listen))
 }
@@ -818,29 +843,36 @@ fn public_addr(listen: ListenMode) -> SocketAddr {
 fn maybe_listen(
     context: &mut Context,
     listen: ListenMode,
-    link: &str,
+    invite_link: &str,
 ) -> Result<CliOutput, String> {
-    match listen {
-        ListenMode::Print { .. } => Ok(CliOutput::line(link.to_string())),
-        ListenMode::Listen {
-            listen,
-            accept_count,
-        } => {
-            print_line_now(link)?;
-            let output = connection_worker::run(
-                &context.store,
-                &context.protocol,
-                connection_worker::Work::Serve {
-                    listen,
-                    accept_count,
-                },
-            )?;
-            let connection_worker::Output::Served(report) = output else {
-                return Err("connection worker returned non-serve output".to_string());
-            };
-            Ok(CliOutput::lines(serve_lines(&report)))
-        }
-    }
+    let ListenMode::Listen {
+        listen,
+        accept_count,
+    } = listen
+    else {
+        return Ok(CliOutput::line(invite_link));
+    };
+
+    // `invite --listen`, `invite-server --listen`, and `link --listen` are
+    // synchronous compatibility wrappers around the normal inbound transit
+    // path. They print the link first so the accepting process can start, then
+    // each accepted frame is staged through core TCP and admitted by
+    // `transit_in`. There is no separate accept/bootstrap worker here.
+    print_line_now(invite_link)?;
+    let report = transit_in::serve_invite_listener(
+        &context.store,
+        &context.protocol,
+        context.protocol.sync_index(),
+        listen,
+        accept_count,
+    )?;
+    Ok(CliOutput::lines(serve_lines(
+        report.local_addr,
+        report.accepted_connections,
+        report.canonical_rows,
+        report.received_events,
+        report.sent_frames,
+    )))
 }
 
 fn connect_invite(
@@ -859,6 +891,10 @@ fn connect_invite_with_initial_records(
     // lock file so the request body can advertise it to the peer. CLI
     // processes that run alongside no daemon get `None` here, which is the
     // correct signal for "do not advertise a listener route".
+    //
+    // Route retry is owned by the accepting side's daemon: Bob records the
+    // invite address he dialed and keeps using that route. Alice does not learn
+    // Bob's advertised listener as route authority during invite bootstrap.
     let from_listen_addr = crate::core::daemon::current_listen_addr(&context.db_path)?;
     let output = connection_worker::run(
         &context.store,
@@ -876,9 +912,7 @@ fn connect_invite_with_initial_records(
             }
         },
     )?;
-    let connection_worker::Output::Connected(report) = output else {
-        return Err("connection worker returned non-connect output".to_string());
-    };
+    let connection_worker::Output::Connected(report) = output;
     Ok(report)
 }
 
@@ -1062,13 +1096,20 @@ fn proposed_records(events: &[worker::ProposedEvent]) -> Vec<EventRecord> {
     events.iter().map(|event| event.record().clone()).collect()
 }
 
-fn serve_lines(report: &connection_types::ServeReport) -> Vec<String> {
-    let mut lines = vec![format!("listening: {}", report.local_addr)];
-    lines.extend([
-        format!("accepted_connections: {}", report.accepted_connections),
-        format!("received_events: {}", report.received_events),
-    ]);
-    lines
+fn serve_lines(
+    local_addr: SocketAddr,
+    accepted_connections: usize,
+    canonical_rows: usize,
+    received_events: usize,
+    sent_frames: usize,
+) -> Vec<String> {
+    vec![
+        format!("listening: {local_addr}"),
+        format!("accepted_connections: {accepted_connections}"),
+        format!("canonical_in: {canonical_rows}"),
+        format!("received_events: {received_events}"),
+        format!("sent_frames: {sent_frames}"),
+    ]
 }
 
 fn print_line_now(line: &str) -> Result<(), String> {

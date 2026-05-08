@@ -1,22 +1,22 @@
 //! Projector for connection response events.
 //!
 //! Responses are connection facts, not transport effects. They answer a
-//! specific request and commit the responder to the connection id derived from
-//! that request.
+//! specific request. The response's event id is the connection id; the response
+//! bytes carry the traffic secret used by connection transit.
 //!
 //! This projector has two legal modes:
 //!
 //! ```text
 //! local response, no receive metadata
 //!   -> verify request dependency
-//!   -> store response bytes only
+//!   -> store response bytes
+//!   -> project connection(event_id(response), requester endpoint)
 //!
 //! received response, with endpoint receive metadata
-//!   -> verify request dependency
-//!   -> verify response endpoint direction and derived connection id
+//!   -> verify request dependency and response endpoint direction
 //!   -> verify receive endpoint/sender/authorization
 //!   -> store response bytes
-//!   -> project connection(response.connection_id, response.from_endpoint)
+//!   -> project connection(event_id(response), responder endpoint)
 //!   -> optionally remember the observed route
 //! ```
 //!
@@ -34,7 +34,6 @@ use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput}
 
 use super::super::connection_request;
 use super::super::schema as projection;
-use super::super::types;
 use super::codec;
 use crate::protocol::event_modules::types::ReceiveAuthorization;
 
@@ -42,13 +41,7 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
     let bytes = event.record.canonical_bytes.clone();
     let receive = event.context.receive;
     let response = codec::decode(&bytes)?;
-    // The response body carries a connection id, but that id is accepted only
-    // if it is exactly the deterministic id for the request and responder.
-    let expected_connection_id =
-        types::connection_id(&response.request_id, &response.from_endpoint);
-    if response.connection_id != expected_connection_id {
-        return Err("connection response has an invalid connection id".to_string());
-    }
+    let connection_id = event.context.event_id;
     // Request bytes are dependency context supplied by the common worker. If
     // the request is absent or failed projection, this response cannot project.
     let request = event
@@ -64,12 +57,7 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
         return Err("connection response sender does not match request recipient".to_string());
     }
 
-    // Always cache the canonical response bytes so future facts can depend on
-    // exactly this response event if the protocol starts using that edge.
-    let mut rows = vec![projection::connection_event_row(
-        types::event_id(&bytes),
-        bytes,
-    )];
+    let mut rows = Vec::new();
     if let Some(receive) = receive {
         // Received responses are useful only when transit provenance agrees
         // with the canonical body. Otherwise a peer could forward a valid
@@ -87,7 +75,7 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
         // response that has passed both dependency validation and receive
         // provenance validation.
         rows.push(projection::connection_row(
-            response.connection_id,
+            connection_id,
             response.from_endpoint,
         ));
         if receive.remember_route() {
@@ -95,10 +83,15 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
             // into the response fact and is only written when the worker marks
             // the observed route as reusable.
             rows.push(projection::transport_target_row(
-                response.connection_id,
+                connection_id,
                 receive.origin(),
             ));
         }
+    } else {
+        rows.push(projection::connection_row(
+            connection_id,
+            response.to_endpoint,
+        ));
     }
     Ok(ProjectionOutput::rows(rows))
 }
@@ -136,7 +129,7 @@ mod tests {
             from_endpoint: [4; 32],
             to_endpoint: [1; 32],
             request_id,
-            connection_id: types::connection_id(&request_id, &[4; 32]),
+            traffic_secret: [5; 32],
         };
         codec::record_from_bytes(codec::encode(&response)).expect("response record")
     }
@@ -170,12 +163,12 @@ mod tests {
             project(&context_for(&response, request_id, request)).expect("project response");
 
         assert_eq!(output.rows.len(), 1);
-        assert_eq!(output.rows[0].table, schema::CONNECTION_EVENTS);
         assert_eq!(
             output.rows[0].key,
             types::event_id(&response.canonical_bytes)
         );
-        assert_eq!(output.rows[0].value, response.canonical_bytes);
+        assert_eq!(output.rows[0].table, schema::CONNECTIONS);
+        assert_eq!(output.rows[0].value, [1; 32]);
     }
 
     #[test]
@@ -201,12 +194,11 @@ mod tests {
         })
         .expect("project response");
 
-        assert_eq!(output.rows.len(), 3);
-        assert_eq!(output.rows[0].table, schema::CONNECTION_EVENTS);
-        assert_eq!(output.rows[1].table, schema::CONNECTIONS);
-        assert_eq!(output.rows[2].table, schema::TRANSPORT_TARGETS);
-        assert_eq!(output.rows[1].value, [4; 32]);
-        assert_eq!(output.rows[2].value, origin.to_string().into_bytes());
+        assert_eq!(output.rows.len(), 2);
+        assert_eq!(output.rows[0].table, schema::CONNECTIONS);
+        assert_eq!(output.rows[1].table, schema::TRANSPORT_TARGETS);
+        assert_eq!(output.rows[0].value, [4; 32]);
+        assert_eq!(output.rows[1].value, origin.to_string().into_bytes());
     }
 
     #[test]

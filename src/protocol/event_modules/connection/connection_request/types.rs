@@ -5,11 +5,10 @@
 //! event is a normal local dependency: transit does not reconstruct it from
 //! projected rows.
 //!
-//! `from_listen_addr` is the requester's advertised steady-state listener
-//! address, when known. The accepting peer uses it as a transport target so the
-//! daemons can reach each other after the bootstrap stream closes. The field is
-//! optional because not every requester runs a listener; bootstrap still works
-//! when only one side advertises.
+//! `from_listen_addr` is retained as optional request metadata, but invite
+//! bootstrap does not treat it as route authority. Route rows are local state:
+//! the requester records the invite address it dialed, and receive paths only
+//! record routes from explicit receive metadata.
 
 use std::net::SocketAddr;
 

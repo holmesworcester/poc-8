@@ -29,11 +29,8 @@ pub use encryption::local_history_node_secret as leaf_history_node;
 use std::sync::Arc;
 
 use crate::core::store::{Schema, Store};
-use crate::protocol::event_modules::types::{EventRecord, ReceiveMetadata};
-use crate::protocol::event_modules::worker::{
-    EventRegistry, EventWithContext, ProjectionOutput, ReceivedRecord,
-};
-use crate::workers::schema::{TransitProvenance, TransitUnwrap};
+use crate::protocol::event_modules::types::EventRecord;
+use crate::protocol::event_modules::worker::{EventRegistry, EventWithContext, ProjectionOutput};
 
 #[derive(Debug, Clone, Default)]
 pub struct Modules {
@@ -124,25 +121,6 @@ impl EventRegistry for Modules {
         self.record_from_bytes(bytes)
     }
 
-    fn record_from_canonical_in(
-        &self,
-        store: &Store,
-        bytes: Vec<u8>,
-        receive: Option<ReceiveMetadata>,
-        provenance: Option<TransitProvenance>,
-    ) -> Result<ReceivedRecord, String> {
-        match provenance {
-            Some(provenance) => record_from_transit_canonical_in(store, bytes, provenance),
-            None => {
-                let record = self.record_from_bytes(bytes)?;
-                Ok(match receive {
-                    Some(receive) => ReceivedRecord::with_receive(record, receive),
-                    None => ReceivedRecord::new(record),
-                })
-            }
-        }
-    }
-
     fn project_record(
         &self,
         store: &Store,
@@ -156,114 +134,8 @@ impl EventRegistry for Modules {
         // catalog. The catalog observes projector-emitted indicator rows and
         // dispatches to the right worker, so this registry stays narrow: it
         // does not branch on event type or own worker dispatch logic.
-        crate::workers::drain_post_admission_purge_pending(store, self)
-    }
-}
-
-fn record_from_transit_canonical_in(
-    store: &Store,
-    bytes: Vec<u8>,
-    provenance: TransitProvenance,
-) -> Result<ReceivedRecord, String> {
-    match provenance.unwrapped_with {
-        TransitUnwrap::Bootstrap => {
-            if !connection::connection_request::codec::is_request(&bytes) {
-                return Err(
-                    "endpoint bootstrap transit only carries connection requests".to_string(),
-                );
-            }
-            let record = connection::connection_request::codec::record_from_bytes(bytes)?;
-            return Ok(ReceivedRecord::with_receive(
-                record,
-                ReceiveMetadata::bootstrap_invite(
-                    provenance.origin,
-                    provenance.local_endpoint,
-                    provenance.sender_endpoint,
-                    provenance.remember_route,
-                ),
-            ));
-        }
-        TransitUnwrap::InviteBootstrap { workspace_id, .. } => {
-            let record = record_from_bytes(bytes)?;
-            if !record.scope.is_shared() {
-                return Err("invite bootstrap transit only accepts shared events".to_string());
-            }
-            if record.workspace_id != Some(workspace_id) {
-                return Err(
-                    "invite bootstrap transit rejected event outside invite workspace".to_string(),
-                );
-            }
-            if !is_identity_bootstrap_event(&record.canonical_bytes)? {
-                return Err(
-                    "invite bootstrap transit only accepts identity bootstrap events".to_string(),
-                );
-            }
-            return Ok(ReceivedRecord::new(record));
-        }
-        TransitUnwrap::Connection { connection_id } => {
-            if connection::connection_request::codec::is_request(&bytes) {
-                return Err("connection transit cannot carry connection requests".to_string());
-            }
-            if connection::connection_response::codec::is_response(&bytes) {
-                let record = connection::connection_response::codec::record_from_bytes(bytes)?;
-                return Ok(ReceivedRecord::with_receive(
-                    record,
-                    ReceiveMetadata::endpoint_receive(
-                        provenance.origin,
-                        provenance.local_endpoint,
-                        provenance.sender_endpoint,
-                        provenance.remember_route,
-                    ),
-                ));
-            }
-            if sync::is_connection_scoped_event(&bytes) {
-                return sync::inbound_record_from_connection_bytes(connection_id, bytes)
-                    .map(ReceivedRecord::new);
-            }
-        }
-    }
-    let TransitUnwrap::Connection { .. } = provenance.unwrapped_with else {
-        return Err("transit provenance cannot admit this event".to_string());
-    };
-    let record = record_from_bytes(bytes)?;
-    if !record.scope.is_shared() {
-        return Err(
-            "connection transit only accepts shared or connection-scoped events".to_string(),
-        );
-    }
-    let workspace_id = record
-        .workspace_id
-        .ok_or_else(|| "transit shared in requires a workspace".to_string())?;
-    let allowed_workspaces = identity::endpoint_shared::schema::mutual_workspace_ids(
-        store,
-        provenance.local_endpoint,
-        provenance.sender_endpoint,
-    )?;
-    if !allowed_workspaces
-        .iter()
-        .any(|allowed| allowed == &workspace_id)
-    {
-        return Err("transit shared in rejected event outside sender workspace".to_string());
-    }
-    Ok(ReceivedRecord::new(record))
-}
-
-pub(crate) fn is_identity_bootstrap_event(bytes: &[u8]) -> Result<bool, String> {
-    match bytes.first().copied() {
-        Some(identity::workspace::codec::TYPE_WORKSPACE) => Ok(true),
-        Some(identity::signed::codec::TYPE_SIGNED) => {
-            let envelope = identity::signed::codec::decode(bytes)?;
-            Ok(matches!(
-                envelope.inner_type,
-                identity::admin::codec::TYPE_ADMIN
-                    | identity::user_invite::codec::TYPE_USER_INVITE
-                    | identity::invite_server::codec::TYPE_INVITE_SERVER
-                    | identity::user::codec::TYPE_USER
-                    | identity::device_invite::codec::TYPE_DEVICE_INVITE
-                    | identity::endpoint_shared::codec::TYPE_ENDPOINT_SHARED
-            ))
-        }
-        _ => Ok(false),
+        crate::workers::drain_post_admission_purge_pending(store, self)?;
+        crate::workers::drain_post_admission_message_leaves(store, self)
     }
 }
 

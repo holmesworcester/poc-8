@@ -846,7 +846,8 @@ fn cli_files_listing_shows_zero_progress_when_only_descriptor_received() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
     let bob = temp_db(&tmp, "bob.db");
-    let workspace_id = create_workspace(&alice, "Zero", "alice", "alice-laptop");    let invite_port = free_port();
+    let workspace_id = create_workspace(&alice, "Zero", "alice", "alice-laptop");
+    let invite_port = free_port();
     let alice_port = free_port();
     let bob_port = free_port();
 
@@ -1069,7 +1070,8 @@ fn cli_delete_message_purges_attached_file_on_peer_after_sync() {
         raw.windows(sentinel.len())
             .all(|w| w != sentinel.as_bytes()),
         "sentinel survived on peer DB after delete sync; purge not propagated"
-    );}
+    );
+}
 
 fn create_workspace(db: &str, name: &str, username: &str, device_name: &str) -> String {
     let out = assert_success(topo(&[

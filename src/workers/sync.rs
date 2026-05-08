@@ -37,11 +37,11 @@
 //! projected sync in rows -> compare/have/need handler for that connection
 //! ```
 //!
-//! The response paths produce connection-scoped sync events. Those events are
-//! transient protocol facts: they can be projected into the transit out,
-//! wrapped by transit out, and deduped while queued, but they are not
-//! part of the durable content history. Requested durable events are queued by
-//! id for transit out; sync does not build data packets. When an
+//! The response paths produce durable local connection-scoped sync events.
+//! Those events can be projected into transit out, wrapped by transit out, and
+//! deduped while queued, but they are not part of the shared content history.
+//! Requested shared events are queued by id for transit out; sync does not
+//! build data packets. When an
 //! inbound sync event arrives on a connection without a stored return route, the
 //! response is queued on another routed connection to the same remote endpoint.
 //! Daemon ticks process inbound sync work before starting new compares. Starting
@@ -135,54 +135,13 @@ impl SyncIndex {
             .map_err(|_| "sync index mutex poisoned".to_string())?;
         state.dependency_closure_entries(store, roots)
     }
-
-    fn start_summary_if_changed(
-        &self,
-        connection_id: connection::types::ConnectionId,
-        range: TimestampRange,
-        compute: impl FnOnce() -> Result<RangeSummary, String>,
-    ) -> Result<Option<RangeSummary>, String> {
-        let key = start_snapshot_key(connection_id, range);
-        let generation = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| "sync index mutex poisoned".to_string())?;
-            if matches!(
-                state.start_snapshots.get(&key),
-                Some(snapshot) if snapshot.generation == state.generation
-            ) {
-                return Ok(None);
-            }
-            state.generation
-        };
-
-        let summary = compute()?;
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "sync index mutex poisoned".to_string())?;
-        let changed = state
-            .start_snapshots
-            .get(&key)
-            .map(|snapshot| snapshot.summary != summary)
-            .unwrap_or(true);
-        state.start_snapshots.insert(
-            key,
-            StartSnapshot {
-                generation,
-                summary,
-            },
-        );
-        Ok(changed.then_some(summary))
-    }
 }
 
 /// Work accepted by the sync worker.
 ///
 /// `DrainIndex` processes the shared-event feed. `Start` creates initial
 /// compare events for route exchange. `DrainIn` handles work already projected
-/// from transient inbound sync events.
+/// from inbound connection-scoped sync events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Work {
     Tick {
@@ -401,11 +360,7 @@ fn start(
         if context.workspace_ids.is_empty() {
             continue;
         }
-        let Some(summary) =
-            index.start_summary_if_changed(connection_id, range, || context.summary(range))?
-        else {
-            continue;
-        };
+        let summary = context.summary(range)?;
         let output = commands::start_for_connection_with_summary(connection_id, range, summary)?;
         events.extend(output.events);
         sent_events += output.value.sent_events;
@@ -622,24 +577,15 @@ fn summarize_entries(entries: &[EventIndexEntry]) -> RangeSummary {
 
 #[derive(Debug, Default)]
 struct IndexState {
-    generation: u64,
     indexed: HashSet<EventId>,
     ids_by_time: BTreeMap<(u64, EventId), EventIndexEntry>,
     entries_by_id: HashMap<EventId, EventIndexEntry>,
     deps_by_event: HashMap<EventId, Vec<EventId>>,
-    start_snapshots: HashMap<(connection::types::ConnectionId, u64, u64), StartSnapshot>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StartSnapshot {
-    generation: u64,
-    summary: RangeSummary,
 }
 
 impl IndexState {
     fn insert(&mut self, entry: EventIndexEntry) {
         self.indexed.insert(entry.event_id);
-        self.generation = self.generation.wrapping_add(1);
         self.ids_by_time
             .insert((entry.timestamp, entry.event_id), entry.clone());
         self.entries_by_id.insert(entry.event_id, entry);
@@ -705,13 +651,6 @@ impl IndexState {
         self.deps_by_event.insert(*event_id, dependencies.clone());
         Ok(dependencies)
     }
-}
-
-fn start_snapshot_key(
-    connection_id: connection::types::ConnectionId,
-    range: TimestampRange,
-) -> (connection::types::ConnectionId, u64, u64) {
-    (connection_id, range.start, range.end)
 }
 
 fn fingerprint_id(id: &EventId) -> [u8; 32] {
@@ -782,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_large_start_ticks_skip_until_visible_summary_changes() {
+    fn repeated_large_start_ticks_poll_routed_peers() {
         let local = endpoint::commands::create_local_keypair().value;
         let remote = endpoint::commands::create_local_keypair().value;
         let store = routed_sync_store(local, remote);
@@ -803,11 +742,11 @@ mod tests {
         assert_eq!(first.value.sent_events, 1);
         assert_eq!(first.events.len(), 1);
 
-        for _ in 0..1_000 {
+        for _ in 0..10 {
             let repeated = tick_output(&store, &index);
-            assert_eq!(repeated.value.started_rounds, 0);
-            assert_eq!(repeated.value.sent_events, 0);
-            assert!(repeated.events.is_empty());
+            assert_eq!(repeated.value.started_rounds, 1);
+            assert_eq!(repeated.value.sent_events, 1);
+            assert_eq!(repeated.events.len(), 1);
         }
 
         index
@@ -819,10 +758,10 @@ mod tests {
             .expect("insert unrelated index entry");
         let unrelated = tick_output(&store, &index);
         assert_eq!(
-            unrelated.value.started_rounds, 0,
-            "global index churn outside the mutual workspace should refresh the snapshot without sending"
+            unrelated.value.started_rounds, 1,
+            "routed peers are polled even when only unrelated local state changed"
         );
-        assert_eq!(unrelated.value.sent_events, 0);
+        assert_eq!(unrelated.value.sent_events, 1);
 
         index
             .insert_entry(EventIndexEntry {

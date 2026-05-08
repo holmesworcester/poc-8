@@ -30,8 +30,8 @@ use crate::core::{
     network_queues::{self, InboundNetworkRow},
     store::{Schema, Store},
 };
-use event_modules::types::{EventRecord, ReceiveMetadata};
-use event_modules::worker::{EventRegistry, EventWithContext, ProjectionOutput, ReceivedRecord};
+use event_modules::types::EventRecord;
+use event_modules::worker::{EventRegistry, EventWithContext, ProjectionOutput};
 use event_modules::Modules;
 
 #[derive(Debug, Clone, Default)]
@@ -82,17 +82,6 @@ impl EventRegistry for Protocol {
         inbound: &InboundNetworkRow,
     ) -> Result<ProjectionOutput, String> {
         event_modules::connection::transit::projector::project_network_in(store, inbound, false)
-    }
-
-    fn record_from_canonical_in(
-        &self,
-        store: &Store,
-        bytes: Vec<u8>,
-        receive: Option<ReceiveMetadata>,
-        provenance: Option<crate::workers::schema::TransitProvenance>,
-    ) -> Result<ReceivedRecord, String> {
-        self.modules
-            .record_from_canonical_in(store, bytes, receive, provenance)
     }
 
     fn project_record(

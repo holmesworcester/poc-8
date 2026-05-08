@@ -14,7 +14,7 @@ pub mod queries;
 pub mod schema;
 pub mod transit;
 pub mod types;
-pub use crate::workers::bootstrap_exchange as worker;
+pub use crate::workers::bootstrap_connect as worker;
 
 use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput};
 

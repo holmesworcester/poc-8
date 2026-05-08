@@ -5,7 +5,6 @@
 //! worker answers it by queuing the requested durable event id, not by
 //! manufacturing a data packet.
 
-use crate::protocol::event_modules::connection;
 use crate::protocol::event_modules::types::{ConnectionScope, EventScope};
 use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput};
 use crate::workers::schema as worker_schema;
@@ -19,10 +18,6 @@ pub fn project(envelope: &EventWithContext<'_>) -> Result<ProjectionOutput, Stri
         EventScope::Connection(ConnectionScope::Outgoing { connection_id }) => {
             ensure_connection(need.connection_id, connection_id)?;
             Ok(ProjectionOutput::rows(vec![
-                connection::schema::connection_scoped_event_row(
-                    envelope.context.event_id,
-                    bytes.to_vec(),
-                ),
                 worker_schema::transit_out_row(connection_id, envelope.context.event_id),
             ]))
         }
@@ -50,7 +45,6 @@ fn ensure_connection(actual: [u8; 32], scoped: [u8; 32]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::protocol::event_modules::connection;
     use crate::protocol::event_modules::types::{event_id, EventRecord};
     use crate::protocol::event_modules::worker::EventContext;
     use crate::workers::schema as worker_schema;
@@ -78,16 +72,12 @@ mod tests {
     }
 
     #[test]
-    fn outgoing_need_id_projects_cached_event_and_transit_out_rows() {
+    fn outgoing_need_id_projects_transit_out_row() {
         let record = codec::outbound_record(need_event()).expect("record");
         let output = project(&context_for(&record)).expect("project outgoing");
 
-        assert_eq!(output.rows.len(), 2);
-        assert_eq!(
-            output.rows[0].table,
-            connection::schema::CONNECTION_SCOPED_EVENTS
-        );
-        assert_eq!(output.rows[1].table, worker_schema::TRANSIT_OUT);
+        assert_eq!(output.rows.len(), 1);
+        assert_eq!(output.rows[0].table, worker_schema::TRANSIT_OUT);
     }
 
     #[test]

@@ -14,7 +14,6 @@ use crate::protocol::event_modules::types::EventId;
 pub type TransitNonce = [u8; 24];
 
 pub(super) const BOOTSTRAP_PURPOSE: &[u8] = b"topo-bootstrap-transit-v1";
-pub(super) const CONNECTION_PURPOSE: &[u8] = b"topo-connection-transit-v1";
 pub(super) const INVITE_BOOTSTRAP_PURPOSE: &[u8] = b"topo-invite-bootstrap-transit-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

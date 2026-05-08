@@ -105,9 +105,12 @@ impl ReceiveMetadata {
 ///
 /// `Shared` participates in sync. `Local` is durable but node-local.
 /// `Transient` is a real event for projection purposes but is not stored in the
-/// durable event history. `Connection` is also transient; it carries the
-/// connection context needed by projectors for protocol messages whose canonical
-/// bytes are scoped to one established connection.
+/// durable event history. `Connection` is durable and node-local; it carries
+/// the connection context needed by projectors for protocol messages whose
+/// canonical bytes are scoped to one established connection.
+///
+/// TODO: add a TTL purge for old applied connection-scoped sync protocol events
+/// after their transit queues have drained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventScope {
     Shared,
@@ -122,29 +125,44 @@ impl EventScope {
     }
 
     pub fn is_durable(self) -> bool {
-        matches!(self, Self::Shared | Self::Local)
+        matches!(self, Self::Shared | Self::Local | Self::Connection(_))
     }
 
     pub fn durable_tag(self) -> Result<u8, String> {
         match self {
             Self::Shared => Ok(0),
             Self::Local => Ok(1),
-            Self::Transient | Self::Connection(_) => {
-                Err("non-durable event scope cannot be stored".to_string())
-            }
+            Self::Connection(ConnectionScope::Outgoing { .. }) => Ok(2),
+            Self::Connection(ConnectionScope::Incoming { .. }) => Ok(3),
+            Self::Transient => Err("non-durable event scope cannot be stored".to_string()),
         }
     }
 
-    pub fn from_durable_tag(value: u8) -> Result<Self, String> {
+    pub fn durable_context_id(self) -> Option<EventId> {
+        match self {
+            Self::Connection(scope) => Some(scope.connection_id()),
+            _ => None,
+        }
+    }
+
+    pub fn from_durable_parts(value: u8, context_id: Option<EventId>) -> Result<Self, String> {
         match value {
             0 => Ok(Self::Shared),
             1 => Ok(Self::Local),
+            2 => Ok(Self::Connection(ConnectionScope::Outgoing {
+                connection_id: context_id
+                    .ok_or_else(|| "connection event scope is missing connection id".to_string())?,
+            })),
+            3 => Ok(Self::Connection(ConnectionScope::Incoming {
+                connection_id: context_id
+                    .ok_or_else(|| "connection event scope is missing connection id".to_string())?,
+            })),
             _ => Err(format!("unknown durable event scope {value}")),
         }
     }
 }
 
-/// Projection context for a connection-scoped transient event.
+/// Projection context for a connection-scoped local event.
 ///
 /// This is deliberately metadata, not event-body data. The same canonical sync
 /// event bytes can be locally proposed for a connection or received from that

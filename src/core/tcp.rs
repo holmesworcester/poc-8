@@ -35,6 +35,7 @@ use crate::core::store::Store;
 
 const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 const WRITE_FRAME_BUDGET: Duration = Duration::from_millis(100);
+const READ_FRAME_IDLE_BUDGET: Duration = Duration::from_millis(500);
 
 /// Counts observed while pumping one TCP stream.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -91,6 +92,13 @@ impl Listener {
         stream
             .set_nodelay(true)
             .map_err(|err| format!("set stream nodelay: {err}"))?;
+        // This accept shape stages inbound bytes for later workers and never
+        // sends same-stream replies. Half-close our write side before draining
+        // so callers using `connect_exchange` can finish after sending their
+        // initial frames instead of waiting for a reply that will not exist.
+        stream
+            .shutdown(Shutdown::Write)
+            .map_err(|err| format!("shutdown accepted stream write: {err}"))?;
         let value = read_inbound_frames(store, &mut stream, NetworkSource::new(source_addr))?;
         Ok(AcceptReport {
             accepted_connections: 1,
@@ -160,11 +168,12 @@ pub fn listen(listen: SocketAddr) -> Result<Listener, String> {
 
 /// Open a TCP stream, send outbound rows for that target, and return.
 ///
-/// This is the daemon-friendly shape for queued outbound work whose responses
-/// will arrive later as ordinary inbound streams. It still stages bytes in the
-/// core outbound queue and calls `on_sent` only after bounded socket writes and
-/// queue deletion complete. If the remote side stops draining its socket, the write
-/// times out and the protocol send rows remain queued for a later pass.
+/// This is the one-way shape for command paths that do not expect same-stream
+/// replies. Response-aware daemon exchange uses `connect_exchange`. This still
+/// stages bytes in the core outbound queue and calls `on_sent` only after
+/// bounded socket writes and queue deletion complete. If the remote side stops
+/// draining its socket, the write times out and protocol send rows remain
+/// queued for a later pass.
 pub fn send_once<T>(
     store: &Store,
     target: NetworkTarget,
@@ -265,6 +274,9 @@ fn pump_stream<T>(
 ) -> Result<(StreamReport, T), String> {
     let mut report = StreamReport::default();
     let mut write_open = true;
+    stream
+        .set_read_timeout(Some(READ_FRAME_IDLE_BUDGET))
+        .map_err(|err| format!("set stream read timeout: {err}"))?;
     write_outbound(
         store,
         stream,
@@ -279,6 +291,7 @@ fn pump_stream<T>(
         let bytes = match read_frame(stream) {
             Ok(bytes) => bytes,
             Err(err) if is_stream_closed(&err) => break,
+            Err(err) if is_stream_idle_timeout(&err) => break,
             Err(err) => return Err(format!("read frame: {err}")),
         };
         report.received_frames += 1;
@@ -320,10 +333,14 @@ fn read_inbound_frames(
     source: NetworkSource,
 ) -> Result<StreamReport, String> {
     let mut report = StreamReport::default();
+    stream
+        .set_read_timeout(Some(READ_FRAME_IDLE_BUDGET))
+        .map_err(|err| format!("set stream read timeout: {err}"))?;
     loop {
         let bytes = match read_frame(stream) {
             Ok(bytes) => bytes,
             Err(err) if is_stream_closed(&err) => break,
+            Err(err) if is_stream_idle_timeout(&err) => break,
             Err(err) => return Err(format!("read frame: {err}")),
         };
         report.received_frames += 1;
@@ -463,6 +480,13 @@ fn is_stream_closed(err: &std::io::Error) -> bool {
         std::io::ErrorKind::UnexpectedEof
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::BrokenPipe
+    )
+}
+
+fn is_stream_idle_timeout(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
     )
 }
 

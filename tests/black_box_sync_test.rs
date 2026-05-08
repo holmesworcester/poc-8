@@ -176,7 +176,7 @@ fn cli_two_long_running_daemons_converge_messages_without_manual_sync() {
     poll_for_workspace_member(&bob, &workspace, "bob", 10_000);
 
     let bob_recipient_id = line_value(
-        &assert_success(topo(&["--db", &bob, "key-recipient", &workspace])),
+        &poll_for_key_recipient(&bob, &workspace, 10_000),
         "recipient_key_id",
     );
 
@@ -203,9 +203,8 @@ fn cli_two_long_running_daemons_converge_messages_without_manual_sync() {
 
 #[test]
 #[ignore = "asymmetric three-peer late-joiner convergence still has a transit \
-admission race when alice's bootstrap_serve is concurrently processing bob's \
-sync compares while accepting carol's bootstrap stream; tracked as a follow-on \
-fix"]
+admission race while alice processes bob's sync compares and carol's bootstrap \
+stream concurrently; tracked as a follow-on fix"]
 fn cli_three_long_running_daemons_converge_messages_among_late_joiner() {
     // alice runs a daemon. bob accepts alice's daemon-served invite, then
     // carol does the same. All three converge on shared messages from alice
@@ -242,11 +241,11 @@ fn cli_three_long_running_daemons_converge_messages_among_late_joiner() {
     poll_for_workspace_member(&carol, &workspace, "carol", 10_000);
 
     let bob_recipient_id = line_value(
-        &assert_success(topo(&["--db", &bob, "key-recipient", &workspace])),
+        &poll_for_key_recipient(&bob, &workspace, 10_000),
         "recipient_key_id",
     );
     let carol_recipient_id = line_value(
-        &assert_success(topo(&["--db", &carol, "key-recipient", &workspace])),
+        &poll_for_key_recipient(&carol, &workspace, 10_000),
         "recipient_key_id",
     );
 
@@ -304,12 +303,7 @@ fn invite_link_from_output(output: &str) -> String {
         .to_string()
 }
 
-fn accept_with_identity_retry(
-    db: &str,
-    invite: &str,
-    username: &str,
-    device_name: &str,
-) -> String {
+fn accept_with_identity_retry(db: &str, invite: &str, username: &str, device_name: &str) -> String {
     let mut last = String::new();
     for _ in 0..200 {
         let output = topo(&[
@@ -352,6 +346,20 @@ fn poll_for_workspace_member(db: &str, workspace_id: &str, username: &str, timeo
         thread::sleep(Duration::from_millis(250));
     }
     panic!("user {username} did not converge into {db}; last output:\n{last}");
+}
+
+fn poll_for_key_recipient(db: &str, workspace_id: &str, timeout_ms: u64) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let mut last = String::new();
+    while std::time::Instant::now() < deadline {
+        let out = topo(&["--db", db, "key-recipient", workspace_id]);
+        if out.status.success() {
+            return stdout(&out);
+        }
+        last = stderr(&out);
+        thread::sleep(Duration::from_millis(250));
+    }
+    panic!("key recipient did not converge in {db}; last output:\n{last}");
 }
 
 fn poll_for_wrap_eligibility(
@@ -615,11 +623,7 @@ impl Drop for RunningDaemon {
         if let Some(stderr) = self.stderr.take() {
             if let Ok(text) = stderr.join() {
                 if !text.trim().is_empty() {
-                    eprintln!(
-                        "[daemon-stderr label={}] {}",
-                        self.label,
-                        text.trim_end()
-                    );
+                    eprintln!("[daemon-stderr label={}] {}", self.label, text.trim_end());
                 }
             }
         }

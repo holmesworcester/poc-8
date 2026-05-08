@@ -2032,7 +2032,11 @@ mod tests {
         }
         let pre_rows = local_history_node_secret::schema::list_for_workspace(&store, WORKSPACE)
             .expect("pre rows");
-        assert_eq!(pre_rows.len(), N, "every fresh send admits exactly one leaf row");
+        assert_eq!(
+            pre_rows.len(),
+            N,
+            "every fresh send admits exactly one leaf row"
+        );
         for row in &pre_rows {
             assert!(
                 local_history_node_secret::types::is_leaf_row(row),
@@ -2137,8 +2141,8 @@ mod tests {
         )
         .expect("retire");
 
-        let rows = local_history_node_secret::schema::list_for_workspace(&store, WORKSPACE)
-            .expect("rows");
+        let rows =
+            local_history_node_secret::schema::list_for_workspace(&store, WORKSPACE).expect("rows");
         // Adjacent minute_nodes (range_width=1, bit_depth=0) at minute 99 or 101
         // must not exist.
         for adjacent in [99u64, 101u64] {

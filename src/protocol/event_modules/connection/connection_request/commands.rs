@@ -22,9 +22,9 @@
 //!   local invite-secret fact proposed immediately before it.
 //! - Bootstrap authorization is carried by the request dependency edge, not by
 //!   transit code reconstructing secret state from projected rows.
-//! - The returned connection id is derived from `(request_id, invite endpoint)`
-//!   so the local requester can name the same connection fact before any later
-//!   traffic arrives.
+//! - The request does not create a usable connection by itself. The response
+//!   event carries the traffic secret and its event id becomes the connection
+//!   id.
 //! - The returned bytes are transport bytes only. They are not stored as the
 //!   semantic fact; the inner request event is.
 
@@ -35,8 +35,7 @@ use crate::protocol::event_modules::identity::{endpoint, invite};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker::CommandOutput;
 
-use super::super::transit;
-use super::super::types;
+use super::super::{transit, types};
 use super::codec;
 use super::types::RequestEvent;
 
@@ -46,9 +45,6 @@ pub struct OutboundRequest {
     pub bytes: Vec<u8>,
     /// Deterministic id of the connection request event.
     pub request_id: EventId,
-    /// Local view of the connection id derived from the request and invite
-    /// endpoint.
-    pub connection_id: types::ConnectionId,
     /// Socket address advertised by the invite link.
     pub addr: std::net::SocketAddr,
 }
@@ -90,13 +86,11 @@ pub fn create(
     };
     let inner = codec::encode(&event);
     let request_id = types::event_id(&inner);
-    let connection_id = types::connection_id(&request_id, &invite.endpoint);
     let record = codec::record_from_bytes(inner.clone())?;
     Ok(CommandOutput::with_events(
         OutboundRequest {
             bytes: transit::commands::create_bootstrap(&local, invite.endpoint, &inner)?,
             request_id,
-            connection_id,
             addr: invite.addr,
         },
         vec![invite_secret_record, record],
@@ -109,10 +103,9 @@ pub fn create(
 /// endpoint exists, the endpoint command's proposed local event is prepended so
 /// admission sees the endpoint material before the request uses it.
 ///
-/// `from_listen_addr` is the local steady-state listener advertised inside the
-/// request body. Callers read it from `connection::schema::local_listen_addr`
-/// before invoking this command; passing `None` keeps the request asymmetric
-/// and still bootstraps correctly when no daemon is running.
+/// `from_listen_addr` is optional metadata inside the request body. It is not
+/// projected as route state during invite bootstrap; callers that can continue
+/// retrying persist the invite address locally.
 pub fn create_with_local(
     context: &impl endpoint::commands::LocalEndpointRead,
     invite_link: &str,
@@ -163,8 +156,7 @@ mod tests {
         let invite_link = invite::commands::create(inviter, invite_addr).value;
         let local_listen = "127.0.0.1:50000".parse::<SocketAddr>().expect("listen");
 
-        let output =
-            create(connector, &invite_link, Some(local_listen)).expect("create request");
+        let output = create(connector, &invite_link, Some(local_listen)).expect("create request");
         let request =
             codec::decode(&output.events[1].record().canonical_bytes).expect("decode request");
 

@@ -248,7 +248,6 @@ fn daemon_runner_is_core_and_protocol_supplies_workers() {
     let workers = source_text(&root.join("src/workers/mod.rs"));
     assert!(
         workers.contains("pub fn daemon_workers")
-            && workers.contains("bootstrap_exchange::daemon_worker")
             && workers.contains("transit_in::daemon_worker")
             && workers.contains("event_admission::daemon_worker")
             && workers.contains("sync::daemon_worker"),
@@ -499,7 +498,6 @@ fn event_module_files_use_only_standard_concern_names() {
         "mod.rs",
         "projector.rs",
         "queries.rs",
-        "registry_meta.rs",
         "schema.rs",
         "types.rs",
         "worker.rs",
@@ -616,7 +614,7 @@ fn workers_folder_has_standard_catalog_shape() {
         "pipeline_helpers/event_pipeline.rs",
         "pipeline_helpers/event_lifecycle.rs",
         "pipeline_helpers/purging.rs",
-        "bootstrap_exchange.rs",
+        "bootstrap_connect.rs",
         "transit_in.rs",
         "content_purge.rs",
         "event_admission.rs",
@@ -639,11 +637,11 @@ fn workers_folder_has_standard_catalog_shape() {
 }
 
 #[test]
-fn socket_receive_is_bootstrap_exchange_transit_in_and_outbound_is_transit_out() {
+fn socket_receive_is_transit_in_and_outbound_is_transit_out() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     assert!(
         !root.join("src/workers/connection_io.rs").exists(),
-        "transit mechanics should live behind bootstrap_exchange, transit_in, and transit_out"
+        "transit mechanics should live behind transit_in and transit_out"
     );
     assert!(
         !root.join("src/workers/connection.rs").exists(),
@@ -653,10 +651,10 @@ fn socket_receive_is_bootstrap_exchange_transit_in_and_outbound_is_transit_out()
     let catalog = source_text(&root.join("src/workers/mod.rs"));
     assert!(
         catalog.contains("transit_in::daemon_worker()")
-            && catalog.contains("bootstrap_exchange::daemon_worker()")
             && catalog.contains("event_admission::daemon_worker()")
-            && catalog.contains("transit_out::daemon_worker()"),
-        "the daemon catalog should schedule bootstrap_exchange, transit_in, event_admission, and transit_out workers"
+            && catalog.contains("transit_out::daemon_worker()")
+            && !catalog.contains("transport_accept::daemon_worker()"),
+        "the daemon catalog should schedule transit_in, event_admission, and transit_out workers without a separate transport_accept worker"
     );
     assert!(
         !catalog.contains("connection_io::daemon_worker()"),
@@ -1358,6 +1356,7 @@ fn network_admission_does_not_reconstruct_connection_request_dependencies() {
     let transit_projector =
         source_text(&root.join("src/protocol/event_modules/connection/transit/projector.rs"));
     let registry = source_text(&root.join("src/protocol/event_modules/mod.rs"));
+    let event_admission = source_text(&root.join("src/workers/event_admission.rs"));
     let request_codec = source_text(
         &root.join("src/protocol/event_modules/connection/connection_request/codec.rs"),
     );
@@ -1367,6 +1366,14 @@ fn network_admission_does_not_reconstruct_connection_request_dependencies() {
             && !transit_projector.contains("record.dependencies.push")
             && !registry.contains("record.dependencies.push"),
         "network admission must not synthesize invite dependencies from projected invite state"
+    );
+    assert!(
+        !registry.contains("TransitUnwrap")
+            && !registry.contains("record_from_transit_canonical_in")
+            && !registry.contains("invite_authorizes_shared_event")
+            && event_admission.contains("record_from_transit_canonical_in")
+            && event_admission.contains("invite_authorizes_shared_event"),
+        "transit provenance admission policy belongs in the event admission worker, not the event-module registry"
     );
     assert!(
         request_codec.contains("invite_secret_event_id")
@@ -1385,15 +1392,12 @@ fn connection_routes_are_projected_from_receive_metadata() {
     );
 
     let schema = source_text(&connection_root.join("schema.rs"));
-    let request_projector = source_text(&connection_root.join("connection_request/projector.rs"));
     let response_projector = source_text(&connection_root.join("connection_response/projector.rs"));
     assert!(
         schema.contains("const TRANSPORT_TARGETS")
-            && request_projector.contains("context.receive")
-            && request_projector.contains("transport_target_row")
             && response_projector.contains("context.receive")
             && response_projector.contains("transport_target_row"),
-        "connection request/response projection should atomically write route rows from receive metadata"
+        "connection response projection should atomically write route rows from receive metadata; requests are not usable connections"
     );
 }
 
@@ -1735,7 +1739,7 @@ fn new_poc8_modules_document_responsibility_boundaries() {
         root.join("src/core/logical_clock.rs"),
         root.join("src/protocol/event_modules/content/cli.rs"),
         root.join("src/protocol/event_modules/identity/cli.rs"),
-        root.join("src/workers/bootstrap_exchange.rs"),
+        root.join("src/workers/bootstrap_connect.rs"),
         root.join("src/workers/pipeline_helpers/mod.rs"),
         root.join("src/workers/content_purge.rs"),
         root.join("src/workers/encryption.rs"),
@@ -1802,22 +1806,29 @@ fn new_poc8_modules_document_responsibility_boundaries() {
 fn projector_files_are_not_empty_placeholders() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let event_root = root.join("src/protocol/event_modules");
+    let validation_only = [Path::new(
+        "src/protocol/event_modules/connection/connection_request/projector.rs",
+    )];
     let mut violations = Vec::new();
     for path in rust_files(&event_root)
         .into_iter()
         .filter(|path| path.file_name().is_some_and(|name| name == "projector.rs"))
     {
+        let relative = path.strip_prefix(root).unwrap();
+        if validation_only.iter().any(|allowed| *allowed == relative) {
+            continue;
+        }
         let text = source_text(&path);
         if !text.contains("ProjectionOutput::rows")
             && !text.contains("ProjectionOutput::deletes")
             && !text.contains("ProjectionOutput::with")
         {
-            violations.push(path.strip_prefix(root).unwrap().display().to_string());
+            violations.push(relative.display().to_string());
         }
     }
     assert!(
         violations.is_empty(),
-        "omit projector.rs when a module has no row/label/delete projection; projector files must write real projection output:\n{}",
+        "omit projector.rs when a module has no row/label/delete projection unless it is an explicit validation-only projector:\n{}",
         violations.join("\n")
     );
 }

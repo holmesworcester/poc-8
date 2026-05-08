@@ -16,9 +16,7 @@ use crate::core::store::{Schema, Store, TableName, TableRow};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::wire::{Reader, Writer};
 
-use super::types::{
-    FileEvent, SealedFileRow, FILE_DESCRIPTOR_CIPHERTEXT_BYTES,
-};
+use super::types::{FileEvent, SealedFileRow, FILE_DESCRIPTOR_CIPHERTEXT_BYTES};
 use crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES;
 
 pub const FILES: TableName = TableName::new("content.files");

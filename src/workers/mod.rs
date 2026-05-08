@@ -16,8 +16,9 @@
 use crate::core::daemon::Worker;
 use crate::core::store::Store;
 use crate::protocol::event_modules::content::message_deletion;
+use crate::protocol::event_modules::schema as event_schema;
 
-pub mod bootstrap_exchange;
+pub mod bootstrap_connect;
 pub mod content_purge;
 pub mod dependency_unblock;
 pub mod encryption;
@@ -56,6 +57,35 @@ where
     Ok(())
 }
 
+/// Derive receiver-side content leaves immediately after admission blocks on
+/// them.
+///
+/// The daemon still runs `encryption_message_leaves` as a regular worker, but
+/// same-stream sync can admit an encrypted message and need its local leaf
+/// before the route exchange returns. Draining this bounded worker here keeps
+/// that path self-contained without putting encryption logic in the event
+/// pipeline.
+pub fn drain_post_admission_message_leaves<R>(store: &Store, registry: &R) -> Result<(), String>
+where
+    R: pipeline_helpers::event_pipeline::EventRegistry,
+{
+    if store
+        .table_row_count(event_schema::BLOCKED_EVENTS_BY_MISSING_DEP)
+        .map_err(|err| format!("count blocked events: {err}"))?
+        == 0
+    {
+        return Ok(());
+    }
+    let _ = encryption::run(
+        store,
+        registry,
+        encryption::Work::DrainPendingMessageLeaves {
+            batch_size: pipeline_helpers::event_pipeline::DEFAULT_READY_BATCH,
+        },
+    )?;
+    Ok(())
+}
+
 /// Protocol context required by daemon worker descriptors.
 pub trait DaemonWorkerContext: pipeline_helpers::event_pipeline::EventRegistry {
     fn store(&self) -> &Store;
@@ -67,13 +97,9 @@ where
     C: DaemonWorkerContext,
 {
     vec![
-        // Accept any available inbound stream first so bootstrap responses
-        // (workspace identity events) ride out on the same TCP connection the
-        // requester opened. The same accept handler also writes a transport
-        // target row from the requester's advertised steady-state listener so
-        // the daemon can dial that peer back after the bootstrap stream
-        // closes.
-        bootstrap_exchange::daemon_worker(),
+        // Accept and admit one available inbound stream before starting sync
+        // work, so invite-bootstrap and ordinary transit use the same inbound
+        // processor.
         transit_in::daemon_worker(),
         event_admission::daemon_worker(),
         event_projection::daemon_worker(),
@@ -95,7 +121,6 @@ mod tests {
             .iter()
             .map(|w| w.name)
             .collect();
-        assert!(names.contains(&"bootstrap_serve"));
         assert!(names.contains(&"transit_in"));
         assert!(names.contains(&"sync_tick"));
         assert!(names.contains(&"transit_out"));

@@ -82,12 +82,12 @@
 use crate::core::network_queues::{self, InboundNetworkRow};
 use crate::core::store::{Store, TableName, TableRow};
 use crate::protocol::event_modules::types::{
-    event_id, EventId, EventIndexEntry, EventRecord, EventStatus, ReceiveMetadata,
+    event_id, EventId, EventIndexEntry, EventRecord, EventScope, EventStatus, ReceiveMetadata,
 };
 
 use crate::protocol::event_modules::schema;
-use crate::workers::pipeline_helpers::event_lifecycle;
 use crate::workers::dependency_unblock;
+use crate::workers::pipeline_helpers::event_lifecycle;
 use crate::workers::schema as worker_schema;
 
 /// Default upper bound for one ready-event drain.
@@ -501,6 +501,20 @@ pub(crate) struct PipelineStepReport {
     pub drained: ApplyReadyReport,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CanonicalInProjection {
+    pub canonical_bytes: Vec<u8>,
+    pub receive: Option<ReceiveMetadata>,
+    pub provenance: Option<worker_schema::TransitProvenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NetworkInputAdmission {
+    pub canonical_rows: Vec<CanonicalInProjection>,
+    pub admitted: AdmitReport,
+    pub drained: ApplyReadyReport,
+}
+
 pub(crate) fn enqueue_proposed_events(
     store: &Store,
     events: Vec<ProposedEvent>,
@@ -512,6 +526,54 @@ pub(crate) fn enqueue_proposed_events(
     store
         .insert_table_rows(rows)
         .map_err(|err| format!("enqueue canonical in: {err}"))
+}
+
+pub(crate) fn project_network_in_and_admit<R>(
+    store: &Store,
+    registry: &R,
+    inbound: InboundNetworkRow,
+    ready_batch: usize,
+) -> Result<NetworkInputAdmission, String>
+where
+    R: EventRegistry,
+{
+    let output = registry.project_network_in(store, &inbound)?;
+    let canonical_rows = canonical_projection_rows(&output)?;
+    store
+        .write_transaction(|store| write_projection_output_in_tx(store, output))
+        .map_err(|err| format!("stage network input: {err}"))?;
+    let admitted = drain_canonical_in(store, registry, canonical_rows.len().max(1))?;
+    let drained = run(
+        store,
+        registry,
+        DrainUntilIdle {
+            batch_size: ready_batch,
+        },
+    )?;
+    Ok(NetworkInputAdmission {
+        canonical_rows,
+        admitted,
+        drained,
+    })
+}
+
+fn canonical_projection_rows(
+    output: &ProjectionOutput,
+) -> Result<Vec<CanonicalInProjection>, String> {
+    output
+        .rows
+        .iter()
+        .filter(|row| row.table == worker_schema::CANONICAL_IN)
+        .map(|row| {
+            let (canonical_bytes, receive, provenance) =
+                worker_schema::decode_canonical_in(&row.value)?;
+            Ok(CanonicalInProjection {
+                canonical_bytes,
+                receive,
+                provenance,
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn drain_canonical_in<R>(
@@ -814,8 +876,10 @@ where
 /// 2. Durable records are inserted by deterministic id, blocked if dependencies
 ///    are missing, and projected only if this insertion made them ready.
 ///
-/// Duplicate durable events stop after insertion returns `inserted = false`.
-/// They do not re-project, rewrite blockers, or re-run module code.
+/// Duplicate ordinary events stop after insertion returns `inserted = false`.
+/// Duplicate context-scoped events may re-project their operational queues
+/// because downstream queue rows can be drained independently while the local
+/// event remains durable for dependency resolution.
 fn process_proposed_event_tx(
     store: &Store,
     modules: &impl EventRegistry,
@@ -832,18 +896,27 @@ fn process_proposed_event_tx(
 
     let stored = store_durable_event_tx(store, event, report)?;
     if stored.inserted && stored.ready {
-        let apply = if event.receive().is_some() {
-            project_ready_event_record_in_tx(
-                store,
-                modules,
-                &stored.event_id,
-                record,
-                event.receive(),
-            )?
-        } else {
-            project_ready_event_tx(store, modules, &stored.event_id)?
-        };
+        let apply = project_ready_event_record_in_tx(
+            store,
+            modules,
+            &stored.event_id,
+            record,
+            event.receive(),
+        )?;
         report.applied_events += apply.applied_events;
+    } else if !stored.inserted && matches!(record.scope, EventScope::Connection(_)) {
+        // Context-scoped protocol facts are stored for dependency resolution,
+        // while their projection rows are operational queues. Replaying the
+        // same local event id must be able to recreate a queue row that may
+        // have already been drained.
+        let changes = project_event_with_context_in_tx(
+            store,
+            modules,
+            &stored.event_id,
+            record,
+            event.receive(),
+        )?;
+        write_projection_output_in_tx(store, changes)?;
     }
     Ok(())
 }
@@ -932,7 +1005,8 @@ fn project_ready_event_tx(
     event_id: &EventId,
 ) -> rusqlite::Result<ApplyReadyReport> {
     let mut report = ApplyReadyReport::default();
-    if event_lifecycle::set_event_status(store, event_id, EventStatus::Ready, EventStatus::Applied)? {
+    if event_lifecycle::set_event_status(store, event_id, EventStatus::Ready, EventStatus::Applied)?
+    {
         // The status change is the claim. Projection runs only for the worker
         // that successfully moved Ready -> Applied, which keeps duplicate drain
         // attempts idempotent when callers retry.
@@ -959,7 +1033,8 @@ fn project_ready_event_record_in_tx(
     receive: Option<ReceiveMetadata>,
 ) -> rusqlite::Result<ApplyReadyReport> {
     let mut report = ApplyReadyReport::default();
-    if event_lifecycle::set_event_status(store, event_id, EventStatus::Ready, EventStatus::Applied)? {
+    if event_lifecycle::set_event_status(store, event_id, EventStatus::Ready, EventStatus::Applied)?
+    {
         let changes = project_event_with_context_in_tx(store, modules, event_id, record, receive)?;
         write_projection_output_in_tx(store, changes)?;
         write_applied_event_outputs_in_tx(store, event_id, record)?;

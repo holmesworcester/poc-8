@@ -6,30 +6,24 @@
 //! ```text
 //! local request, no receive metadata
 //!   -> store request bytes
-//!   -> project local connection(request_id, request.to_endpoint)
 //!
 //! received bootstrap request, with receive metadata
 //!   -> verify receive endpoint/sender/authorization
 //!   -> verify invite-secret dependency authorizes bootstrap hash
 //!   -> store request bytes
-//!   -> project local connection(request_id, receive.local_endpoint)
-//!   -> optionally remember the observed route
 //! ```
 //!
 //! The distinction is important. A local request is this node's own intent to
-//! connect to the invite endpoint, so it can project a local connection row
-//! after admission has applied its declared invite-secret dependency. A received
+//! connect to the invite endpoint, but it is not a connection. A received
 //! request is untrusted network input until the receive context proves which
 //! endpoint unwrapped it and the dependency context proves that the request
 //! knows a locally stored invite secret.
 //!
 //! This projector does not create response events, send bytes, query storage,
-//! or reconstruct invite dependencies. Transit supplies local receive context;
-//! the codec supplies canonical dependency ids; the common worker supplies only
-//! dependencies that already reached `Applied`.
+//! project usable connections, or reconstruct invite dependencies. Transit
+//! supplies local receive context; the codec supplies canonical dependency ids;
+//! the common worker supplies only dependencies that already reached `Applied`.
 
-use super::super::schema as projection;
-use super::super::types;
 use super::codec;
 use crate::protocol::event_modules::identity::invite;
 use crate::protocol::event_modules::types::ReceiveAuthorization;
@@ -39,11 +33,6 @@ pub fn project(envelope: &EventWithContext<'_>) -> Result<ProjectionOutput, Stri
     let bytes = envelope.record.canonical_bytes.clone();
     let receive = envelope.context.receive;
     let event = codec::decode(&bytes)?;
-    let request_id = types::event_id(&bytes);
-    // Always cache the canonical request bytes. Later connection response facts
-    // use the request as dependency context to prove they answer this exact
-    // request, not merely the same endpoints.
-    let mut rows = vec![projection::connection_event_row(request_id, bytes)];
     if let Some(receive) = receive {
         // Network receive context is subjective and therefore must match the
         // canonical request fields before it can become local connection state.
@@ -68,31 +57,10 @@ pub fn project(envelope: &EventWithContext<'_>) -> Result<ProjectionOutput, Stri
         if invite_secret.bootstrap_hash != event.bootstrap_hash {
             return Err("connection request bootstrap hash is not authorized".to_string());
         }
-        // Both peers derive the connection id from the request id and accepting
-        // endpoint. On receive, the accepting endpoint is this local endpoint.
-        let connection_id = types::connection_id(&request_id, &receive.local_endpoint());
-        rows.push(projection::connection_row(
-            connection_id,
-            event.from_endpoint,
-        ));
-        if receive.remember_route() {
-            // Route learning is local metadata, not a shared event. The worker
-            // only sets this flag when the observed origin is stable enough to
-            // be used for later sends.
-            rows.push(projection::transport_target_row(
-                connection_id,
-                receive.origin(),
-            ));
-        }
     } else {
         // Local requests have no receive metadata because this node created
-        // them. Admission has already applied the invite-secret dependency, so
-        // projection can learn the local view of the connection to the invite
-        // endpoint without another network round trip. Scoped identity
-        // bootstrap is not authorized here; invite-key transit carries that
-        // workspace proof per event.
-        let connection_id = types::connection_id(&request_id, &event.to_endpoint);
-        rows.push(projection::connection_row(connection_id, event.to_endpoint));
+        // them. They are not usable connections until the response event is
+        // received and projected.
         let invite_secret = envelope
             .context
             .dependency(&event.invite_secret_event_id)
@@ -104,7 +72,7 @@ pub fn project(envelope: &EventWithContext<'_>) -> Result<ProjectionOutput, Stri
         }
     }
 
-    Ok(ProjectionOutput::rows(rows))
+    Ok(ProjectionOutput::default())
 }
 
 #[cfg(test)]
@@ -112,7 +80,7 @@ mod tests {
     use std::net::SocketAddr;
 
     use crate::protocol::event_modules::connection::connection_request::types::RequestEvent;
-    use crate::protocol::event_modules::connection::{schema, types};
+    use crate::protocol::event_modules::connection::types;
     use crate::protocol::event_modules::types::ReceiveMetadata;
     use crate::protocol::event_modules::worker::{DependencyContext, EventContext};
 
@@ -190,20 +158,11 @@ mod tests {
         ))
         .expect("project request");
 
-        assert_eq!(output.rows.len(), 2);
-        assert_eq!(output.rows[0].table, schema::CONNECTION_EVENTS);
-        assert_eq!(output.rows[0].key, types::event_id(&record.canonical_bytes));
-        assert_eq!(output.rows[0].value, record.canonical_bytes);
-        assert_eq!(output.rows[1].table, schema::CONNECTIONS);
-        assert_eq!(
-            output.rows[1].key,
-            types::connection_id(&types::event_id(&record.canonical_bytes), &[9; 32])
-        );
-        assert_eq!(output.rows[1].value, [9; 32]);
+        assert!(output.rows.is_empty());
     }
 
     #[test]
-    fn local_scoped_request_projects_connection_only_not_bootstrap_authorization() {
+    fn local_scoped_request_projects_request_only_not_bootstrap_authorization() {
         let (record, invite_secret_event_id, invite_record) = scoped_authorized_request_record();
         let output = project(&context_with_dependency(
             &record,
@@ -212,13 +171,11 @@ mod tests {
         ))
         .expect("project local scoped request");
 
-        assert_eq!(output.rows.len(), 2);
-        assert_eq!(output.rows[0].table, schema::CONNECTION_EVENTS);
-        assert_eq!(output.rows[1].table, schema::CONNECTIONS);
+        assert!(output.rows.is_empty());
     }
 
     #[test]
-    fn projects_received_request_connection_and_route_rows() {
+    fn projects_received_request_bytes_only() {
         let (record, invite_secret_event_id, invite_record) = authorized_request_record();
         let origin = "127.0.0.1:9000".parse::<SocketAddr>().expect("addr");
         let output = project(&EventWithContext {
@@ -237,16 +194,50 @@ mod tests {
         })
         .expect("project received request");
 
-        assert_eq!(output.rows.len(), 3);
-        assert_eq!(output.rows[0].table, schema::CONNECTION_EVENTS);
-        assert_eq!(output.rows[1].table, schema::CONNECTIONS);
-        assert_eq!(output.rows[2].table, schema::TRANSPORT_TARGETS);
-        assert_eq!(
-            output.rows[1].key,
-            types::connection_id(&types::event_id(&record.canonical_bytes), &[9; 32])
+        assert!(output.rows.is_empty());
+    }
+
+    #[test]
+    fn received_request_does_not_project_advertised_listener_as_route() {
+        let invite_secret = invite::types::InviteSecretEvent::new([7; 32]);
+        let invite_record = invite::codec::record_from_bytes(invite::codec::encode(&invite_secret))
+            .expect("invite record");
+        let invite_secret_event_id = types::event_id(&invite_record.canonical_bytes);
+        let advertised = "127.0.0.1:9100"
+            .parse::<SocketAddr>()
+            .expect("advertised addr");
+        let record = codec::record_from_bytes(codec::encode(&RequestEvent {
+            from_endpoint: [1; 32],
+            to_endpoint: [9; 32],
+            nonce: [2; 32],
+            bootstrap_hash: invite_secret.bootstrap_hash,
+            invite_secret_event_id,
+            from_listen_addr: Some(advertised),
+        }))
+        .expect("request record");
+        let origin = "127.0.0.1:9000".parse::<SocketAddr>().expect("origin addr");
+
+        let output = project(&EventWithContext {
+            record: &record,
+            context: EventContext {
+                event_id: types::event_id(&record.canonical_bytes),
+                dependencies: vec![DependencyContext {
+                    event_id: invite_secret_event_id,
+                    record: invite_record,
+                }],
+                labels: Vec::new(),
+                receive: Some(ReceiveMetadata::bootstrap_invite(
+                    origin, [9; 32], [1; 32], false,
+                )),
+            },
+        })
+        .expect("project received request");
+
+        assert!(output.rows.is_empty());
+        assert!(
+            output.rows.is_empty(),
+            "connection requests must not project route state"
         );
-        assert_eq!(output.rows[1].value, [1; 32]);
-        assert_eq!(output.rows[2].value, origin.to_string().into_bytes());
     }
 
     #[test]

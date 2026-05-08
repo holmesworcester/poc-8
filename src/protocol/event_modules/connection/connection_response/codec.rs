@@ -2,13 +2,18 @@
 //!
 //! Responses use the same connection magic as requests and are local protocol
 //! history. They exist for the fact-graph model of connection establishment:
-//! "endpoint B answered request R and committed to connection id C".
+//! "endpoint B answered request R and created connection event C".
 //!
 //! The request id is both a body field and the event dependency. That is the
 //! important boundary: the response projector validates the request/response
 //! relationship from dependency context, not by querying a connection table or
 //! trusting transit metadata. Transit may prove who sent the bytes, but only
 //! this record's dependency edge proves which request is being answered.
+//!
+//! The response body also carries the local-only traffic secret. Because the
+//! connection id is the hash of these canonical bytes, a transit frame can name
+//! the connection id and the receiver can load this event directly to derive the
+//! directional AEAD key.
 //!
 //! This codec only encodes/decodes canonical bytes and declares record metadata.
 //! It does not establish a connection, learn a route, or decide whether a
@@ -30,7 +35,7 @@ pub fn encode(event: &ResponseEvent) -> Vec<u8> {
     out.id(&event.from_endpoint);
     out.id(&event.to_endpoint);
     out.id(&event.request_id);
-    out.id(&event.connection_id);
+    out.id(&event.traffic_secret);
     out.finish()
 }
 
@@ -48,7 +53,7 @@ pub fn decode(bytes: &[u8]) -> Result<ResponseEvent, String> {
         from_endpoint: reader.id()?,
         to_endpoint: reader.id()?,
         request_id: reader.id()?,
-        connection_id: reader.id()?,
+        traffic_secret: reader.id()?,
     };
     reader.finish()?;
     Ok(event)
@@ -63,8 +68,8 @@ pub fn is_response(bytes: &[u8]) -> bool {
 ///
 /// Response facts are local because they are connection state for this node,
 /// not workspace history for global sharing. The request dependency is what
-/// lets the projector validate endpoint direction and the derived connection id
-/// before writing any connection rows.
+/// lets the projector validate endpoint direction before writing any connection
+/// rows. The event id of these bytes is the connection id.
 pub fn record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
     let event = decode(&bytes)?;
     Ok(EventRecord {

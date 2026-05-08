@@ -9,7 +9,7 @@ use std::time::Duration;
 use cli_harness::*;
 
 #[test]
-fn connect_handshake_does_not_create_durable_events() {
+fn connect_handshake_stores_only_local_connection_events() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
     let bob = temp_db(&tmp, "bob.db");
@@ -21,14 +21,14 @@ fn connect_handshake_does_not_create_durable_events() {
     let connected = connect_with_retry(&alice, &bob_invite);
     assert!(connected.contains("connected:"), "{connected}");
     wait_for_connection_count(&bob, 1);
-    wait_for_connection_event_count(&bob, 1);
+    wait_for_connection_event_count(&bob, 2);
 
     assert_eq!(count(&alice), 0, "connect must not store local sync items");
     assert_eq!(count(&bob), 0, "connect must not store remote sync items");
     assert_eq!(connection_count(&alice), 1);
     assert_eq!(connection_count(&bob), 1);
-    assert_eq!(connection_event_count(&alice), 1);
-    assert_eq!(connection_event_count(&bob), 1);
+    assert_eq!(connection_event_count(&alice), 2);
+    assert_eq!(connection_event_count(&bob), 2);
 }
 
 #[test]
@@ -47,7 +47,7 @@ fn wrong_invite_private_key_does_not_project_receiver_connection() {
 
     assert_eq!(count(&alice), 0);
     assert_eq!(count(&bob), 0);
-    assert_eq!(connection_count(&alice), 1);
+    assert_eq!(connection_count(&alice), 0);
     assert_eq!(connection_count(&bob), 0);
     assert_eq!(connection_event_count(&alice), 1);
     assert_eq!(connection_event_count(&bob), 0);
@@ -70,7 +70,7 @@ fn connect_reports_unreachable_invite_address() {
         stderr(&connected)
     );
     assert_eq!(count(&alice), 0);
-    assert_eq!(connection_count(&alice), 1);
+    assert_eq!(connection_count(&alice), 0);
     assert_eq!(connection_event_count(&alice), 1);
 }
 

@@ -11,8 +11,8 @@
 //!
 //! ```text
 //! core.network.inbound row
-//!   + local endpoint secret
-//!   + optional connection -> expected remote endpoint
+//!   + local endpoint secret for bootstrap frames
+//!   + connection event for connection frames
 //!   -> authenticated inner canonical bytes
 //!   -> canonical.in rows with transit provenance
 //! ```
@@ -28,15 +28,21 @@
 use crate::core::crypto;
 use crate::core::network_queues::InboundNetworkRow;
 use crate::core::store::Store;
+use crate::protocol::event_modules::connection::connection_response;
 use crate::protocol::event_modules::connection::types::ConnectionId;
 use crate::protocol::event_modules::identity::endpoint::types::{EndpointId, EndpointKeypair};
 use crate::protocol::event_modules::identity::{endpoint, invite};
+use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::worker::ProjectionOutput;
+use crate::protocol::wire::Writer;
 use crate::workers::schema::{self as worker_schema, TransitProvenance, TransitUnwrap};
 
-use super::super::schema as connection_schema;
 use super::codec::{self, TransitEnvelopeRef};
-use super::types::{BOOTSTRAP_PURPOSE, CONNECTION_PURPOSE, INVITE_BOOTSTRAP_PURPOSE};
+use super::types::{BOOTSTRAP_PURPOSE, INVITE_BOOTSTRAP_PURPOSE};
+
+const TRAFFIC_KEY_PURPOSE: &[u8] = b"topo-connection-traffic-key-v1";
+const INITIATOR_TO_RESPONDER: &[u8] = b"initiator->responder";
+const RESPONDER_TO_INITIATOR: &[u8] = b"responder->initiator";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UnwrappedTransit {
@@ -57,9 +63,7 @@ pub fn project_network_in(
 ) -> Result<ProjectionOutput, String> {
     let local = local_endpoint(store)?;
     let origin = inbound.source.addr();
-    let transit = unwrap(store, local, &inbound.bytes, |connection_id| {
-        connection_schema::remote_endpoint(store, *connection_id)
-    })?;
+    let transit = unwrap(store, local, &inbound.bytes)?;
     let mut rows = Vec::with_capacity(transit.inners.len());
     for inner in transit.inners {
         let provenance = TransitProvenance {
@@ -82,14 +86,7 @@ fn local_endpoint(store: &Store) -> Result<endpoint::types::EndpointKeypair, Str
     endpoint::commands::local_keypair(store)?.ok_or_else(|| "local endpoint is missing".to_string())
 }
 
-fn unwrap(
-    store: &Store,
-    local: EndpointKeypair,
-    bytes: &[u8],
-    remote_endpoint: impl FnOnce(&ConnectionId) -> Result<EndpointId, String>,
-) -> Result<UnwrappedTransit, String> {
-    // The caller supplies remote endpoint lookup for established connections.
-    // That keeps storage access outside the cryptographic transform.
+fn unwrap(store: &Store, local: EndpointKeypair, bytes: &[u8]) -> Result<UnwrappedTransit, String> {
     match codec::decode_ref(bytes)? {
         TransitEnvelopeRef::Bootstrap {
             sender_endpoint,
@@ -169,23 +166,21 @@ fn unwrap(
             if recipient_endpoint != local.endpoint {
                 return Err("connection transit addressed to a different endpoint".to_string());
             }
-            let remote = remote_endpoint(&connection_id)?;
-            if sender_endpoint != remote {
-                return Err("connection transit sender does not match connection".to_string());
-            }
-            let plaintext = crypto::x25519_xchacha20poly1305_decrypt(
-                &local.secret,
-                &sender_endpoint,
-                CONNECTION_PURPOSE,
-                &codec::associated_data_connection(
-                    &connection_id,
-                    &sender_endpoint,
-                    &recipient_endpoint,
-                    &nonce,
-                ),
-                &nonce,
-                ciphertext,
+            let connection = connection_event(store, connection_id)?;
+            let key = derive_directional_key(
+                &connection,
+                connection_id,
+                sender_endpoint,
+                recipient_endpoint,
             )?;
+            let associated_data = codec::associated_data_connection(
+                &connection_id,
+                &sender_endpoint,
+                &recipient_endpoint,
+                &nonce,
+            );
+            let plaintext =
+                crypto::xchacha20poly1305_decrypt(&key, &associated_data, &nonce, ciphertext)?;
             Ok(UnwrappedTransit {
                 inners: codec::decode_inner_events(&plaintext)?,
                 unwrapped_with: TransitUnwrap::Connection { connection_id },
@@ -195,11 +190,49 @@ fn unwrap(
     }
 }
 
+fn connection_event(
+    store: &Store,
+    connection_id: ConnectionId,
+) -> Result<connection_response::types::ResponseEvent, String> {
+    let bytes = event_schema::applied_event_bytes(store, &connection_id)
+        .map_err(|err| format!("load connection event: {err}"))?
+        .ok_or_else(|| "unknown connection".to_string())?;
+    connection_response::codec::decode(&bytes)
+        .map_err(|_| "connection id does not name a connection event".to_string())
+}
+
+fn derive_directional_key(
+    event: &connection_response::types::ResponseEvent,
+    connection_id: ConnectionId,
+    sender_endpoint: EndpointId,
+    recipient_endpoint: EndpointId,
+) -> Result<crypto::XChaCha20Poly1305Key, String> {
+    let direction = if sender_endpoint == event.to_endpoint
+        && recipient_endpoint == event.from_endpoint
+    {
+        INITIATOR_TO_RESPONDER
+    } else if sender_endpoint == event.from_endpoint && recipient_endpoint == event.to_endpoint {
+        RESPONDER_TO_INITIATOR
+    } else {
+        return Err("connection transit direction does not match connection".to_string());
+    };
+
+    let mut info = Writer::with_capacity(32 * 4 + direction.len());
+    info.id(&connection_id);
+    info.id(&event.request_id);
+    info.id(&event.to_endpoint);
+    info.id(&event.from_endpoint);
+    info.raw(direction);
+    crypto::hkdf_sha256_key(&event.traffic_secret, TRAFFIC_KEY_PURPOSE, &info.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::core::network_queues::{InboundNetworkRow, NetworkSource};
-    use crate::protocol::event_modules::connection::transit;
+    use crate::protocol::event_modules::connection::{connection_response, transit};
     use crate::protocol::event_modules::identity::{endpoint, invite};
+    use crate::protocol::event_modules::schema as event_schema;
+    use crate::protocol::event_modules::types::EventStatus;
     use crate::protocol::Protocol;
     use crate::workers::schema::{self as worker_schema, TransitUnwrap};
 
@@ -265,6 +298,56 @@ mod tests {
         let err = project_network_in(&store, &inbound, false).expect_err("wrong endpoint");
 
         assert!(err.contains("addressed to a different endpoint"), "{err}");
+    }
+
+    #[test]
+    fn connection_frame_decrypts_from_connection_event_secret() {
+        let local = keypair();
+        let remote = keypair();
+        let connection = connection_response::types::ResponseEvent {
+            from_endpoint: local.endpoint,
+            to_endpoint: remote.endpoint,
+            request_id: [3; 32],
+            traffic_secret: [4; 32],
+        };
+        let connection_bytes = connection_response::codec::encode(&connection);
+        let connection_id = crate::protocol::event_modules::types::event_id(&connection_bytes);
+        let connection_record =
+            connection_response::codec::record_from_bytes(connection_bytes.clone())
+                .expect("connection record");
+        let store = Protocol::open_memory_store().expect("open store");
+        let mut rows = endpoint::projector::local_endpoint(local);
+        rows.push(
+            event_schema::event_row(&connection_id, &connection_record, EventStatus::Applied)
+                .expect("connection event row"),
+        );
+        store.insert_table_rows(rows).expect("insert local rows");
+        let inner = b"connection inner bytes".to_vec();
+        let frame = transit::commands::create_connection_batch(
+            remote.endpoint,
+            &connection,
+            connection_id,
+            vec![inner.clone()],
+        )
+        .expect("create connection frame");
+        let inbound = InboundNetworkRow::new(
+            NetworkSource::new("127.0.0.1:41001".parse().expect("addr")),
+            frame,
+        );
+
+        let output = project_network_in(&store, &inbound, false).expect("project frame");
+
+        assert_eq!(output.rows.len(), 1);
+        store
+            .insert_table_rows(output.rows)
+            .expect("insert canonical rows");
+        let queued = worker_schema::claim_canonical_in(&store, 1).expect("claim canonical");
+        assert_eq!(queued[0].canonical_bytes, inner);
+        let provenance = queued[0].provenance.expect("provenance");
+        assert_eq!(
+            provenance.unwrapped_with,
+            TransitUnwrap::Connection { connection_id }
+        );
     }
 
     #[test]

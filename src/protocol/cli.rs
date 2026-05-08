@@ -17,10 +17,8 @@ use crate::core::logical_clock;
 use crate::core::network_queues::InboundNetworkRow;
 use crate::core::store::Store;
 use crate::protocol::event_modules::schema as event_schema;
-use crate::protocol::event_modules::types::{EventRecord, ReceiveMetadata};
-use crate::protocol::event_modules::worker::{
-    EventRegistry, EventWithContext, ProjectionOutput, ReceivedRecord,
-};
+use crate::protocol::event_modules::types::EventRecord;
+use crate::protocol::event_modules::worker::{EventRegistry, EventWithContext, ProjectionOutput};
 use crate::protocol::{event_modules, Protocol};
 use crate::workers::DaemonWorkerContext;
 
@@ -60,23 +58,16 @@ impl EventRegistry for Context {
         self.protocol.project_network_in(store, inbound)
     }
 
-    fn record_from_canonical_in(
-        &self,
-        store: &Store,
-        bytes: Vec<u8>,
-        receive: Option<ReceiveMetadata>,
-        provenance: Option<crate::workers::schema::TransitProvenance>,
-    ) -> Result<ReceivedRecord, String> {
-        self.protocol
-            .record_from_canonical_in(store, bytes, receive, provenance)
-    }
-
     fn project_record(
         &self,
         store: &Store,
         event: &EventWithContext<'_>,
     ) -> Result<ProjectionOutput, String> {
         self.protocol.project_record(store, event)
+    }
+
+    fn post_admission_hook(&self, store: &Store) -> Result<(), String> {
+        self.protocol.post_admission_hook(store)
     }
 }
 

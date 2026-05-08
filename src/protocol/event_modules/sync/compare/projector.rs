@@ -1,11 +1,10 @@
 //! Projector for sync compare events.
 //!
 //! Connection-scoped compare events are projected according to their admission
-//! scope. Locally proposed compare events are cached and queued for the connection;
+//! scope. Locally proposed compare events are queued for the connection;
 //! received compare events become sync work rows. The comparison itself is
 //! stateful worker work, not projection work.
 
-use crate::protocol::event_modules::connection;
 use crate::protocol::event_modules::types::{ConnectionScope, EventScope};
 use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput};
 use crate::workers::schema as worker_schema;
@@ -19,10 +18,6 @@ pub fn project(envelope: &EventWithContext<'_>) -> Result<ProjectionOutput, Stri
         EventScope::Connection(ConnectionScope::Outgoing { connection_id }) => {
             ensure_connection(compare.connection_id, connection_id)?;
             Ok(ProjectionOutput::rows(vec![
-                connection::schema::connection_scoped_event_row(
-                    envelope.context.event_id,
-                    bytes.to_vec(),
-                ),
                 worker_schema::transit_out_row(connection_id, envelope.context.event_id),
             ]))
         }
@@ -50,7 +45,6 @@ fn ensure_connection(actual: [u8; 32], scoped: [u8; 32]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::protocol::event_modules::connection;
     use crate::protocol::event_modules::types::{event_id, EventRecord};
     use crate::protocol::event_modules::worker::EventContext;
     use crate::workers::schema as worker_schema;
@@ -80,16 +74,12 @@ mod tests {
     }
 
     #[test]
-    fn outgoing_compare_projects_cached_event_and_transit_out_rows() {
+    fn outgoing_compare_projects_transit_out_row() {
         let record = codec::outbound_record(compare_event()).expect("record");
         let output = project(&context_for(&record)).expect("project outgoing");
 
-        assert_eq!(output.rows.len(), 2);
-        assert_eq!(
-            output.rows[0].table,
-            connection::schema::CONNECTION_SCOPED_EVENTS
-        );
-        assert_eq!(output.rows[1].table, worker_schema::TRANSIT_OUT);
+        assert_eq!(output.rows.len(), 1);
+        assert_eq!(output.rows[0].table, worker_schema::TRANSIT_OUT);
     }
 
     #[test]

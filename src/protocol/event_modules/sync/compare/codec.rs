@@ -2,7 +2,7 @@
 //!
 //! A compare event carries one connection id, one inclusive timestamp range,
 //! and the sender's summary for that range. It is a real connection-scoped
-//! transient event, not a nested packet item.
+//! event, not a nested packet item.
 
 use crate::protocol::event_modules::types::{ConnectionScope, EventRecord, EventScope};
 use crate::protocol::wire::{Reader, Writer};
