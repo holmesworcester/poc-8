@@ -69,9 +69,11 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
         return Err("reaction target message workspace does not match reaction".to_string());
     }
 
-    // Validate the binding to the per-message leaf event named in canonical
+    // Validate the binding to the per-reaction leaf event named in canonical
     // bytes. The leaf must live in the reaction's `unix_minute` and carry
-    // `event_id_in_minute = Some(reaction.leaf_nonce)`.
+    // `event_id_in_minute = Some(reaction.event_id_in_minute_derived())`. The
+    // projector recomputes the deterministic leaf coord from canonical
+    // fields rather than trusting any wire-side nonce.
     let leaf_record = event
         .context
         .dependency(&reaction.local_history_node_secret_id)
@@ -87,9 +89,10 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
     if leaf.range_start != expected_minute || leaf.range_width != message::types::LEAF_RANGE_WIDTH {
         return Err("reaction leaf coordinate does not match reaction minute".to_string());
     }
-    if leaf.event_id_in_minute != Some(reaction.leaf_nonce) {
+    if leaf.event_id_in_minute != Some(reaction.event_id_in_minute_derived()) {
         return Err(
-            "reaction leaf event_id_in_minute does not match reaction leaf_nonce".to_string(),
+            "reaction leaf event_id_in_minute does not match deterministic reaction coord"
+                .to_string(),
         );
     }
 
@@ -173,7 +176,6 @@ mod tests {
             author_user_id,
             removal_frontier_id: [30; 32],
             local_history_node_secret_id: [31; 32],
-            leaf_nonce: [50; 32],
             nonce: [32; crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES],
             ciphertext: [33; message::types::MESSAGE_CIPHERTEXT_BYTES],
         });
@@ -204,7 +206,13 @@ mod tests {
                 .clone();
         let frontier_id = event_id(&frontier_record.canonical_bytes);
         let created_at_ms = 5u64;
-        let leaf_nonce = [44; 32];
+        let event_id_in_minute = super::super::types::reaction_event_id_in_minute(
+            &workspace_id,
+            &author_id,
+            &target_id,
+            &frontier_id,
+            created_at_ms,
+        );
         let leaf_output = leaf_module::commands::derive(
             leaf_module::commands::DeriveHistoryNodeSecret {
                 workspace_id,
@@ -213,7 +221,7 @@ mod tests {
                 source_secret: [201; 32],
                 range_start: super::super::super::message::types::unix_minute_for(created_at_ms),
                 range_width: super::super::super::message::types::LEAF_RANGE_WIDTH,
-                event_id_in_minute: Some(leaf_nonce),
+                event_id_in_minute: Some(event_id_in_minute),
                 tombstone_node_id: None,
             },
         )
@@ -229,7 +237,6 @@ mod tests {
             signer_private_key,
             removal_frontier_id: frontier_id,
             local_history_node_secret_id: leaf_id,
-            leaf_nonce,
             leaf_node_secret: KEY_SECRET,
             emoji: "🔥".to_string(),
         })
@@ -374,7 +381,6 @@ mod tests {
             author_user_id: [11; 32],
             removal_frontier_id: [14; 32],
             local_history_node_secret_id: [15; 32],
-            leaf_nonce: [21; 32],
             nonce: [16; crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES],
             ciphertext: [17; super::super::types::REACTION_CIPHERTEXT_BYTES],
         };
@@ -398,7 +404,6 @@ mod tests {
             author_user_id: [3; 32],
             removal_frontier_id: [4; 32],
             local_history_node_secret_id: [5; 32],
-            leaf_nonce: [10; 32],
             nonce: [6; crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES],
             ciphertext: [7; super::super::types::REACTION_CIPHERTEXT_BYTES],
         });

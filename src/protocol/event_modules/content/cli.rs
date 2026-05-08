@@ -112,32 +112,36 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
     let mut timestamp = starting_timestamp;
     let removal_frontier_id =
         message::cli::require_active_frontier_id(&context.store, parsed.workspace_id)?;
-    let leaf_nonce = crypto::random_bytes_32();
-    let leaf = message::cli::derive_message_leaf(
+    let signer_endpoint = membership.endpoint_shared_id;
+    let author_user_id = membership.user_authority_event_id;
+
+    // Derive the message's own per-event leaf using the deterministic coord
+    // computed from canonical message fields.
+    let message_event_coord = message::types::message_event_id_in_minute(
+        &parsed.workspace_id,
+        &author_user_id,
+        &removal_frontier_id,
+        timestamp,
+    );
+    let message_leaf = message::cli::derive_message_leaf(
         &context.store,
         &context.protocol,
         parsed.workspace_id,
         removal_frontier_id,
         timestamp,
-        leaf_nonce,
+        message_event_coord,
     )?;
-    // Files attached to a message reuse the parent message's per-message leaf
-    // key. On message deletion, retiring the leaf retires the same key for
-    // both the message body and the file ciphertext, so file forward
-    // secrecy follows the per-message FS rule from encryption_plan.md.
-    let signer_endpoint = membership.endpoint_shared_id;
 
-    // Send-message event under the parent's content key.
+    // Send-message event under the message's own content key.
     let send = message::commands::send(message::commands::SendMessage {
         workspace_id: parsed.workspace_id,
         created_at_ms: timestamp,
-        author_user_id: membership.user_authority_event_id,
+        author_user_id,
         signer_endpoint_shared_id: signer_endpoint,
         signer_private_key: local.signing_secret,
         removal_frontier_id,
-        local_history_node_secret_id: leaf.local_history_node_secret_id,
-        leaf_nonce,
-        leaf_node_secret: leaf.leaf_node_secret,
+        local_history_node_secret_id: message_leaf.local_history_node_secret_id,
+        leaf_node_secret: message_leaf.leaf_node_secret,
         text: parsed.text,
     })?;
     let message_id = send.value.message_id;
@@ -145,9 +149,30 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
 
     let file_id = derive_file_id(&signer_endpoint, message_id, starting_timestamp);
 
-    // Encrypt each plaintext slice with the parent's content key. Slice AAD
-    // is independent of file_event_id (see file_slice::codec docs), so a
-    // single seal pass + BAO outboard suffices.
+    // Files now author their own leaf, distinct from the parent message's
+    // leaf. Two clients independently authoring the same file (same
+    // workspace, author, parent message, file_id, frontier, timestamp) reach
+    // the same leaf coord and admission collapses the duplicate.
+    let file_event_coord = file::types::file_event_id_in_minute(
+        &parsed.workspace_id,
+        &author_user_id,
+        &message_id,
+        &file_id,
+        &removal_frontier_id,
+        timestamp,
+    );
+    let file_leaf = message::cli::derive_message_leaf(
+        &context.store,
+        &context.protocol,
+        parsed.workspace_id,
+        removal_frontier_id,
+        timestamp,
+        file_event_coord,
+    )?;
+
+    // Encrypt each plaintext slice with the file's own leaf node secret.
+    // Slice AAD is independent of file_event_id (see file_slice::codec
+    // docs), so a single seal pass + BAO outboard suffices.
     let mut ciphertext_total = Vec::with_capacity(
         plaintext.len() + (total_slices as usize) * XCHACHA20_POLY1305_TAG_BYTES,
     );
@@ -155,7 +180,7 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
         let start = (slice_number as usize) * slice_bytes as usize;
         let end = ((slice_number + 1) as usize * slice_bytes as usize).min(plaintext.len());
         let chunk = file_slice::codec::seal_slice(
-            &leaf.leaf_node_secret,
+            &file_leaf.leaf_node_secret,
             &parsed.workspace_id,
             &file_id,
             slice_number,
@@ -174,7 +199,7 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
         workspace_id: parsed.workspace_id,
         created_at_ms: timestamp,
         message_id,
-        author_user_id: membership.user_authority_event_id,
+        author_user_id,
         signer_endpoint_shared_id: signer_endpoint,
         signer_private_key: local.signing_secret,
         file_id,
@@ -185,8 +210,8 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
         filename: filename.clone(),
         mime_type: parsed.mime_type.clone(),
         removal_frontier_id,
-        local_key_secret_id: leaf.local_history_node_secret_id,
-        key_secret: leaf.leaf_node_secret,
+        local_history_node_secret_id: file_leaf.local_history_node_secret_id,
+        key_secret: file_leaf.leaf_node_secret,
     })?;
     let file_event_id = create_file.value.file_event_id;
     timestamp = timestamp.saturating_add(1);
@@ -212,7 +237,7 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
                 slice_number,
                 signer_endpoint_shared_id: signer_endpoint,
                 signer_private_key: local.signing_secret,
-                local_key_secret_id: leaf.local_history_node_secret_id,
+                local_history_node_secret_id: file_leaf.local_history_node_secret_id,
                 plaintext_len,
                 ciphertext: &ciphertext_total,
                 outboard: &outboard,

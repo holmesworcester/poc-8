@@ -4,7 +4,7 @@
 //! not write descriptor rows, slice rows, or worker queues. The caller must
 //! supply already-decided identity, signing, file_id, and BAO root facts plus
 //! the parent message's content key (`(removal_frontier_id,
-//! local_key_secret_id, key_secret)`). The descriptor's sensitive fields —
+//! local_history_node_secret_id, key_secret)`). The descriptor's sensitive fields —
 //! filename and mime — are sealed under that key with a fresh
 //! XChaCha20-Poly1305 nonce and domain-separated AAD before the event leaves
 //! the command boundary; root_hash, blob byte length, and slice arithmetic
@@ -37,7 +37,7 @@ pub struct CreateFile {
     pub filename: String,
     pub mime_type: String,
     pub removal_frontier_id: EventId,
-    pub local_key_secret_id: EventId,
+    pub local_history_node_secret_id: EventId,
     pub key_secret: XChaCha20Poly1305Key,
 }
 
@@ -52,7 +52,7 @@ pub struct CreateFileOutput {
     pub filename: String,
     pub mime_type: String,
     pub removal_frontier_id: EventId,
-    pub local_key_secret_id: EventId,
+    pub local_history_node_secret_id: EventId,
 }
 
 pub fn create(input: CreateFile) -> Result<CommandOutput<CreateFileOutput>, String> {
@@ -67,7 +67,7 @@ pub fn create(input: CreateFile) -> Result<CommandOutput<CreateFileOutput>, Stri
         slice_bytes: input.slice_bytes,
         root_hash: input.root_hash,
         removal_frontier_id: input.removal_frontier_id,
-        local_key_secret_id: input.local_key_secret_id,
+        local_history_node_secret_id: input.local_history_node_secret_id,
         nonce: crypto::random_xchacha20poly1305_nonce(),
         ciphertext: [0; FILE_DESCRIPTOR_CIPHERTEXT_BYTES],
     };
@@ -100,7 +100,7 @@ pub fn create(input: CreateFile) -> Result<CommandOutput<CreateFileOutput>, Stri
             filename: input.filename,
             mime_type: input.mime_type,
             removal_frontier_id: event.removal_frontier_id,
-            local_key_secret_id: event.local_key_secret_id,
+            local_history_node_secret_id: event.local_history_node_secret_id,
         },
         vec![record],
     ))
@@ -126,7 +126,7 @@ mod tests {
             filename: "secret-name.bin".to_string(),
             mime_type: "application/x-secret".to_string(),
             removal_frontier_id: [8; 32],
-            local_key_secret_id: [9; 32],
+            local_history_node_secret_id: [9; 32],
             key_secret: [42; 32],
         }
     }

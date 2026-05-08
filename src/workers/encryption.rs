@@ -57,33 +57,35 @@ pub enum Work {
         tombstone_node_id: Option<EventId>,
     },
     /// Idempotently derive (or look up) the per-minute coarse-cover node and
-    /// the per-message leaf for one
-    /// `(workspace_id, removal_frontier_id, created_at_ms, leaf_nonce)` tuple.
-    /// Senders call this before authoring a message so the canonical event
-    /// can name the leaf id; receivers call it after admission blocks on the
-    /// named leaf so dependency unblock can let the message project.
+    /// the per-event leaf for one
+    /// `(workspace_id, removal_frontier_id, created_at_ms, event_id_in_minute)`
+    /// tuple. Senders call this before authoring an event so the canonical
+    /// event can name the leaf id; receivers call it after admission blocks
+    /// on the named leaf so dependency unblock can let the event project.
+    /// `event_id_in_minute` is the deterministic 32-byte coordinate computed
+    /// by the event-type's `event_id_in_minute_derived()`.
     DeriveMessageLeaf {
         workspace_id: EventId,
         removal_frontier_id: EventId,
         created_at_ms: u64,
-        leaf_nonce: EventId,
+        event_id_in_minute: EventId,
     },
-    /// Retire one deleted message's per-message leaf by purging the leaf's
+    /// Retire one deleted event's per-event leaf by purging the leaf's
     /// canonical event bytes and exact-deleting its projection row. The
-    /// minute_node above it stays so other messages in the same minute keep
+    /// minute_node above it stays so other events in the same minute keep
     /// decrypting.
     RetireDeletedMessageLeaf {
         workspace_id: EventId,
         removal_frontier_id: EventId,
         created_at_ms: u64,
-        leaf_nonce: EventId,
+        event_id_in_minute: EventId,
     },
-    /// Scan a bounded batch of admitted message and reaction events and derive
-    /// their per-message leaves. This is the receiver-side wiring: when a
-    /// signed message arrives blocked on a leaf id this peer has not yet
-    /// derived, this work item reads `(workspace, frontier, created_at_ms,
-    /// leaf_nonce)` out of the canonical bytes and runs `DeriveMessageLeaf`
-    /// so dependency unblock can let the message project.
+    /// Scan a bounded batch of admitted message, reaction, and file events
+    /// and derive their per-event leaves. This is the receiver-side wiring:
+    /// when a signed event arrives blocked on a leaf id this peer has not
+    /// yet derived, this work item recomputes the deterministic
+    /// `event_id_in_minute` from canonical fields and runs
+    /// `DeriveMessageLeaf` so dependency unblock can let the event project.
     DrainPendingMessageLeaves { batch_size: usize },
 }
 
@@ -194,28 +196,28 @@ pub fn run<R: EventRegistry>(store: &Store, registry: &R, work: Work) -> Result<
             workspace_id,
             removal_frontier_id,
             created_at_ms,
-            leaf_nonce,
+            event_id_in_minute,
         } => derive_message_leaf(
             store,
             registry,
             workspace_id,
             removal_frontier_id,
             created_at_ms,
-            leaf_nonce,
+            event_id_in_minute,
         )
         .map(Output::DerivedMessageLeaf),
         Work::RetireDeletedMessageLeaf {
             workspace_id,
             removal_frontier_id,
             created_at_ms,
-            leaf_nonce,
+            event_id_in_minute,
         } => retire_deleted_message_leaf(
             store,
             registry,
             workspace_id,
             removal_frontier_id,
             created_at_ms,
-            leaf_nonce,
+            event_id_in_minute,
         )
         .map(Output::RetiredDeletedMessageLeaf),
         Work::DrainPendingMessageLeaves { batch_size } => {
@@ -461,30 +463,32 @@ fn derive_history_node<R: EventRegistry>(
     })
 }
 
-/// Idempotently derive (or look up) the per-message leaf chain.
+/// Idempotently derive (or look up) the per-event leaf chain.
 ///
 /// The chain is `local_key_secret_root -> minute_node -> leaf` where:
 ///
 ///   * `minute_node` lives at
 ///     `(workspace_id, removal_frontier_id, range_start=unix_minute,
 ///       range_width=1, event_id_in_minute=None)` and is shared across every
-///     message authored in the same `unix_minute`.
+///     event authored in the same `unix_minute`.
 ///   * `leaf` lives at the same range with
-///     `event_id_in_minute=Some(leaf_nonce)` and is private to this message.
+///     `event_id_in_minute=Some(deterministic_coord)` and is private to this
+///     event.
 ///
 /// Both sender and receiver call this with the same `(created_at_ms,
-/// leaf_nonce)` and reach the same leaf id by BLAKE3-keyed-hash determinism.
-/// The minute_node row is reused on subsequent calls in the same minute.
+/// event_id_in_minute)` and reach the same leaf id by BLAKE3-keyed-hash
+/// determinism. The minute_node row is reused on subsequent calls in the
+/// same minute.
 fn derive_message_leaf<R: EventRegistry>(
     store: &Store,
     registry: &R,
     workspace_id: EventId,
     removal_frontier_id: EventId,
     created_at_ms: u64,
-    leaf_nonce: EventId,
+    event_id_in_minute: EventId,
 ) -> Result<DeriveMessageLeafReport, String> {
-    if leaf_nonce.iter().all(|byte| *byte == 0) {
-        return Err("derive_message_leaf requires non-zero leaf_nonce".to_string());
+    if event_id_in_minute.iter().all(|byte| *byte == 0) {
+        return Err("derive_message_leaf requires non-zero event_id_in_minute".to_string());
     }
     let root = local_key_secret::schema::get(store, workspace_id, removal_frontier_id)?
         .ok_or_else(|| "local key secret is missing for removal frontier".to_string())?;
@@ -528,7 +532,7 @@ fn derive_message_leaf<R: EventRegistry>(
         workspace_id,
         removal_frontier_id,
         unix_minute,
-        leaf_nonce,
+        event_id_in_minute,
     )? {
         Some(row) => row,
         None => {
@@ -541,7 +545,7 @@ fn derive_message_leaf<R: EventRegistry>(
                     source_secret_id: minute_id,
                     range_start: unix_minute,
                     range_width: leaf_width,
-                    event_id_in_minute: Some(leaf_nonce),
+                    event_id_in_minute: Some(event_id_in_minute),
                     tombstone_node_id: None,
                 },
             )?;
@@ -551,7 +555,7 @@ fn derive_message_leaf<R: EventRegistry>(
                 workspace_id,
                 removal_frontier_id,
                 unix_minute,
-                leaf_nonce,
+                event_id_in_minute,
             )?
             .ok_or_else(|| "leaf history node was not projected".to_string())?
         }
@@ -564,12 +568,13 @@ fn derive_message_leaf<R: EventRegistry>(
     })
 }
 
-/// Retire the per-message leaf bytes for a deleted message.
+/// Retire the per-event leaf bytes for a deleted event (message, reaction,
+/// or file).
 ///
-/// With per-message leaves under a per-minute coarse cover, manual delete
+/// With per-event leaves under a per-minute coarse cover, manual delete
 /// only purges the leaf event canonical bytes and exact-deletes its
 /// projection row. The minute_node above the leaf stays intact so other
-/// messages in the same minute keep decrypting; whole-minute retirement
+/// events in the same minute keep decrypting; whole-minute retirement
 /// (disappearing messages) is a separate flow that lands later.
 fn retire_deleted_message_leaf<R: EventRegistry>(
     store: &Store,
@@ -577,7 +582,7 @@ fn retire_deleted_message_leaf<R: EventRegistry>(
     workspace_id: EventId,
     removal_frontier_id: EventId,
     created_at_ms: u64,
-    leaf_nonce: EventId,
+    event_id_in_minute: EventId,
 ) -> Result<RetireDeletedMessageLeafReport, String> {
     let unix_minute =
         crate::protocol::event_modules::content::message::types::unix_minute_for(created_at_ms);
@@ -589,18 +594,18 @@ fn retire_deleted_message_leaf<R: EventRegistry>(
         workspace_id,
         removal_frontier_id,
         unix_minute,
-        leaf_nonce,
+        event_id_in_minute,
     )?;
     let leaf_id = leaf_row.as_ref().map(|row| row.local_history_node_secret_id);
 
     if let Some(leaf_id) = leaf_id {
         // Purge the leaf's canonical event bytes. The leaf carries the
-        // plaintext per-message AEAD key in its canonical body; without this
+        // plaintext per-event AEAD key in its canonical body; without this
         // explicit purge an on-disk attacker could still read the leaf bytes
-        // and decrypt the deleted message.
+        // and decrypt the deleted event.
         let purged = store
             .write_transaction(|store| purging::purge_event_storage_in_tx(store, &leaf_id))
-            .map_err(|err| format!("purge deleted message leaf bytes: {err}"))?;
+            .map_err(|err| format!("purge deleted event leaf bytes: {err}"))?;
         if purged {
             purged_event_bytes += 1;
         }
@@ -615,7 +620,7 @@ fn retire_deleted_message_leaf<R: EventRegistry>(
                     removal_frontier_id,
                     unix_minute,
                     1,
-                    Some(leaf_nonce),
+                    Some(event_id_in_minute),
                 )],
             )
             .map_err(|err| format!("delete leaf projection row: {err}"))?;
@@ -643,7 +648,7 @@ fn drain_pending_message_leaves<R: EventRegistry>(
     registry: &R,
     batch_size: usize,
 ) -> Result<DrainPendingLeavesReport, String> {
-    use crate::protocol::event_modules::content::{message, reaction};
+    use crate::protocol::event_modules::content::{file, message, reaction};
 
     let mut report = DrainPendingLeavesReport::default();
     let blocked_pairs = store
@@ -665,46 +670,65 @@ fn drain_pending_message_leaves<R: EventRegistry>(
         else {
             continue;
         };
-        let (workspace_id, removal_frontier_id, created_at_ms, leaf_id, leaf_nonce) = match bytes
-            .first()
-            .copied()
-        {
-            Some(message::codec::TYPE_SIGNED_MESSAGE) => {
-                let envelope = match message::codec::decode_signed(&bytes) {
-                    Ok(envelope) => envelope,
-                    Err(_) => continue,
-                };
-                let event = match message::codec::decode(&envelope.payload) {
-                    Ok(event) => event,
-                    Err(_) => continue,
-                };
-                (
-                    event.workspace_id,
-                    event.removal_frontier_id,
-                    event.created_at_ms,
-                    event.local_history_node_secret_id,
-                    event.leaf_nonce,
-                )
-            }
-            Some(reaction::codec::TYPE_SIGNED_REACTION) => {
-                let envelope = match reaction::codec::decode_signed(&bytes) {
-                    Ok(envelope) => envelope,
-                    Err(_) => continue,
-                };
-                let event = match reaction::codec::decode(&envelope.payload) {
-                    Ok(event) => event,
-                    Err(_) => continue,
-                };
-                (
-                    event.workspace_id,
-                    event.removal_frontier_id,
-                    event.created_at_ms,
-                    event.local_history_node_secret_id,
-                    event.leaf_nonce,
-                )
-            }
-            _ => continue,
-        };
+        let (workspace_id, removal_frontier_id, created_at_ms, leaf_id, event_id_in_minute) =
+            match bytes.first().copied()
+            {
+                Some(message::codec::TYPE_SIGNED_MESSAGE) => {
+                    let envelope = match message::codec::decode_signed(&bytes) {
+                        Ok(envelope) => envelope,
+                        Err(_) => continue,
+                    };
+                    let event = match message::codec::decode(&envelope.payload) {
+                        Ok(event) => event,
+                        Err(_) => continue,
+                    };
+                    let coord = event.event_id_in_minute_derived();
+                    (
+                        event.workspace_id,
+                        event.removal_frontier_id,
+                        event.created_at_ms,
+                        event.local_history_node_secret_id,
+                        coord,
+                    )
+                }
+                Some(reaction::codec::TYPE_SIGNED_REACTION) => {
+                    let envelope = match reaction::codec::decode_signed(&bytes) {
+                        Ok(envelope) => envelope,
+                        Err(_) => continue,
+                    };
+                    let event = match reaction::codec::decode(&envelope.payload) {
+                        Ok(event) => event,
+                        Err(_) => continue,
+                    };
+                    let coord = event.event_id_in_minute_derived();
+                    (
+                        event.workspace_id,
+                        event.removal_frontier_id,
+                        event.created_at_ms,
+                        event.local_history_node_secret_id,
+                        coord,
+                    )
+                }
+                Some(file::codec::TYPE_SIGNED_FILE) => {
+                    let envelope = match file::codec::decode_signed(&bytes) {
+                        Ok(envelope) => envelope,
+                        Err(_) => continue,
+                    };
+                    let event = match file::codec::decode(&envelope.payload) {
+                        Ok(event) => event,
+                        Err(_) => continue,
+                    };
+                    let coord = event.event_id_in_minute_derived();
+                    (
+                        event.workspace_id,
+                        event.removal_frontier_id,
+                        event.created_at_ms,
+                        event.local_history_node_secret_id,
+                        coord,
+                    )
+                }
+                _ => continue,
+            };
         report.scanned_events += 1;
         // Skip if local_key_secret root is missing for this frontier — the
         // common worker is still blocked on key wraps and will retry once the
@@ -724,7 +748,7 @@ fn drain_pending_message_leaves<R: EventRegistry>(
             workspace_id,
             removal_frontier_id,
             created_at_ms,
-            leaf_nonce,
+            event_id_in_minute,
         )?;
         if derived
             .local_history_node_secret_id
@@ -1147,7 +1171,7 @@ mod tests {
         let store = Protocol::open_memory_store().expect("store");
         let protocol = Protocol::new();
         let (frontier_id, _local_key_secret_id) = seed_local_key_secret(&store);
-        let leaf_nonce = [99; 32];
+        let event_id_in_minute = [99; 32];
 
         let first = run(
             &store,
@@ -1156,7 +1180,7 @@ mod tests {
                 workspace_id: WORKSPACE,
                 removal_frontier_id: frontier_id,
                 created_at_ms: 17,
-                leaf_nonce,
+                event_id_in_minute,
             },
         )
         .expect("first derive");
@@ -1179,7 +1203,7 @@ mod tests {
                 workspace_id: WORKSPACE,
                 removal_frontier_id: frontier_id,
                 created_at_ms: 17,
-                leaf_nonce,
+                event_id_in_minute,
             },
         )
         .expect("second derive");
@@ -1196,8 +1220,8 @@ mod tests {
         let store = Protocol::open_memory_store().expect("store");
         let protocol = Protocol::new();
         let (frontier_id, _local_key_secret_id) = seed_local_key_secret(&store);
-        let nonce_a = [11; 32];
-        let nonce_b = [22; 32];
+        let coord_a = [11; 32];
+        let coord_b = [22; 32];
 
         let _first = run(
             &store,
@@ -1206,7 +1230,7 @@ mod tests {
                 workspace_id: WORKSPACE,
                 removal_frontier_id: frontier_id,
                 created_at_ms: 12_345,
-                leaf_nonce: nonce_a,
+                event_id_in_minute: coord_a,
             },
         )
         .expect("first derive");
@@ -1218,7 +1242,7 @@ mod tests {
                 workspace_id: WORKSPACE,
                 removal_frontier_id: frontier_id,
                 created_at_ms: 12_500,
-                leaf_nonce: nonce_b,
+                event_id_in_minute: coord_b,
             },
         )
         .expect("second derive");
@@ -1234,7 +1258,7 @@ mod tests {
         let store = Protocol::open_memory_store().expect("store");
         let protocol = Protocol::new();
         let (frontier_id, _local_key_secret_id) = seed_local_key_secret(&store);
-        let leaf_nonce = [55; 32];
+        let event_id_in_minute = [55; 32];
 
         let derived = run(
             &store,
@@ -1243,7 +1267,7 @@ mod tests {
                 workspace_id: WORKSPACE,
                 removal_frontier_id: frontier_id,
                 created_at_ms: 60_000, // unix_minute = 1
-                leaf_nonce,
+                event_id_in_minute,
             },
         )
         .expect("derive");
@@ -1281,7 +1305,7 @@ mod tests {
                 workspace_id: WORKSPACE,
                 removal_frontier_id: frontier_id,
                 created_at_ms: 60_000,
-                leaf_nonce,
+                event_id_in_minute,
             },
         )
         .expect("retire");
@@ -1314,7 +1338,7 @@ mod tests {
             WORKSPACE,
             frontier_id,
             unix_minute,
-            leaf_nonce,
+            event_id_in_minute,
         )
         .expect("leaf row after retire")
         .is_none());

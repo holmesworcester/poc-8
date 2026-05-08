@@ -4,7 +4,7 @@
 //! content domain root because it spans message + file + file_slice. This
 //! file does not create canonical events; it consumes projected sealed
 //! descriptor and slice rows for operator-facing reads, opening sealed slots
-//! using the local key-secret named by the descriptor's `local_key_secret_id`
+//! using the local key-secret named by the descriptor's `local_history_node_secret_id`
 //! to recover plaintext filename, mime, and slice bytes.
 
 use std::fs;
@@ -14,7 +14,7 @@ use crate::core::cli::{CliArgs, CliCommand, CliOutput};
 use crate::core::store::Store;
 use crate::protocol::cli::Context;
 use crate::protocol::event_modules::content::{file_slice, message};
-use crate::protocol::event_modules::encryption::{local_history_node_secret, local_key_secret};
+use crate::protocol::event_modules::encryption::local_history_node_secret;
 use crate::protocol::event_modules::types::EventId;
 
 use super::codec;
@@ -188,7 +188,7 @@ fn run_save_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
         &context.store,
         sealed.workspace_id,
         sealed.removal_frontier_id,
-        sealed.local_key_secret_id,
+        sealed.local_history_node_secret_id,
     )?
     .ok_or_else(|| "local content key is missing".to_string())?;
 
@@ -289,7 +289,7 @@ pub(crate) fn open_sealed_file_row(
         store,
         sealed.workspace_id,
         sealed.removal_frontier_id,
-        sealed.local_key_secret_id,
+        sealed.local_history_node_secret_id,
     )?
     else {
         return Ok(None);
@@ -305,7 +305,7 @@ pub(crate) fn open_sealed_file_row(
         slice_bytes: sealed.slice_bytes,
         root_hash: sealed.root_hash,
         removal_frontier_id: sealed.removal_frontier_id,
-        local_key_secret_id: sealed.local_key_secret_id,
+        local_history_node_secret_id: sealed.local_history_node_secret_id,
         nonce: sealed.nonce,
         ciphertext: sealed.ciphertext,
     };
@@ -330,7 +330,7 @@ pub(crate) fn open_sealed_file_row(
         slice_bytes: sealed.slice_bytes,
         root_hash: sealed.root_hash,
         removal_frontier_id: sealed.removal_frontier_id,
-        local_key_secret_id: sealed.local_key_secret_id,
+        local_history_node_secret_id: sealed.local_history_node_secret_id,
         filename: plaintext.filename,
         mime_type: plaintext.mime_type,
     }))
@@ -358,29 +358,21 @@ fn resolve_file_selector(
     }
 }
 
-/// Resolve the AEAD key bytes for a file by its `local_key_secret_id`. With
-/// per-message FS, files reuse the parent message's leaf node secret, so we
-/// look up `local_history_node_secret` first; if that doesn't match, we fall
-/// back to the workspace-frontier `local_key_secret` for files authored before
-/// per-message FS landed.
+/// Resolve the AEAD key bytes for a file by its `local_history_node_secret_id`.
+///
+/// Each file authors its own per-event leaf, so this is a single lookup
+/// against `encryption.local_history_node_secrets`. The
+/// `removal_frontier_id` arg is retained as a search-scope hint but is
+/// equivalent to filtering by frontier through the leaf row.
 fn lookup_content_key_secret(
     store: &Store,
     workspace_id: EventId,
-    removal_frontier_id: EventId,
-    local_key_secret_id: EventId,
+    _removal_frontier_id: EventId,
+    local_history_node_secret_id: EventId,
 ) -> Result<Option<crate::core::crypto::XChaCha20Poly1305Key>, String> {
-    for row in
-        local_history_node_secret::schema::list_for_workspace(store, workspace_id)?
-    {
-        if row.local_history_node_secret_id == local_key_secret_id {
+    for row in local_history_node_secret::schema::list_for_workspace(store, workspace_id)? {
+        if row.local_history_node_secret_id == local_history_node_secret_id {
             return Ok(Some(row.node_secret));
-        }
-    }
-    if let Some(secret) =
-        local_key_secret::schema::get(store, workspace_id, removal_frontier_id)?
-    {
-        if secret.local_key_secret_id == local_key_secret_id {
-            return Ok(Some(secret.key_secret));
         }
     }
     Ok(None)

@@ -1,7 +1,7 @@
 //! Commands for creating file slices.
 //!
 //! `create` takes a pre-built BAO slice proof, the descriptor's event id, and
-//! the descriptor's `local_key_secret_id`. `slice_from_ciphertext` is the
+//! the descriptor's `local_history_node_secret_id`. `slice_from_ciphertext` is the
 //! convenience wrapper send-file uses with the full encrypted blob and its
 //! BAO outboard already in hand. Both produce one signed file slice event
 //! whose projection verifies the slice's ciphertext bytes against the
@@ -23,7 +23,7 @@ pub struct CreateFileSlice {
     pub slice_number: u32,
     pub signer_endpoint_shared_id: EventId,
     pub signer_private_key: Ed25519PrivateKey,
-    pub local_key_secret_id: EventId,
+    pub local_history_node_secret_id: EventId,
     pub plaintext_len: u32,
     pub proof: Vec<u8>,
 }
@@ -41,7 +41,7 @@ pub fn create(input: CreateFileSlice) -> Result<CommandOutput<CreateFileSliceOut
         created_at_ms: input.created_at_ms,
         file_id: input.file_id,
         slice_number: input.slice_number,
-        local_key_secret_id: input.local_key_secret_id,
+        local_history_node_secret_id: input.local_history_node_secret_id,
         plaintext_len: input.plaintext_len,
         proof: input.proof,
     };
@@ -73,7 +73,7 @@ pub struct SliceFromCiphertext<'a> {
     pub slice_number: u32,
     pub signer_endpoint_shared_id: EventId,
     pub signer_private_key: Ed25519PrivateKey,
-    pub local_key_secret_id: EventId,
+    pub local_history_node_secret_id: EventId,
     pub plaintext_len: u32,
     /// Concatenated per-slice ciphertexts; this is the byte stream BAO is
     /// computed over, so any slice proof verifies against the descriptor's
@@ -92,7 +92,7 @@ pub fn slice_from_ciphertext(
         created_at_ms: input.created_at_ms,
         file_id: input.file_id,
         slice_number: input.slice_number,
-        local_key_secret_id: input.local_key_secret_id,
+        local_history_node_secret_id: input.local_history_node_secret_id,
         plaintext_len: input.plaintext_len,
         ciphertext: input.ciphertext,
         outboard: input.outboard,
@@ -107,7 +107,7 @@ pub fn slice_from_ciphertext(
         slice_number: input.slice_number,
         signer_endpoint_shared_id: input.signer_endpoint_shared_id,
         signer_private_key: input.signer_private_key,
-        local_key_secret_id: input.local_key_secret_id,
+        local_history_node_secret_id: input.local_history_node_secret_id,
         plaintext_len: input.plaintext_len,
         proof: event.proof,
     })

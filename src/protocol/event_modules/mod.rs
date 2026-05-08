@@ -329,6 +329,12 @@ pub fn record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
         content::file_slice::codec::TYPE_SIGNED_FILE_SLICE => {
             content::file_slice::codec::signed_record_from_bytes(bytes)
         }
+        content::file_deletion::codec::TYPE_FILE_DELETION => {
+            Err("file deletion must be signed".to_string())
+        }
+        content::file_deletion::codec::TYPE_SIGNED_FILE_DELETION => {
+            content::file_deletion::codec::signed_record_from_bytes(bytes)
+        }
         encryption::local_recipient_key::codec::TYPE_LOCAL_RECIPIENT_KEY => {
             encryption::record_from_bytes(bytes)
         }

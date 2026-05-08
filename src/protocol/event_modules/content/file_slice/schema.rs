@@ -17,7 +17,7 @@ use super::types::{FileSliceEvent, FileSliceRow};
 pub const FILE_SLICES: TableName = TableName::new("content.file_slices");
 
 pub const SCHEMAS: &[Schema] = &[Schema::durable_row_table(
-    "content.file_slices.v1",
+    "content.file_slices.v2",
     FILE_SLICES,
 )];
 
@@ -40,7 +40,7 @@ pub fn file_slice_row(
             slice_event_id,
             signer_endpoint_shared_id,
             event.created_at_ms,
-            event.local_key_secret_id,
+            event.local_history_node_secret_id,
             event.plaintext_len,
             &verified_ciphertext,
         ),
@@ -78,7 +78,7 @@ pub fn decode_file_slice_row(key: &[u8], value: &[u8]) -> Result<FileSliceRow, S
     let slice_event_id = reader.id()?;
     let created_at_ms = reader.u64()?;
     let signer_endpoint_shared_id = reader.id()?;
-    let local_key_secret_id = reader.id()?;
+    let local_history_node_secret_id = reader.id()?;
     let plaintext_len = reader.u32()?;
     let ciphertext = reader.sized_bytes()?;
     reader.finish()?;
@@ -89,7 +89,7 @@ pub fn decode_file_slice_row(key: &[u8], value: &[u8]) -> Result<FileSliceRow, S
         slice_event_id,
         created_at_ms,
         signer_endpoint_shared_id,
-        local_key_secret_id,
+        local_history_node_secret_id,
         plaintext_len,
         ciphertext,
     })
@@ -126,7 +126,7 @@ fn encode_value(
     slice_event_id: EventId,
     signer_endpoint_shared_id: EventId,
     created_at_ms: u64,
-    local_key_secret_id: EventId,
+    local_history_node_secret_id: EventId,
     plaintext_len: u32,
     ciphertext: &[u8],
 ) -> Vec<u8> {
@@ -134,7 +134,7 @@ fn encode_value(
     out.id(&slice_event_id);
     out.u64(created_at_ms);
     out.id(&signer_endpoint_shared_id);
-    out.id(&local_key_secret_id);
+    out.id(&local_history_node_secret_id);
     out.u32(plaintext_len as usize);
     out.sized_bytes(ciphertext);
     out.finish()

@@ -61,7 +61,9 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
     // canonical bytes name the leaf id as a dependency, so projection runs
     // after the leaf has been admitted by its own projector. The leaf event
     // body must declare the same `unix_minute` as the message and carry
-    // `event_id_in_minute = Some(message.leaf_nonce)`.
+    // `event_id_in_minute = Some(message.event_id_in_minute_derived())`. The
+    // projector recomputes the deterministic leaf coordinate from canonical
+    // fields rather than trusting any wire-side nonce.
     let leaf_record = event
         .context
         .dependency(&message.local_history_node_secret_id)
@@ -77,8 +79,11 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
     if leaf.range_start != expected_minute || leaf.range_width != super::types::LEAF_RANGE_WIDTH {
         return Err("message leaf coordinate does not match message minute".to_string());
     }
-    if leaf.event_id_in_minute != Some(message.leaf_nonce) {
-        return Err("message leaf event_id_in_minute does not match message leaf_nonce".to_string());
+    if leaf.event_id_in_minute != Some(message.event_id_in_minute_derived()) {
+        return Err(
+            "message leaf event_id_in_minute does not match deterministic message coord"
+                .to_string(),
+        );
     }
 
     // Purge-on-project: a deletion event labels its target message id with
@@ -181,12 +186,18 @@ mod tests {
     ) -> BuiltMessage {
         let created_at_ms = 5u64;
         let removal_frontier_id = [30; 32];
-        // Mint a real leaf event for `(unix_minute_for(5), leaf_nonce)` so
-        // the projector's leaf-binding check has a real local_history_node_secret
+        // Mint a real leaf event for the deterministic
+        // `(unix_minute_for(5), event_id_in_minute_derived())` so the
+        // projector's leaf-binding check has a real local_history_node_secret
         // dependency. Source it from a stub minute_node id so derivation
         // succeeds; production would source from the minute_node admitted
         // earlier in the worker.
-        let leaf_nonce = [44; 32];
+        let event_id_in_minute = super::super::types::message_event_id_in_minute(
+            &workspace_id,
+            &author_user_id,
+            &removal_frontier_id,
+            created_at_ms,
+        );
         let leaf_output = leaf_module::commands::derive(leaf_module::commands::DeriveHistoryNodeSecret {
             workspace_id,
             removal_frontier_id,
@@ -194,7 +205,7 @@ mod tests {
             source_secret: [201; 32],
             range_start: unix_minute_for(created_at_ms),
             range_width: super::super::types::LEAF_RANGE_WIDTH,
-            event_id_in_minute: Some(leaf_nonce),
+            event_id_in_minute: Some(event_id_in_minute),
             tombstone_node_id: None,
         })
         .expect("derive leaf for projector test");
@@ -208,7 +219,6 @@ mod tests {
             signer_private_key: *signer_private_key,
             removal_frontier_id,
             local_history_node_secret_id: leaf_id,
-            leaf_nonce,
             leaf_node_secret: KEY_SECRET,
             text: "hello".to_string(),
         })
@@ -413,7 +423,6 @@ mod tests {
             author_user_id: [2; 32],
             removal_frontier_id: [3; 32],
             local_history_node_secret_id: [4; 32],
-            leaf_nonce: [10; 32],
             nonce: [5; 24],
             ciphertext: [6; super::super::types::MESSAGE_CIPHERTEXT_BYTES],
         });

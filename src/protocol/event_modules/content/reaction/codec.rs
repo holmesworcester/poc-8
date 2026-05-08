@@ -18,12 +18,11 @@ use super::types::{
 
 pub const TYPE_REACTION: u8 = 7;
 pub const TYPE_SIGNED_REACTION: u8 = 8;
-pub const REACTION_ENCRYPTION_PURPOSE: &[u8] = b"topo reaction emoji v1";
-/// Reaction canonical wire size after the per-message leaf-coord redesign.
+pub const REACTION_ENCRYPTION_PURPOSE: &[u8] = b"topo reaction emoji v2";
+/// Reaction canonical wire size after the deterministic-leaf-coord redesign.
 pub const REACTION_WIRE_SIZE: usize = 1
     + 32
     + 8
-    + 32
     + 32
     + 32
     + 32
@@ -39,7 +38,6 @@ struct ReactionMetadata {
     author_user_id: EventId,
     removal_frontier_id: EventId,
     local_history_node_secret_id: EventId,
-    leaf_nonce: EventId,
 }
 
 pub fn encode(event: &ReactionEvent) -> Vec<u8> {
@@ -51,7 +49,6 @@ pub fn encode(event: &ReactionEvent) -> Vec<u8> {
     out.id(&event.author_user_id);
     out.id(&event.removal_frontier_id);
     out.id(&event.local_history_node_secret_id);
-    out.id(&event.leaf_nonce);
     out.raw(&event.nonce);
     out.raw(&event.ciphertext);
     out.finish()
@@ -69,7 +66,6 @@ pub fn decode(bytes: &[u8]) -> Result<ReactionEvent, String> {
     let author_user_id = reader.id()?;
     let removal_frontier_id = reader.id()?;
     let local_history_node_secret_id = reader.id()?;
-    let leaf_nonce = reader.id()?;
     let nonce = fixed_nonce(reader.bytes(XCHACHA20_POLY1305_NONCE_BYTES)?)?;
     let ciphertext = fixed_ciphertext(reader.bytes(REACTION_CIPHERTEXT_BYTES)?)?;
     reader.finish()?;
@@ -80,7 +76,6 @@ pub fn decode(bytes: &[u8]) -> Result<ReactionEvent, String> {
         author_user_id,
         removal_frontier_id,
         local_history_node_secret_id,
-        leaf_nonce,
         nonce,
         ciphertext,
     };
@@ -178,7 +173,6 @@ fn metadata(bytes: &[u8]) -> Result<ReactionMetadata, String> {
     let author_user_id = reader.id()?;
     let removal_frontier_id = reader.id()?;
     let local_history_node_secret_id = reader.id()?;
-    let leaf_nonce = reader.id()?;
     let _nonce = reader.bytes(XCHACHA20_POLY1305_NONCE_BYTES)?;
     let _ciphertext = reader.bytes(REACTION_CIPHERTEXT_BYTES)?;
     reader.finish()?;
@@ -189,7 +183,6 @@ fn metadata(bytes: &[u8]) -> Result<ReactionMetadata, String> {
         author_user_id,
         removal_frontier_id,
         local_history_node_secret_id,
-        leaf_nonce,
     };
     validate_id("reaction workspace", &metadata.workspace_id)?;
     validate_id("reaction target_message_id", &metadata.target_message_id)?;
@@ -202,12 +195,11 @@ fn metadata(bytes: &[u8]) -> Result<ReactionMetadata, String> {
         "reaction local_history_node_secret_id",
         &metadata.local_history_node_secret_id,
     )?;
-    validate_id("reaction leaf_nonce", &metadata.leaf_nonce)?;
     Ok(metadata)
 }
 
 pub fn associated_data(event: &ReactionEvent, signer_endpoint_shared_id: EventId) -> Vec<u8> {
-    let mut out = Writer::with_capacity(1 + 8 + (32 * 7) + XCHACHA20_POLY1305_NONCE_BYTES);
+    let mut out = Writer::with_capacity(1 + 8 + (32 * 6) + XCHACHA20_POLY1305_NONCE_BYTES);
     out.u8(TYPE_REACTION);
     out.id(&event.workspace_id);
     out.u64(event.created_at_ms);
@@ -215,7 +207,6 @@ pub fn associated_data(event: &ReactionEvent, signer_endpoint_shared_id: EventId
     out.id(&event.author_user_id);
     out.id(&event.removal_frontier_id);
     out.id(&event.local_history_node_secret_id);
-    out.id(&event.leaf_nonce);
     out.raw(&event.nonce);
     out.id(&signer_endpoint_shared_id);
     out.finish()
@@ -269,7 +260,6 @@ fn validate_event(event: &ReactionEvent) -> Result<(), String> {
         "reaction local_history_node_secret_id",
         &event.local_history_node_secret_id,
     )?;
-    validate_id("reaction leaf_nonce", &event.leaf_nonce)?;
     Ok(())
 }
 
@@ -330,7 +320,6 @@ mod tests {
             author_user_id: [3; 32],
             removal_frontier_id: [4; 32],
             local_history_node_secret_id: [5; 32],
-            leaf_nonce: [11; 32],
             nonce: [6; XCHACHA20_POLY1305_NONCE_BYTES],
             ciphertext: [7; REACTION_CIPHERTEXT_BYTES],
         }

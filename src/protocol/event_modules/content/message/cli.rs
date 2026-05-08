@@ -23,6 +23,8 @@ use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker;
 use crate::workers::encryption as encryption_worker;
 
+use super::types::message_event_id_in_minute;
+
 use super::{commands, schema};
 
 const SEND_USAGE: &str = "send WORKSPACE_ID_HEX TEXT";
@@ -104,14 +106,19 @@ fn run_send_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
 
     let timestamp = next_timestamp(&context.store, workspace_id)?;
     let removal_frontier_id = require_active_frontier_id(&context.store, workspace_id)?;
-    let leaf_nonce = crypto::random_bytes_32();
+    let event_id_in_minute = message_event_id_in_minute(
+        &workspace_id,
+        &membership.user_authority_event_id,
+        &removal_frontier_id,
+        timestamp,
+    );
     let leaf = derive_message_leaf(
         &context.store,
         &context.protocol,
         workspace_id,
         removal_frontier_id,
         timestamp,
-        leaf_nonce,
+        event_id_in_minute,
     )?;
     let send = commands::send(commands::SendMessage {
         workspace_id,
@@ -121,7 +128,6 @@ fn run_send_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
         signer_private_key: local.signing_secret,
         removal_frontier_id,
         local_history_node_secret_id: leaf.local_history_node_secret_id,
-        leaf_nonce,
         leaf_node_secret: leaf.leaf_node_secret,
         text,
     })?;
@@ -274,12 +280,18 @@ fn open_sealed_message_row(
     row: schema::SealedMessageRow,
 ) -> Result<Option<super::types::MessageRow>, String> {
     let unix_minute = super::types::unix_minute_for(row.created_at_ms);
+    let event_id_in_minute = message_event_id_in_minute(
+        &row.workspace_id,
+        &row.author_user_id,
+        &row.removal_frontier_id,
+        row.created_at_ms,
+    );
     let Some(leaf) = local_history_node_secret::schema::get_leaf(
         store,
         row.workspace_id,
         row.removal_frontier_id,
         unix_minute,
-        row.leaf_nonce,
+        event_id_in_minute,
     )?
     else {
         return Ok(None);
@@ -295,7 +307,6 @@ fn open_sealed_message_row(
         author_user_id: row.author_user_id,
         removal_frontier_id: row.removal_frontier_id,
         local_history_node_secret_id: row.local_history_node_secret_id,
-        leaf_nonce: row.leaf_nonce,
         nonce: row.nonce,
         ciphertext: row.ciphertext,
     };
@@ -395,12 +406,19 @@ fn open_sealed_reaction_row(
     row: reaction::schema::SealedReactionRow,
 ) -> Result<Option<reaction::types::ReactionRow>, String> {
     let unix_minute = super::types::unix_minute_for(row.created_at_ms);
+    let event_id_in_minute = reaction::types::reaction_event_id_in_minute(
+        &row.workspace_id,
+        &row.author_user_id,
+        &row.target_message_id,
+        &row.removal_frontier_id,
+        row.created_at_ms,
+    );
     let Some(leaf) = local_history_node_secret::schema::get_leaf(
         store,
         row.workspace_id,
         row.removal_frontier_id,
         unix_minute,
-        row.leaf_nonce,
+        event_id_in_minute,
     )?
     else {
         return Ok(None);
@@ -417,7 +435,6 @@ fn open_sealed_reaction_row(
         author_user_id: row.author_user_id,
         removal_frontier_id: row.removal_frontier_id,
         local_history_node_secret_id: row.local_history_node_secret_id,
-        leaf_nonce: row.leaf_nonce,
         nonce: row.nonce,
         ciphertext: row.ciphertext,
     };
@@ -519,19 +536,23 @@ pub(crate) fn require_active_frontier_id(
 }
 
 /// Derive (or look up) the per-message minute_node and leaf for one
-/// `(workspace_id, removal_frontier_id, created_at_ms, leaf_nonce)` quadruple.
+/// `(workspace_id, removal_frontier_id, created_at_ms, event_id_in_minute)`
+/// quadruple.
 ///
 /// The minute_node is shared across every message in the same `unix_minute`,
 /// so first call admits it and subsequent calls reuse the row. The leaf is
-/// per-message and never shared. Returns the leaf id and the leaf's
-/// `node_secret` for AEAD use.
+/// per-message and never shared. The caller computes the deterministic
+/// `event_id_in_minute` from canonical event fields (see
+/// `message_event_id_in_minute`); two peers authoring the same logical
+/// message reach the same leaf id by BLAKE3-keyed-hash determinism. Returns
+/// the leaf id and the leaf's `node_secret` for AEAD use.
 pub(crate) fn derive_message_leaf<R>(
     store: &Store,
     registry: &R,
     workspace_id: EventId,
     removal_frontier_id: EventId,
     created_at_ms: u64,
-    leaf_nonce: EventId,
+    event_id_in_minute: EventId,
 ) -> Result<MessageLeafKey, String>
 where
     R: crate::workers::pipeline_helpers::event_pipeline::EventRegistry,
@@ -543,7 +564,7 @@ where
             workspace_id,
             removal_frontier_id,
             created_at_ms,
-            leaf_nonce,
+            event_id_in_minute,
         },
     )?;
     let encryption_worker::Output::DerivedMessageLeaf(report) = output else {

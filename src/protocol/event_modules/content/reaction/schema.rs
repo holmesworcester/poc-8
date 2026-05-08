@@ -21,8 +21,8 @@ pub const REACTIONS: TableName = TableName::new("content.reactions");
 pub const SEALED_REACTIONS: TableName = TableName::new("content.sealed_reactions");
 
 pub const SCHEMAS: &[Schema] = &[
-    Schema::durable_row_table("content.reactions.v1", REACTIONS),
-    Schema::durable_row_table("content.sealed_reactions.v1", SEALED_REACTIONS),
+    Schema::durable_row_table("content.reactions.v2", REACTIONS),
+    Schema::durable_row_table("content.sealed_reactions.v2", SEALED_REACTIONS),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,7 +35,6 @@ pub struct SealedReactionRow {
     pub signer_endpoint_shared_id: EventId,
     pub removal_frontier_id: EventId,
     pub local_history_node_secret_id: EventId,
-    pub leaf_nonce: EventId,
     pub nonce: crate::core::crypto::XChaCha20Poly1305Nonce,
     pub ciphertext: ReactionCiphertext,
 }
@@ -87,7 +86,6 @@ pub fn decode_sealed_reaction_row(key: &[u8], value: &[u8]) -> Result<SealedReac
     let signer_endpoint_shared_id = reader.id()?;
     let removal_frontier_id = reader.id()?;
     let local_history_node_secret_id = reader.id()?;
-    let leaf_nonce = reader.id()?;
     let nonce = reader
         .bytes(crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES)?
         .try_into()
@@ -106,7 +104,6 @@ pub fn decode_sealed_reaction_row(key: &[u8], value: &[u8]) -> Result<SealedReac
         signer_endpoint_shared_id,
         removal_frontier_id,
         local_history_node_secret_id,
-        leaf_nonce,
         nonce,
         ciphertext,
     })
@@ -214,7 +211,6 @@ fn encode_sealed_value(signer_endpoint_shared_id: EventId, event: &ReactionEvent
             + 32
             + 32
             + 32
-            + 32
             + crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES
             + REACTION_CIPHERTEXT_BYTES,
     );
@@ -224,7 +220,6 @@ fn encode_sealed_value(signer_endpoint_shared_id: EventId, event: &ReactionEvent
     out.id(&signer_endpoint_shared_id);
     out.id(&event.removal_frontier_id);
     out.id(&event.local_history_node_secret_id);
-    out.id(&event.leaf_nonce);
     out.raw(&event.nonce);
     out.raw(&event.ciphertext);
     out.finish()

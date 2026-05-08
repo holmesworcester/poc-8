@@ -20,7 +20,9 @@
 
 use crate::core::daemon::{StepContext, Worker};
 use crate::core::store::Store;
-use crate::protocol::event_modules::content::{file, file_slice, message, message_deletion, reaction};
+use crate::protocol::event_modules::content::{
+    file, file_deletion, file_slice, message, message_deletion, reaction,
+};
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::types::EventId;
 use crate::workers::pipeline_helpers::event_pipeline::EventRegistry;
@@ -93,7 +95,7 @@ struct RetireLeafJob {
     workspace_id: EventId,
     removal_frontier_id: EventId,
     created_at_ms: u64,
-    leaf_nonce: EventId,
+    event_id_in_minute: EventId,
 }
 
 fn drain<R: EventRegistry>(
@@ -117,7 +119,7 @@ fn drain<R: EventRegistry>(
                 workspace_id: job.workspace_id,
                 removal_frontier_id: job.removal_frontier_id,
                 created_at_ms: job.created_at_ms,
-                leaf_nonce: job.leaf_nonce,
+                event_id_in_minute: job.event_id_in_minute,
             },
         )?;
         let encryption_worker::Output::RetiredDeletedMessageLeaf(retired) = output else {
@@ -160,7 +162,13 @@ fn drain_in_tx(
                 purge_reaction_for_deleted_message(store, entry.event_id, &bytes, &mut report)?;
             }
             Some(file::codec::TYPE_SIGNED_FILE) => {
-                purge_file_for_deleted_message(store, entry.event_id, &bytes, &mut report)?;
+                purge_file_for_deleted_message_or_file_deletion(
+                    store,
+                    entry.event_id,
+                    &bytes,
+                    &mut report,
+                    &mut retire_jobs,
+                )?;
             }
             Some(file_slice::codec::TYPE_SIGNED_FILE_SLICE) => {
                 purge_file_slice_for_deleted_file(store, entry.event_id, &bytes, &mut report)?;
@@ -192,7 +200,7 @@ fn purge_deleted_message(
         workspace_id: event.workspace_id,
         removal_frontier_id: event.removal_frontier_id,
         created_at_ms: event.created_at_ms,
-        leaf_nonce: event.leaf_nonce,
+        event_id_in_minute: event.event_id_in_minute_derived(),
     });
 
     let inserted = store
@@ -250,17 +258,38 @@ fn purge_reaction_for_deleted_message(
     Ok(())
 }
 
-fn purge_file_for_deleted_message(
+/// Decide whether a file event should be purged, and if so, drop its
+/// projection rows + slice rows + canonical bytes and queue its leaf for
+/// retirement. A file is purged when:
+///
+///   * the parent message has been tombstoned (cascade from
+///     `message_deletion`), or
+///   * the file event itself carries an author-signed deletion label from
+///     an admitted `file_deletion`.
+///
+/// In both cases the file's per-event leaf is retired, parallel to how a
+/// deleted message retires its own leaf.
+fn purge_file_for_deleted_message_or_file_deletion(
     store: &Store,
     file_event_id: EventId,
     bytes: &[u8],
     report: &mut PurgeReport,
+    retire_jobs: &mut Vec<RetireLeafJob>,
 ) -> Result<(), String> {
     let envelope = file::codec::decode_signed(bytes)?;
     let event = file::codec::decode(&envelope.payload)?;
-    if !message::schema::message_tombstone_exists(store, event.workspace_id, event.message_id)? {
+    let parent_deleted =
+        message::schema::message_tombstone_exists(store, event.workspace_id, event.message_id)?;
+    let file_self_deleted = has_file_deletion_label(store, &file_event_id, &event.author_user_id)?;
+    if !parent_deleted && !file_self_deleted {
         return Ok(());
     }
+    retire_jobs.push(RetireLeafJob {
+        workspace_id: event.workspace_id,
+        removal_frontier_id: event.removal_frontier_id,
+        created_at_ms: event.created_at_ms,
+        event_id_in_minute: event.event_id_in_minute_derived(),
+    });
 
     // Delete projection rows for this file_event_id and file_id.
     let primary_key = file::schema::file_key(event.workspace_id, file_event_id);
@@ -379,6 +408,20 @@ fn has_author_deletion_label(
     }))
 }
 
+fn has_file_deletion_label(
+    store: &Store,
+    file_event_id: &EventId,
+    author_user_id: &EventId,
+) -> Result<bool, String> {
+    let labels = event_schema::event_labels(store, file_event_id)
+        .map_err(|err| format!("load file deletion labels: {err}"))?;
+    Ok(labels.iter().any(|label| {
+        file_deletion::types::deletion_label_author(label)
+            .map(|author| author == *author_user_id)
+            .unwrap_or(false)
+    }))
+}
+
 fn table_error(err: String) -> rusqlite::Error {
     rusqlite::Error::InvalidParameterName(err)
 }
@@ -402,8 +445,6 @@ mod tests {
 
     const LEAF_NODE_ID: EventId = [42; 32];
 
-    const LEAF_NONCE: EventId = [88; 32];
-
     fn message_record(text: &str) -> crate::protocol::event_modules::types::EventRecord {
         let output = message::commands::send(message::commands::SendMessage {
             workspace_id: WORKSPACE,
@@ -413,7 +454,6 @@ mod tests {
             signer_private_key: [9; 32],
             removal_frontier_id: FRONTIER,
             local_history_node_secret_id: LEAF_NODE_ID,
-            leaf_nonce: LEAF_NONCE,
             leaf_node_secret: KEY_SECRET,
             text: text.to_string(),
         })
@@ -433,7 +473,6 @@ mod tests {
             signer_private_key: [9; 32],
             removal_frontier_id: FRONTIER,
             local_history_node_secret_id: LEAF_NODE_ID,
-            leaf_nonce: LEAF_NONCE,
             leaf_node_secret: KEY_SECRET,
             emoji: "+1".to_string(),
         })
@@ -464,7 +503,6 @@ mod tests {
                         author_user_id: AUTHOR,
                         removal_frontier_id: FRONTIER,
                         local_history_node_secret_id: LEAF_NODE_ID,
-                        leaf_nonce: LEAF_NONCE,
                         text: "delete me".to_string(),
                     },
                 )
@@ -479,7 +517,6 @@ mod tests {
                         author_user_id: AUTHOR,
                         removal_frontier_id: FRONTIER,
                         local_history_node_secret_id: LEAF_NODE_ID,
-                        leaf_nonce: LEAF_NONCE,
                         emoji: "+1".to_string(),
                     },
                 )

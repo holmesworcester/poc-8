@@ -1,7 +1,7 @@
 //! Projector for signed file slices.
 //!
 //! Each slice event names its descriptor by `file_event_id` and its parent
-//! message's content key by `local_key_secret_id`, so the worker pulls the
+//! message's content key by `local_history_node_secret_id`, so the worker pulls the
 //! descriptor into projection context and the local key-secret will be in
 //! the dependency context too. The projector reads the sealed-blob
 //! `root_hash` from the descriptor's clear-text fields, verifies the BAO
@@ -9,7 +9,7 @@
 //! `[slice_number * (slice_bytes + tag) .. + plaintext_len + tag)` (clamped at
 //! the file tail), and writes the verified ciphertext into the slot row.
 //! Plaintext is never written; the read path opens each slice using the local
-//! key-secret named by `local_key_secret_id`. Out-of-order arrival blocks
+//! key-secret named by `local_history_node_secret_id`. Out-of-order arrival blocks
 //! until the descriptor and the local key-secret apply, then admission
 //! unblocks the slice.
 
@@ -60,7 +60,7 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
     if descriptor_file.file_id != slice.file_id {
         return Err("file slice descriptor file_id does not match slice".to_string());
     }
-    if descriptor_file.local_key_secret_id != slice.local_key_secret_id {
+    if descriptor_file.local_history_node_secret_id != slice.local_history_node_secret_id {
         return Err(
             "file slice local key secret does not match descriptor local key secret".to_string(),
         );
@@ -137,7 +137,7 @@ mod tests {
             created_at_ms: 0,
             file_id: [0; 32],
             slice_number: 0,
-            local_key_secret_id: [0; 32],
+            local_history_node_secret_id: [0; 32],
             plaintext_len: 0,
             proof: Vec::new(),
         };
@@ -188,7 +188,7 @@ mod tests {
             slice_bytes,
             root_hash,
             removal_frontier_id: frontier_id,
-            local_key_secret_id: local_secret_id,
+            local_history_node_secret_id: local_secret_id,
             nonce: descriptor_nonce,
             ciphertext: [0; file::types::FILE_DESCRIPTOR_CIPHERTEXT_BYTES],
         };
@@ -282,7 +282,7 @@ mod tests {
             created_at_ms: 5,
             file_id,
             slice_number,
-            local_key_secret_id: local_secret_id,
+            local_history_node_secret_id: local_secret_id,
             plaintext_len: slice_plaintext_len as u32,
             ciphertext: &ciphertext_total,
             outboard: &outboard,
@@ -376,13 +376,13 @@ mod tests {
     #[test]
     fn rejects_slice_with_descriptor_local_key_secret_mismatch() {
         let built = build_slice(0, 1024, 1);
-        // Construct a slice whose local_key_secret_id diverges from the
+        // Construct a slice whose local_history_node_secret_id diverges from the
         // descriptor's. We do that by re-encoding the slice payload with a
-        // tampered local_key_secret_id and re-signing.
+        // tampered local_history_node_secret_id and re-signing.
         let envelope =
             codec::decode_signed(&built.record.canonical_bytes).expect("decode signed");
         let (mut slice, descriptor_id) = codec::decode(&envelope.payload).expect("decode");
-        slice.local_key_secret_id = [200; 32];
+        slice.local_history_node_secret_id = [200; 32];
         let payload = codec::encode(&slice, &descriptor_id).expect("re-encode");
         let resigned = codec::sign(built.signer_id, &[9; 32], payload);
         let bytes = codec::encode_signed(&resigned);
@@ -422,7 +422,7 @@ mod tests {
             created_at_ms: 5,
             file_id: [88; 32],
             slice_number: 0,
-            local_key_secret_id: [4; 32],
+            local_history_node_secret_id: [4; 32],
             plaintext_len: 0,
             proof: Vec::new(),
         };

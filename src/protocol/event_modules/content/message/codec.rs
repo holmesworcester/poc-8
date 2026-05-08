@@ -19,14 +19,17 @@ use super::types::{
 
 pub const TYPE_MESSAGE: u8 = 5;
 pub const TYPE_SIGNED_MESSAGE: u8 = 6;
-pub const MESSAGE_ENCRYPTION_PURPOSE: &[u8] = b"topo message text v1";
-/// Message canonical wire size after the per-message leaf-coord redesign.
+pub const MESSAGE_ENCRYPTION_PURPOSE: &[u8] = b"topo message text v2";
+/// Message canonical wire size after the deterministic-leaf-coord redesign.
 ///
 /// Layout: type(1) || workspace(32) || created_at_ms(8) || author(32)
 ///       || removal_frontier(32) || local_history_node_secret_id(32)
-///       || leaf_nonce(32) || nonce(24) || ciphertext(MESSAGE_CIPHERTEXT_BYTES)
+///       || nonce(24) || ciphertext(MESSAGE_CIPHERTEXT_BYTES)
+///
+/// `leaf_nonce` is no longer carried on the wire: receivers re-derive the leaf
+/// coord deterministically from `(workspace, author, frontier, created_at_ms)`.
 pub const MESSAGE_WIRE_SIZE: usize =
-    1 + 32 + 8 + 32 + 32 + 32 + 32 + XCHACHA20_POLY1305_NONCE_BYTES + MESSAGE_CIPHERTEXT_BYTES;
+    1 + 32 + 8 + 32 + 32 + 32 + XCHACHA20_POLY1305_NONCE_BYTES + MESSAGE_CIPHERTEXT_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MessageMetadata {
@@ -35,7 +38,6 @@ struct MessageMetadata {
     author_user_id: EventId,
     removal_frontier_id: EventId,
     local_history_node_secret_id: EventId,
-    leaf_nonce: EventId,
 }
 
 pub fn encode(event: &MessageEvent) -> Vec<u8> {
@@ -46,7 +48,6 @@ pub fn encode(event: &MessageEvent) -> Vec<u8> {
     out.id(&event.author_user_id);
     out.id(&event.removal_frontier_id);
     out.id(&event.local_history_node_secret_id);
-    out.id(&event.leaf_nonce);
     out.raw(&event.nonce);
     out.raw(&event.ciphertext);
     out.finish()
@@ -63,7 +64,6 @@ pub fn decode(bytes: &[u8]) -> Result<MessageEvent, String> {
     let author_user_id = reader.id()?;
     let removal_frontier_id = reader.id()?;
     let local_history_node_secret_id = reader.id()?;
-    let leaf_nonce = reader.id()?;
     let nonce = fixed_nonce(reader.bytes(XCHACHA20_POLY1305_NONCE_BYTES)?)?;
     let ciphertext = fixed_ciphertext(reader.bytes(MESSAGE_CIPHERTEXT_BYTES)?)?;
     reader.finish()?;
@@ -73,7 +73,6 @@ pub fn decode(bytes: &[u8]) -> Result<MessageEvent, String> {
         author_user_id,
         removal_frontier_id,
         local_history_node_secret_id,
-        leaf_nonce,
         nonce,
         ciphertext,
     };
@@ -169,7 +168,6 @@ fn metadata(bytes: &[u8]) -> Result<MessageMetadata, String> {
     let author_user_id = reader.id()?;
     let removal_frontier_id = reader.id()?;
     let local_history_node_secret_id = reader.id()?;
-    let leaf_nonce = reader.id()?;
     let _nonce = reader.bytes(XCHACHA20_POLY1305_NONCE_BYTES)?;
     let _ciphertext = reader.bytes(MESSAGE_CIPHERTEXT_BYTES)?;
     reader.finish()?;
@@ -179,7 +177,6 @@ fn metadata(bytes: &[u8]) -> Result<MessageMetadata, String> {
         author_user_id,
         removal_frontier_id,
         local_history_node_secret_id,
-        leaf_nonce,
     };
     validate_id("message workspace", &metadata.workspace_id)?;
     validate_id("message author_user_id", &metadata.author_user_id)?;
@@ -188,25 +185,23 @@ fn metadata(bytes: &[u8]) -> Result<MessageMetadata, String> {
         "message local_history_node_secret_id",
         &metadata.local_history_node_secret_id,
     )?;
-    validate_id("message leaf_nonce", &metadata.leaf_nonce)?;
     Ok(metadata)
 }
 
 /// Build the AEAD associated-data block for a message ciphertext.
 ///
 /// The block binds every fixed field of the canonical bytes plus the signer
-/// endpoint id. It also binds `leaf_nonce` so two AEAD opens against the
-/// same `(workspace, frontier, unix_minute)` cannot succeed against
-/// different leaf nonces.
+/// endpoint id. The leaf coordinate is recoverable from the canonical fields
+/// alone (see `message_event_id_in_minute`), so AAD does not need a separate
+/// leaf-nonce slot.
 pub fn associated_data(event: &MessageEvent, signer_endpoint_shared_id: EventId) -> Vec<u8> {
-    let mut out = Writer::with_capacity(1 + 8 + (32 * 6) + XCHACHA20_POLY1305_NONCE_BYTES);
+    let mut out = Writer::with_capacity(1 + 8 + (32 * 5) + XCHACHA20_POLY1305_NONCE_BYTES);
     out.u8(TYPE_MESSAGE);
     out.id(&event.workspace_id);
     out.u64(event.created_at_ms);
     out.id(&event.author_user_id);
     out.id(&event.removal_frontier_id);
     out.id(&event.local_history_node_secret_id);
-    out.id(&event.leaf_nonce);
     out.raw(&event.nonce);
     out.id(&signer_endpoint_shared_id);
     out.finish()
@@ -259,7 +254,6 @@ fn validate_event(event: &MessageEvent) -> Result<(), String> {
         "message local_history_node_secret_id",
         &event.local_history_node_secret_id,
     )?;
-    validate_id("message leaf_nonce", &event.leaf_nonce)?;
     Ok(())
 }
 
@@ -313,7 +307,6 @@ mod tests {
             author_user_id: [2; 32],
             removal_frontier_id: [3; 32],
             local_history_node_secret_id: [4; 32],
-            leaf_nonce: [9; 32],
             nonce: [5; XCHACHA20_POLY1305_NONCE_BYTES],
             ciphertext: [6; MESSAGE_CIPHERTEXT_BYTES],
         }

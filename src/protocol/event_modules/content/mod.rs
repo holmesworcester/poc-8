@@ -8,6 +8,7 @@
 pub mod cli;
 pub mod content_event;
 pub mod file;
+pub mod file_deletion;
 pub mod file_slice;
 pub mod message;
 pub mod message_deletion;
@@ -31,6 +32,9 @@ pub fn project_record(event: &EventWithContext<'_>) -> Result<Option<ProjectionO
         Some(file::codec::TYPE_SIGNED_FILE) => Ok(Some(file::projector::project(event)?)),
         Some(file_slice::codec::TYPE_SIGNED_FILE_SLICE) => {
             Ok(Some(file_slice::projector::project(event)?))
+        }
+        Some(file_deletion::codec::TYPE_SIGNED_FILE_DELETION) => {
+            Ok(Some(file_deletion::projector::project(event)?))
         }
         _ => Ok(None),
     }

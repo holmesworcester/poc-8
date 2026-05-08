@@ -6,7 +6,7 @@
 //! the descriptor is named by `file_id` and pulled into the projector's
 //! dependency context. The slice event also depends on the file descriptor
 //! event id so the worker holds the slice until its descriptor applies, and
-//! on the parent message's `local_key_secret_id` so AEAD decryption can run
+//! on the parent message's `local_history_node_secret_id` so AEAD decryption can run
 //! at read time without a separate blocking system.
 //!
 //! Encryption shape: each plaintext slice is encrypted independently with
@@ -33,7 +33,7 @@ pub const FILE_SLICE_NONCE_PURPOSE: &[u8] = b"topo file slice nonce v1";
 pub const FILE_SLICE_ENCRYPTION_PURPOSE: &[u8] = b"topo file slice payload v1";
 
 /// Inner wire size: tag(1) + workspace(32) + ts(8) + file_id(32)
-/// + file_event_id(32) + slice#(4) + local_key_secret_id(32) + plaintext_len(4)
+/// + file_event_id(32) + slice#(4) + local_history_node_secret_id(32) + plaintext_len(4)
 /// + proof_len(4) + proof slot.
 pub const FILE_SLICE_WIRE_SIZE: usize =
     1 + 32 + 8 + 32 + 32 + 4 + 32 + 4 + 4 + FILE_SLICE_PROOF_BYTES;
@@ -45,7 +45,7 @@ struct FileSliceMetadata {
     file_id: EventId,
     file_event_id: EventId,
     slice_number: u32,
-    local_key_secret_id: EventId,
+    local_history_node_secret_id: EventId,
     plaintext_len: u32,
 }
 
@@ -151,7 +151,7 @@ pub fn build_slice(input: BuildSlice<'_>) -> Result<FileSliceEvent, String> {
         created_at_ms: input.created_at_ms,
         file_id: input.file_id,
         slice_number: input.slice_number,
-        local_key_secret_id: input.local_key_secret_id,
+        local_history_node_secret_id: input.local_history_node_secret_id,
         plaintext_len: input.plaintext_len,
         proof,
     })
@@ -177,7 +177,7 @@ pub fn encode(event: &FileSliceEvent, file_event_id: &EventId) -> Result<Vec<u8>
     out.id(&event.file_id);
     out.id(file_event_id);
     out.u32(event.slice_number as usize);
-    out.id(&event.local_key_secret_id);
+    out.id(&event.local_history_node_secret_id);
     out.u32(event.plaintext_len as usize);
     out.u32(event.proof.len());
     out.raw(&event.proof);
@@ -196,7 +196,7 @@ pub fn decode(bytes: &[u8]) -> Result<(FileSliceEvent, EventId), String> {
     let file_id = reader.id()?;
     let file_event_id = reader.id()?;
     let slice_number = reader.u32()?;
-    let local_key_secret_id = reader.id()?;
+    let local_history_node_secret_id = reader.id()?;
     let plaintext_len = reader.u32()?;
     let proof_len = reader.u32()? as usize;
     if proof_len > FILE_SLICE_PROOF_BYTES {
@@ -215,7 +215,7 @@ pub fn decode(bytes: &[u8]) -> Result<(FileSliceEvent, EventId), String> {
             created_at_ms,
             file_id,
             slice_number,
-            local_key_secret_id,
+            local_history_node_secret_id,
             plaintext_len,
             proof,
         },
@@ -288,7 +288,7 @@ pub fn signed_record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
     push_unique(&mut dependencies, envelope.signer_endpoint_shared_id);
     push_unique(&mut dependencies, metadata.workspace_id);
     push_unique(&mut dependencies, metadata.file_event_id);
-    push_unique(&mut dependencies, metadata.local_key_secret_id);
+    push_unique(&mut dependencies, metadata.local_history_node_secret_id);
     Ok(EventRecord {
         timestamp: metadata.created_at_ms,
         body_len: FILE_SLICE_WIRE_SIZE - 1,
@@ -310,7 +310,7 @@ fn metadata(bytes: &[u8]) -> Result<FileSliceMetadata, String> {
     let file_id = reader.id()?;
     let file_event_id = reader.id()?;
     let slice_number = reader.u32()?;
-    let local_key_secret_id = reader.id()?;
+    let local_history_node_secret_id = reader.id()?;
     let plaintext_len = reader.u32()?;
     let proof_len = reader.u32()?;
     if (proof_len as usize) > FILE_SLICE_PROOF_BYTES {
@@ -324,7 +324,7 @@ fn metadata(bytes: &[u8]) -> Result<FileSliceMetadata, String> {
         file_id,
         file_event_id,
         slice_number,
-        local_key_secret_id,
+        local_history_node_secret_id,
         plaintext_len,
     })
 }
@@ -385,7 +385,7 @@ mod tests {
             created_at_ms: 11,
             file_id,
             slice_number: 0,
-            local_key_secret_id: [4; 32],
+            local_history_node_secret_id: [4; 32],
             plaintext_len: plaintext.len() as u32,
             ciphertext: &ciphertext,
             outboard: &outboard,
@@ -405,7 +405,7 @@ mod tests {
         let workspace_id: EventId = [1; 32];
         let file_id: EventId = [2; 32];
         let signer: EventId = [3; 32];
-        let local_key_secret_id: EventId = [4; 32];
+        let local_history_node_secret_id: EventId = [4; 32];
         let plaintext_total_len = FILE_SLICE_DATA_BYTES * 4 + 123;
         let plaintext: Vec<u8> = (0..plaintext_total_len)
             .map(|idx| (idx as u8).wrapping_mul(31).rotate_left((idx % 7) as u32))
@@ -443,7 +443,7 @@ mod tests {
                 created_at_ms: 11 + slice_number as u64,
                 file_id,
                 slice_number: slice_number as u32,
-                local_key_secret_id,
+                local_history_node_secret_id,
                 plaintext_len: plaintext_len as u32,
                 ciphertext: &ciphertext_total,
                 outboard: &outboard,
@@ -482,7 +482,7 @@ mod tests {
             created_at_ms: 1,
             file_id: [2; 32],
             slice_number: 0,
-            local_key_secret_id: [4; 32],
+            local_history_node_secret_id: [4; 32],
             plaintext_len: 0,
             proof: vec![0; FILE_SLICE_PROOF_BYTES + 1],
         };
@@ -490,14 +490,14 @@ mod tests {
     }
 
     #[test]
-    fn signed_envelope_dependencies_include_local_key_secret_id() {
+    fn signed_envelope_dependencies_include_local_history_node_secret_id() {
         let file_event_id = [9; 32];
         let (event, _) = slice_event(&file_event_id);
         let payload = encode(&event, &file_event_id).expect("encode");
         let envelope = sign([5; 32], &[6; 32], payload);
         let bytes = encode_signed(&envelope);
         let record = signed_record_from_bytes(bytes).expect("record");
-        // signer, workspace, file_event_id, local_key_secret_id
+        // signer, workspace, file_event_id, local_history_node_secret_id
         assert_eq!(
             record.dependencies,
             vec![[5; 32], [1; 32], file_event_id, [4; 32]]

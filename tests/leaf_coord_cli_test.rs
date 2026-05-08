@@ -1,4 +1,4 @@
-//! Black-box CLI tests for the per-message-FS leaf-coord redesign.
+//! Black-box CLI tests for the deterministic per-event leaf-coord design.
 //!
 //! Setup goes through the real `topo` binary: workspace creation, key
 //! frontier, message authoring, deletion. The tests intentionally do not
@@ -6,8 +6,9 @@
 //! invariant under test.
 //!
 //! Tested invariants:
-//!   * Two peers authoring at the same `created_at_ms` produce distinct
-//!     leaves (per-peer random `leaf_nonce`).
+//!   * Two clients with **identical** canonical inputs (same workspace,
+//!     author, frontier, clock-pinned `created_at_ms`) produce **identical**
+//!     event ids and leaf coordinates — replay is idempotent.
 //!   * Multiple messages in the same `unix_minute` share one minute_node
 //!     above their per-message leaves.
 //!   * Manual delete purges only the deleted leaf event canonical bytes;
@@ -97,37 +98,115 @@ fn cli_minute_node_is_shared_across_messages_in_same_minute() {
 }
 
 #[test]
-fn cli_two_peers_at_same_created_at_ms_get_distinct_leaves() {
+fn cli_message_leaf_coord_is_deterministic_from_canonical_fields() {
+    // The redesign: leaf coord is BLAKE3-keyed-hash over canonical
+    // identifying fields, so two clients with identical inputs land on the
+    // same leaf. Verify that property at the CLI boundary by:
+    //
+    //   1. Pinning the clock so `created_at_ms` is fixed.
+    //   2. Sending one message and reading back the leaf coordinate from
+    //      `keys`.
+    //   3. Recomputing the leaf coord independently from the message's
+    //      canonical fields using the same BLAKE3-keyed-hash construction
+    //      the protocol uses.
+    //   4. Asserting the two coords match.
+    //
+    // The independent recomputation is a thin re-implementation of
+    // `message_event_id_in_minute`; if the protocol's hash construction
+    // changes, this test changes too — that's the point.
+    use topo::core::crypto;
+    use topo::protocol::event_modules::content::message::types::{
+        message_event_id_in_minute, MESSAGE_LEAF_COORD_DOMAIN,
+    };
+
     let tmp = tempfile::tempdir().unwrap();
-    let alice = temp_db(&tmp, "alice.db");
-    let bob = temp_db(&tmp, "bob.db");
+    let db = temp_db(&tmp, "alice.db");
+    let workspace_id = create_workspace(&db, "Determinism", "alice", "alice-laptop");
+    assert_success(topo(&["--db", &db, "key-frontier", &workspace_id]));
+    assert_success(topo(&["--db", &db, "clock", "set", "6000000"]));
+    assert_success(topo(&["--db", &db, "send", &workspace_id, "hello"]));
 
-    // Each peer creates their own private workspace (no sync). Pin both
-    // peers' logical clocks so the next authored timestamp lands at exactly
-    // the same `created_at_ms` on each store.
-    let alice_ws = create_workspace(&alice, "AliceWS", "alice", "alice-laptop");
-    let bob_ws = create_workspace(&bob, "BobWS", "bob", "bob-phone");
-    assert_success(topo(&["--db", &alice, "key-frontier", &alice_ws]));
-    assert_success(topo(&["--db", &bob, "key-frontier", &bob_ws]));
-    assert_success(topo(&["--db", &alice, "clock", "set", "1700000000000"]));
-    assert_success(topo(&["--db", &bob, "clock", "set", "1700000000000"]));
+    // Read back the only leaf coord recorded for the workspace.
+    let keys = keys_value(&db, &workspace_id);
+    let leaf_line = keys
+        .lines()
+        .find(|line| line.contains("history_node:") && !line.contains("event_id_in_minute=none"))
+        .expect("expected one per-message leaf row");
+    // `event_id_in_minute=<hex>` is part of the row line.
+    let observed_coord_hex = leaf_line
+        .split("event_id_in_minute=")
+        .nth(1)
+        .expect("leaf line carries event_id_in_minute")
+        .split_whitespace()
+        .next()
+        .expect("event_id_in_minute hex token");
+    let observed_coord = parse_hex(observed_coord_hex);
 
-    let alice_send = assert_success(topo(&["--db", &alice, "send", &alice_ws, "hello"]));
-    let bob_send = assert_success(topo(&["--db", &bob, "send", &bob_ws, "hello"]));
-    let alice_id = line_value(&alice_send, "event_id");
-    let bob_id = line_value(&bob_send, "event_id");
-    assert_ne!(
-        alice_id, bob_id,
-        "two peers authoring at the same created_at_ms must produce distinct leaf event ids",
+    // Recompute the deterministic coord. The protocol uses the workspace_id
+    // as the keyed-hash key, the v1 domain tag, and a writer-encoded info
+    // tuple `(workspace, author, frontier, ts_be)`. We reuse
+    // `message_event_id_in_minute` to keep this test honest about the
+    // construction it validates.
+    let workspace_bytes = parse_hex(&workspace_id);
+    // The author + frontier ids are not directly printed by `keys`, so we
+    // ask the CLI: identity prints the local user id embedded in a
+    // `workspace:` row, and `keys` prints the workspace's frontier line.
+    let identity = assert_success(topo(&["--db", &db, "identity"]));
+    let user_hex = identity
+        .lines()
+        .find_map(|line| {
+            line.split_whitespace()
+                .find(|tok| tok.starts_with("user_id="))
+                .map(|tok| tok.trim_start_matches("user_id=").to_string())
+        })
+        .expect("identity output must include user_id=...");
+    let author_id = parse_hex(&user_hex);
+    let frontier_line = keys
+        .lines()
+        .find(|line| line.starts_with("frontier:"))
+        .expect("frontier line");
+    let frontier_hex = frontier_line
+        .split_whitespace()
+        .nth(1)
+        .expect("frontier hex token");
+    let frontier_id = parse_hex(frontier_hex);
+
+    let recomputed = message_event_id_in_minute(
+        &workspace_bytes,
+        &author_id,
+        &frontier_id,
+        6_000_000,
     );
+    assert_eq!(observed_coord, recomputed, "leaf coord must be deterministic");
 
-    // Both messages remain decodable on their authoring stores (each has
-    // private key material; the per-peer random leaf_nonce keeps the AEAD
-    // keys distinct).
-    let alice_msgs = assert_success(topo(&["--db", &alice, "messages", &alice_ws]));
-    assert!(alice_msgs.contains("alice: hello"), "{alice_msgs}");
-    let bob_msgs = assert_success(topo(&["--db", &bob, "messages", &bob_ws]));
-    assert!(bob_msgs.contains("bob: hello"), "{bob_msgs}");
+    // Sanity-check the construction is BLAKE3-keyed-hash with the v1 domain.
+    let mut info = Vec::with_capacity(32 + 32 + 32 + 8);
+    info.extend_from_slice(&workspace_bytes);
+    info.extend_from_slice(&author_id);
+    info.extend_from_slice(&frontier_id);
+    info.extend_from_slice(&6_000_000u64.to_be_bytes());
+    let manual = crypto::blake3_keyed_hash(&workspace_bytes, MESSAGE_LEAF_COORD_DOMAIN, &info);
+    assert_eq!(recomputed, manual);
+}
+
+fn parse_hex(value: &str) -> [u8; 32] {
+    assert_eq!(value.len(), 64, "expected 64 hex chars, got {value:?}");
+    let mut out = [0u8; 32];
+    for idx in 0..32 {
+        let hi = hex_nibble(value.as_bytes()[idx * 2]);
+        let lo = hex_nibble(value.as_bytes()[idx * 2 + 1]);
+        out[idx] = (hi << 4) | lo;
+    }
+    out
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => panic!("invalid hex nibble: {byte:?}"),
+    }
 }
 
 #[test]
@@ -239,6 +318,158 @@ fn cli_retained_cover_summary_is_deterministic_within_one_workspace() {
     let after_delete_again = cover_summary_value(&keys_value(&db, &workspace_id));
     assert_eq!(after_delete, after_delete_again);
     assert_ne!(after_delete, pre_summary);
+}
+
+#[test]
+fn cli_send_file_authors_its_own_leaf_distinct_from_message_leaf() {
+    // Each file event now authors its own per-event leaf under the
+    // per-minute coarse cover. After `send-file`, the workspace must have:
+    //   * one minute_node,
+    //   * one leaf for the message,
+    //   * one leaf for the file descriptor.
+    //
+    // The file's leaf is keyed by canonical file fields (workspace +
+    // author + parent message + file_id + frontier + ts), distinct from
+    // the message's leaf.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = temp_db(&tmp, "alice.db");
+    let workspace_id = create_workspace(&db, "FileLeaf", "alice", "alice-laptop");
+    assert_success(topo(&["--db", &db, "key-frontier", &workspace_id]));
+    assert_success(topo(&["--db", &db, "clock", "set", "6000000"]));
+
+    let payload: Vec<u8> = (0..256u32).map(|byte| byte as u8).collect();
+    let in_path = tmp.path().join("blob.bin");
+    std::fs::write(&in_path, &payload).expect("write input");
+    assert_success(topo(&[
+        "--db",
+        &db,
+        "send-file",
+        &workspace_id,
+        "see attached",
+        "--file",
+        in_path.to_str().expect("utf-8"),
+    ]));
+
+    let keys = keys_value(&db, &workspace_id);
+    assert_eq!(line_value(&keys, "local_history_minute_nodes"), "1");
+    assert_eq!(
+        line_value(&keys, "local_history_leaves"),
+        "2",
+        "expected one message leaf + one file leaf in keys output:\n{keys}"
+    );
+}
+
+#[test]
+fn cli_delete_file_retires_its_leaf_without_touching_message_leaf() {
+    // Author one message + one file. Delete the file via `delete-file`
+    // and verify:
+    //   * the file's leaf is retired (one leaf left = the message's),
+    //   * the message itself remains visible,
+    //   * the minute_node above stays.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = temp_db(&tmp, "alice.db");
+    let workspace_id = create_workspace(&db, "FileDelete", "alice", "alice-laptop");
+    assert_success(topo(&["--db", &db, "key-frontier", &workspace_id]));
+    assert_success(topo(&["--db", &db, "clock", "set", "6000000"]));
+
+    let payload: Vec<u8> = (0..256u32).map(|byte| byte as u8).collect();
+    let in_path = tmp.path().join("blob.bin");
+    std::fs::write(&in_path, &payload).expect("write input");
+    let send_out = assert_success(topo(&[
+        "--db",
+        &db,
+        "send-file",
+        &workspace_id,
+        "see attached",
+        "--file",
+        in_path.to_str().expect("utf-8"),
+    ]));
+    let file_event_id = line_value(&send_out, "file_event_id");
+
+    let pre = keys_value(&db, &workspace_id);
+    assert_eq!(line_value(&pre, "local_history_leaves"), "2");
+    assert_eq!(line_value(&pre, "local_history_minute_nodes"), "1");
+
+    assert_success(topo(&[
+        "--db",
+        &db,
+        "delete-file",
+        &workspace_id,
+        &file_event_id,
+    ]));
+
+    let post = keys_value(&db, &workspace_id);
+    // Only the message's leaf survives.
+    assert_eq!(
+        line_value(&post, "local_history_leaves"),
+        "1",
+        "file leaf must be retired, message leaf must remain:\n{post}"
+    );
+    assert_eq!(line_value(&post, "local_history_minute_nodes"), "1");
+
+    // Message text still listed.
+    let messages = assert_success(topo(&["--db", &db, "messages", &workspace_id]));
+    assert!(
+        messages.contains("see attached"),
+        "message must remain visible after file delete:\n{messages}"
+    );
+    // File listing is empty.
+    let files = assert_success(topo(&["--db", &db, "files", &workspace_id]));
+    assert!(
+        files.contains("FILES (0 total):"),
+        "file row must be deleted:\n{files}"
+    );
+}
+
+#[test]
+fn cli_delete_message_cascades_to_attached_file_leaf() {
+    // Author one message + one file. Delete the parent message via
+    // `delete-message`. Both the message's leaf AND the file's leaf must
+    // be retired (cascade), the file's projection rows + canonical bytes
+    // are gone, and the minute_node stays.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = temp_db(&tmp, "alice.db");
+    let workspace_id = create_workspace(&db, "Cascade", "alice", "alice-laptop");
+    assert_success(topo(&["--db", &db, "key-frontier", &workspace_id]));
+    assert_success(topo(&["--db", &db, "clock", "set", "6000000"]));
+
+    let payload: Vec<u8> = (0..256u32).map(|byte| byte as u8).collect();
+    let in_path = tmp.path().join("blob.bin");
+    std::fs::write(&in_path, &payload).expect("write input");
+    assert_success(topo(&[
+        "--db",
+        &db,
+        "send-file",
+        &workspace_id,
+        "see attached",
+        "--file",
+        in_path.to_str().expect("utf-8"),
+    ]));
+
+    let pre = keys_value(&db, &workspace_id);
+    assert_eq!(line_value(&pre, "local_history_leaves"), "2");
+
+    assert_success(topo(&["--db", &db, "delete-message", &workspace_id, "#1"]));
+
+    let post = keys_value(&db, &workspace_id);
+    // Both leaves are retired by the cascade.
+    assert_eq!(
+        line_value(&post, "local_history_leaves"),
+        "0",
+        "both message and file leaves must be retired by the cascade:\n{post}"
+    );
+    // Minute_node survives — the cascade is a per-event leaf retirement,
+    // not a whole-minute retirement.
+    assert_eq!(line_value(&post, "local_history_minute_nodes"), "1");
+
+    // Both projection rows are gone.
+    let messages = assert_success(topo(&["--db", &db, "messages", &workspace_id]));
+    assert_eq!(line_value(&messages, "messages"), "0");
+    let files = assert_success(topo(&["--db", &db, "files", &workspace_id]));
+    assert!(
+        files.contains("FILES (0 total):"),
+        "file row must be cleared by cascade:\n{files}"
+    );
 }
 
 // ---------------------------------------------------------------------------
