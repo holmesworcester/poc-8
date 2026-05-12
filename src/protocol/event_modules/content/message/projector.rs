@@ -6,16 +6,54 @@
 //! the named author user is also a workspace member who signed off the
 //! endpoint chain. The text itself is opaque; storage is keyed by workspace.
 
+use crate::core::store::Store;
 use crate::protocol::event_modules::content::message_deletion::types::deletion_label_author;
 use crate::protocol::event_modules::disappearing_messages_setting;
 use crate::protocol::event_modules::identity::{endpoint_shared, signed, user};
 use crate::protocol::event_modules::identity::workspace;
 use crate::protocol::event_modules::leaf_history_node;
 use crate::protocol::event_modules::types::{EventId, EventRecord};
-use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput, TableDelete};
+use crate::protocol::event_modules::worker::{
+    AdmitDecision, EventWithContext, ProjectionOutput, TableDelete,
+};
 
-use super::types::unix_minute_for;
-use super::{codec, schema};
+use super::types::{unix_minute_for, EXPIRES_NEVER, UNIX_MINUTE_MS};
+use super::{codec, queries, schema};
+
+/// Receive-side admission gate for signed message events.
+///
+/// Runs in the common pipeline's `drain_canonical_in` step before storage,
+/// so message bytes whose id is already tombstoned (a previous TTL expiry or
+/// author deletion has fired) never re-enter `EVENTS` or the in-memory
+/// admitted-event index. If the message's stamped `expires_at_minute` is
+/// past the local logical clock, the gate writes a tombstone row directly
+/// and drops the bytes; this catches re-deliveries after a previous local
+/// expiry, and replaces the projector's old `is_expired_at_receive` branch
+/// (which fired too late, after the bytes were already stored).
+pub fn admit_check_received(store: &Store, bytes: &[u8]) -> Result<AdmitDecision, String> {
+    let envelope = codec::decode_signed(bytes)?;
+    let event = codec::decode(&envelope.payload)?;
+    let event_id = crate::protocol::event_modules::types::event_id(bytes);
+    if queries::message_tombstone_exists(store, event.workspace_id, event_id)? {
+        return Ok(AdmitDecision::Drop);
+    }
+    if event.expires_at_minute == EXPIRES_NEVER {
+        return Ok(AdmitDecision::Admit);
+    }
+    let Some(now_ms) = crate::core::logical_clock::logical_time(store)? else {
+        return Ok(AdmitDecision::Admit);
+    };
+    if event.expires_at_minute >= now_ms / UNIX_MINUTE_MS {
+        return Ok(AdmitDecision::Admit);
+    }
+    let row = schema::message_tombstone_row(
+        event.workspace_id,
+        event_id,
+        event.author_user_id,
+        unix_minute_for(event.created_at_ms),
+    );
+    Ok(AdmitDecision::WriteRowsAndDrop(vec![row]))
+}
 
 pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String> {
     let envelope = codec::decode_signed(&event.record.canonical_bytes)?;
