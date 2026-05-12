@@ -10,6 +10,7 @@
 use crate::core::crypto::{self, Ed25519PrivateKey, ED25519_SIGNATURE_BYTES};
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
 use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::{
     RemovalFrontierEvent, SignedRemovalFrontierEnvelope, MAX_REMOVAL_FRONTIER_REFS,
@@ -17,7 +18,22 @@ use super::types::{
 
 pub const TYPE_REMOVAL_FRONTIER: u8 = 20;
 pub const TYPE_SIGNED_REMOVAL_FRONTIER: u8 = 21;
-pub const REMOVAL_FRONTIER_WIRE_SIZE: usize = 1 + 32 + 8 + 32 + 1 + (32 * 4);
+
+const REMOVAL_SLOT_BYTES: usize = 32 * MAX_REMOVAL_FRONTIER_REFS;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "removal_frontier",
+    TYPE_REMOVAL_FRONTIER,
+    &[
+        Field::id("workspace_id"),
+        Field::u64("created_at_ms"),
+        Field::id("authority_admin_id"),
+        Field::u8("removal_count"),
+        Field::bytes("removal_slot", REMOVAL_SLOT_BYTES),
+    ],
+);
+
+pub const REMOVAL_FRONTIER_WIRE_SIZE: usize = SCHEMA.wire_size();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RemovalFrontierMetadata {
@@ -29,52 +45,43 @@ struct RemovalFrontierMetadata {
 
 pub fn encode(event: &RemovalFrontierEvent) -> Result<Vec<u8>, String> {
     validate_event(event)?;
-    let mut out = Writer::with_capacity(REMOVAL_FRONTIER_WIRE_SIZE);
-    out.u8(TYPE_REMOVAL_FRONTIER);
-    out.id(&event.workspace_id);
-    out.u64(event.created_at_ms);
-    out.id(&event.authority_admin_id);
-    out.u8(u8::try_from(event.removal_event_ids.len())
-        .map_err(|_| "removal frontier has too many refs".to_string())?);
-    for id in &event.removal_event_ids {
-        out.id(id);
+    let count = u8::try_from(event.removal_event_ids.len())
+        .map_err(|_| "removal frontier has too many refs".to_string())?;
+    let mut slot = [0u8; REMOVAL_SLOT_BYTES];
+    for (i, id) in event.removal_event_ids.iter().enumerate() {
+        slot[i * 32..(i + 1) * 32].copy_from_slice(id);
     }
-    for _ in event.removal_event_ids.len()..MAX_REMOVAL_FRONTIER_REFS {
-        out.id(&[0; 32]);
-    }
-    Ok(out.finish())
+    Ok(SCHEMA
+        .encoder()
+        .id(&event.workspace_id)
+        .u64(event.created_at_ms)
+        .id(&event.authority_admin_id)
+        .u8(count)
+        .bytes(&slot)
+        .finish())
 }
 
 pub fn decode(bytes: &[u8]) -> Result<RemovalFrontierEvent, String> {
-    let mut reader = Reader::new(bytes, "removal frontier");
-    let tag = reader.u8()?;
-    if tag != TYPE_REMOVAL_FRONTIER {
-        return Err("expected removal frontier".to_string());
-    }
-    let workspace_id = reader.id()?;
-    let created_at_ms = reader.u64()?;
-    let authority_admin_id = reader.id()?;
-    let count = usize::from(reader.u8()?);
+    let v = SCHEMA.parse(bytes)?;
+    let count = usize::from(v.u8("removal_count")?);
     if count > MAX_REMOVAL_FRONTIER_REFS {
         return Err("removal frontier has too many refs".to_string());
     }
-    let mut slots = Vec::with_capacity(MAX_REMOVAL_FRONTIER_REFS);
-    for _ in 0..MAX_REMOVAL_FRONTIER_REFS {
-        slots.push(reader.id()?);
+    let slot = v.raw("removal_slot")?;
+    let used = count * 32;
+    if slot[used..].iter().any(|b| *b != 0) {
+        return Err("removal frontier unused ref slots must be empty".to_string());
     }
-    reader.finish()?;
     let mut removal_event_ids = Vec::with_capacity(count);
-    for (idx, id) in slots.into_iter().enumerate() {
-        if idx < count {
-            removal_event_ids.push(id);
-        } else if !is_zero(&id) {
-            return Err("removal frontier unused ref slots must be empty".to_string());
-        }
+    for i in 0..count {
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&slot[i * 32..(i + 1) * 32]);
+        removal_event_ids.push(id);
     }
     let event = RemovalFrontierEvent {
-        workspace_id,
-        created_at_ms,
-        authority_admin_id,
+        workspace_id: v.id("workspace_id")?,
+        created_at_ms: v.u64("created_at_ms")?,
+        authority_admin_id: v.id("authority_admin_id")?,
         removal_event_ids,
     };
     validate_event(&event)?;

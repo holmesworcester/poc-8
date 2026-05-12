@@ -12,6 +12,7 @@ use crate::core::crypto::{
 };
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
 use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::{
     KeyWrapCiphertext, KeyWrapEvent, SignedKeyWrapEnvelope, KEY_WRAP_CIPHERTEXT_BYTES,
@@ -20,15 +21,23 @@ use super::types::{
 pub const TYPE_KEY_WRAP: u8 = 22;
 pub const TYPE_SIGNED_KEY_WRAP: u8 = 23;
 pub const KEY_WRAP_PURPOSE: &[u8] = b"topo key wrap v1";
-pub const KEY_WRAP_WIRE_SIZE: usize = 1
-    + 32
-    + 8
-    + 32
-    + 32
-    + 32
-    + X25519_PUBLIC_KEY_BYTES
-    + XCHACHA20_POLY1305_NONCE_BYTES
-    + KEY_WRAP_CIPHERTEXT_BYTES;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "key_wrap",
+    TYPE_KEY_WRAP,
+    &[
+        Field::id("workspace_id"),
+        Field::u64("created_at_ms"),
+        Field::id("removal_frontier_id"),
+        Field::id("local_key_secret_id"),
+        Field::id("recipient_key_id"),
+        Field::bytes("sender_wrap_public_key", X25519_PUBLIC_KEY_BYTES),
+        Field::bytes("nonce", XCHACHA20_POLY1305_NONCE_BYTES),
+        Field::bytes("ciphertext", KEY_WRAP_CIPHERTEXT_BYTES),
+    ],
+);
+
+pub const KEY_WRAP_WIRE_SIZE: usize = SCHEMA.wire_size();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KeyWrapMetadata {
@@ -39,36 +48,34 @@ struct KeyWrapMetadata {
 }
 
 pub fn encode(event: &KeyWrapEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(KEY_WRAP_WIRE_SIZE);
-    out.u8(TYPE_KEY_WRAP);
-    out.id(&event.workspace_id);
-    out.u64(event.created_at_ms);
-    out.id(&event.removal_frontier_id);
-    out.id(&event.local_key_secret_id);
-    out.id(&event.recipient_key_id);
-    out.id(&event.sender_wrap_public_key);
-    out.raw(&event.nonce);
-    out.raw(&event.ciphertext);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .id(&event.workspace_id)
+        .u64(event.created_at_ms)
+        .id(&event.removal_frontier_id)
+        .id(&event.local_key_secret_id)
+        .id(&event.recipient_key_id)
+        .bytes(&event.sender_wrap_public_key)
+        .bytes(&event.nonce)
+        .bytes(&event.ciphertext)
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<KeyWrapEvent, String> {
-    let mut reader = Reader::new(bytes, "key wrap event");
-    let tag = reader.u8()?;
-    if tag != TYPE_KEY_WRAP {
-        return Err("expected key wrap event".to_string());
-    }
+    let v = SCHEMA.parse(bytes)?;
     let event = KeyWrapEvent {
-        workspace_id: reader.id()?,
-        created_at_ms: reader.u64()?,
-        removal_frontier_id: reader.id()?,
-        local_key_secret_id: reader.id()?,
-        recipient_key_id: reader.id()?,
-        sender_wrap_public_key: reader.id()?,
-        nonce: fixed_nonce(reader.bytes(XCHACHA20_POLY1305_NONCE_BYTES)?)?,
-        ciphertext: fixed_ciphertext(reader.bytes(KEY_WRAP_CIPHERTEXT_BYTES)?)?,
+        workspace_id: v.id("workspace_id")?,
+        created_at_ms: v.u64("created_at_ms")?,
+        removal_frontier_id: v.id("removal_frontier_id")?,
+        local_key_secret_id: v.id("local_key_secret_id")?,
+        recipient_key_id: v.id("recipient_key_id")?,
+        sender_wrap_public_key: v
+            .raw("sender_wrap_public_key")?
+            .try_into()
+            .map_err(|_| "sender_wrap_public_key length".to_string())?,
+        nonce: fixed_nonce(v.raw("nonce")?.to_vec())?,
+        ciphertext: fixed_ciphertext(v.raw("ciphertext")?.to_vec())?,
     };
-    reader.finish()?;
     validate_event(&event)?;
     Ok(event)
 }

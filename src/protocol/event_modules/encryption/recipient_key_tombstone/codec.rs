@@ -8,12 +8,26 @@
 use crate::core::crypto::{self, Ed25519PrivateKey, ED25519_SIGNATURE_BYTES};
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
 use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::{RecipientKeyTombstoneEvent, SignedRecipientKeyTombstoneEnvelope};
 
 pub const TYPE_RECIPIENT_KEY_TOMBSTONE: u8 = 24;
 pub const TYPE_SIGNED_RECIPIENT_KEY_TOMBSTONE: u8 = 25;
-pub const RECIPIENT_KEY_TOMBSTONE_WIRE_SIZE: usize = 1 + 32 + 8 + 32 + 32 + 32;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "recipient_key_tombstone",
+    TYPE_RECIPIENT_KEY_TOMBSTONE,
+    &[
+        Field::id("workspace_id"),
+        Field::u64("created_at_ms"),
+        Field::id("endpoint_shared_id"),
+        Field::id("old_recipient_key_id"),
+        Field::id("new_recipient_key_id"),
+    ],
+);
+
+pub const RECIPIENT_KEY_TOMBSTONE_WIRE_SIZE: usize = SCHEMA.wire_size();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecipientKeyTombstoneMetadata {
@@ -25,30 +39,25 @@ struct RecipientKeyTombstoneMetadata {
 }
 
 pub fn encode(event: &RecipientKeyTombstoneEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(RECIPIENT_KEY_TOMBSTONE_WIRE_SIZE);
-    out.u8(TYPE_RECIPIENT_KEY_TOMBSTONE);
-    out.id(&event.workspace_id);
-    out.u64(event.created_at_ms);
-    out.id(&event.endpoint_shared_id);
-    out.id(&event.old_recipient_key_id);
-    out.id(&event.new_recipient_key_id);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .id(&event.workspace_id)
+        .u64(event.created_at_ms)
+        .id(&event.endpoint_shared_id)
+        .id(&event.old_recipient_key_id)
+        .id(&event.new_recipient_key_id)
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<RecipientKeyTombstoneEvent, String> {
-    let mut reader = Reader::new(bytes, "recipient key tombstone");
-    let tag = reader.u8()?;
-    if tag != TYPE_RECIPIENT_KEY_TOMBSTONE {
-        return Err("expected recipient key tombstone".to_string());
-    }
+    let v = SCHEMA.parse(bytes)?;
     let event = RecipientKeyTombstoneEvent {
-        workspace_id: reader.id()?,
-        created_at_ms: reader.u64()?,
-        endpoint_shared_id: reader.id()?,
-        old_recipient_key_id: reader.id()?,
-        new_recipient_key_id: reader.id()?,
+        workspace_id: v.id("workspace_id")?,
+        created_at_ms: v.u64("created_at_ms")?,
+        endpoint_shared_id: v.id("endpoint_shared_id")?,
+        old_recipient_key_id: v.id("old_recipient_key_id")?,
+        new_recipient_key_id: v.id("new_recipient_key_id")?,
     };
-    reader.finish()?;
     validate_event(&event)?;
     Ok(event)
 }

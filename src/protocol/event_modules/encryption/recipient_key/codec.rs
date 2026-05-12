@@ -9,12 +9,25 @@ use crate::core::crypto::{
 };
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
 use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::{RecipientKeyEvent, SignedRecipientKeyEnvelope};
 
 pub const TYPE_RECIPIENT_KEY: u8 = 18;
 pub const TYPE_SIGNED_RECIPIENT_KEY: u8 = 19;
-pub const RECIPIENT_KEY_WIRE_SIZE: usize = 1 + 32 + 8 + 32 + X25519_PUBLIC_KEY_BYTES;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "recipient_key",
+    TYPE_RECIPIENT_KEY,
+    &[
+        Field::id("workspace_id"),
+        Field::u64("created_at_ms"),
+        Field::id("endpoint_shared_id"),
+        Field::bytes("recipient_key", X25519_PUBLIC_KEY_BYTES),
+    ],
+);
+
+pub const RECIPIENT_KEY_WIRE_SIZE: usize = SCHEMA.wire_size();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecipientKeyMetadata {
@@ -24,28 +37,26 @@ struct RecipientKeyMetadata {
 }
 
 pub fn encode(event: &RecipientKeyEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(RECIPIENT_KEY_WIRE_SIZE);
-    out.u8(TYPE_RECIPIENT_KEY);
-    out.id(&event.workspace_id);
-    out.u64(event.created_at_ms);
-    out.id(&event.endpoint_shared_id);
-    out.id(&event.recipient_key);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .id(&event.workspace_id)
+        .u64(event.created_at_ms)
+        .id(&event.endpoint_shared_id)
+        .bytes(&event.recipient_key)
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<RecipientKeyEvent, String> {
-    let mut reader = Reader::new(bytes, "recipient key event");
-    let tag = reader.u8()?;
-    if tag != TYPE_RECIPIENT_KEY {
-        return Err("expected recipient key event".to_string());
-    }
+    let v = SCHEMA.parse(bytes)?;
     let event = RecipientKeyEvent {
-        workspace_id: reader.id()?,
-        created_at_ms: reader.u64()?,
-        endpoint_shared_id: reader.id()?,
-        recipient_key: reader.id()?,
+        workspace_id: v.id("workspace_id")?,
+        created_at_ms: v.u64("created_at_ms")?,
+        endpoint_shared_id: v.id("endpoint_shared_id")?,
+        recipient_key: v
+            .raw("recipient_key")?
+            .try_into()
+            .map_err(|_| "recipient_key length".to_string())?,
     };
-    reader.finish()?;
     validate_event(&event)?;
     Ok(event)
 }
@@ -263,6 +274,6 @@ mod tests {
         let mut bytes = encode(&event());
         bytes.push(0);
         let err = decode(&bytes).expect_err("trailing byte must fail");
-        assert!(err.starts_with("trailing "), "{err}");
+        assert!(err.contains("expected"), "{err}");
     }
 }
