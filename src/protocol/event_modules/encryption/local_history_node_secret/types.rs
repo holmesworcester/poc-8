@@ -144,3 +144,68 @@ pub fn first_diverging_bit(a: &EventId, b: &EventId) -> u16 {
     }
     TRIE_LEAF_BIT_DEPTH
 }
+
+/// True if `row` covers the position `(unix_minute, event_id_in_minute)`.
+/// Time-axis containment first; trie-axis containment second.
+pub fn row_covers(
+    row: &LocalHistoryNodeSecretRow,
+    unix_minute: u64,
+    event_id_in_minute: EventId,
+) -> bool {
+    let row_end = row.range_start.saturating_add(row.range_width);
+    if unix_minute < row.range_start || unix_minute >= row_end {
+        return false;
+    }
+    if row.bit_depth == TIME_TREE_BIT_DEPTH {
+        return true;
+    }
+    if row.bit_depth >= TRIE_LEAF_BIT_DEPTH {
+        return row.event_id_prefix == event_id_in_minute;
+    }
+    mask_prefix_to_depth(event_id_in_minute, row.bit_depth) == row.event_id_prefix
+}
+
+/// Compute the sibling's masked prefix at `depth` along the trie path of
+/// `leaf_coord` — i.e. flip bit `(depth - 1)` of the masked prefix.
+pub fn sibling_prefix_at_depth(leaf_coord: EventId, depth: u16) -> EventId {
+    debug_assert!(depth > 0 && depth <= TRIE_LEAF_BIT_DEPTH);
+    let mut prefix = mask_prefix_to_depth(leaf_coord, depth);
+    let bit_index = depth - 1;
+    let byte = (bit_index / 8) as usize;
+    let shift = 7 - (bit_index % 8) as u8;
+    let mask = 1u8 << shift;
+    prefix[byte] ^= mask;
+    mask_prefix_to_depth(prefix, depth)
+}
+
+/// Source-of-derivation for a per-event leaf, returned by
+/// `schema::closest_ancestor`. Three shapes correspond to the three places a
+/// derivation chain can start from when descending toward a leaf.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AncestorSource {
+    /// The frontier root (`local_key_secret`). Implicitly covers the whole
+    /// time axis at `bit_depth = 0`.
+    Root {
+        secret_id: EventId,
+        secret: HistoryNodeSecret,
+    },
+    /// A materialized time-tree internal: `range_width > 1, bit_depth = 0`.
+    /// Reaching the leaf requires walking the time tree (one event per
+    /// remaining level) plus one trie split.
+    TimeInternal {
+        secret_id: EventId,
+        secret: HistoryNodeSecret,
+        range_start: u64,
+        range_width: u64,
+    },
+    /// A materialized minute_node (`range_width = 1, bit_depth = 0`) or trie
+    /// internal (`range_width = 1, 0 < bit_depth < 256`). Reaching the leaf
+    /// requires one trie split.
+    InMinute {
+        secret_id: EventId,
+        secret: HistoryNodeSecret,
+        range_start: u64,
+        bit_depth: u16,
+        event_id_prefix: EventId,
+    },
+}

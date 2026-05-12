@@ -14,9 +14,11 @@ use crate::core::store::{Schema, Store, TableName, TableRow};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::wire::{Reader, Writer};
 
+use super::super::local_key_secret;
 use super::types::{
-    is_leaf_row, is_minute_node_row, mask_prefix_to_depth, LocalHistoryNodeSecret,
-    LocalHistoryNodeSecretRow, LocalHistoryNodeTombstoneRow,
+    is_leaf_row, is_minute_node_row, mask_prefix_to_depth, row_covers, AncestorSource,
+    LocalHistoryNodeSecret, LocalHistoryNodeSecretRow, LocalHistoryNodeTombstoneRow,
+    TIME_TREE_BIT_DEPTH, TRIE_LEAF_BIT_DEPTH,
 };
 
 pub const LOCAL_HISTORY_NODE_SECRETS: TableName =
@@ -227,6 +229,88 @@ pub fn list_leaves(
         .into_iter()
         .filter(is_leaf_row)
         .collect())
+}
+
+/// Return all materialized trie leaves in a single minute under one frontier.
+/// Used by retirement to compute trie divergence depths against survivors.
+pub fn list_leaves_in_minute(
+    store: &Store,
+    workspace_id: EventId,
+    removal_frontier_id: EventId,
+    unix_minute: u64,
+) -> Result<Vec<LocalHistoryNodeSecretRow>, String> {
+    Ok(list_for_frontier(store, workspace_id, removal_frontier_id)?
+        .into_iter()
+        .filter(|row| {
+            row.range_start == unix_minute
+                && row.range_width == 1
+                && row.bit_depth == TRIE_LEAF_BIT_DEPTH
+        })
+        .collect())
+}
+
+/// Find the closest source-of-derivation for the leaf at
+/// `(unix_minute, event_id_in_minute)` under this frontier. Falls back to the
+/// frontier root (`local_key_secret`) when no materialized internal covers
+/// the position. When `exclude_leaf` is true, skip the leaf-being-retired
+/// itself (it cannot be its own ancestor).
+///
+/// Specificity ranks first by smaller `range_width`, then by larger
+/// `bit_depth`. The returned `AncestorSource` carries the secret material
+/// and identity needed to resume derivation toward the leaf.
+pub fn closest_ancestor(
+    store: &Store,
+    workspace_id: EventId,
+    removal_frontier_id: EventId,
+    unix_minute: u64,
+    event_id_in_minute: EventId,
+    exclude_leaf: bool,
+) -> Result<AncestorSource, String> {
+    let root = local_key_secret::schema::get(store, workspace_id, removal_frontier_id)?
+        .ok_or_else(|| "local key secret is missing for removal frontier".to_string())?;
+    let mut best = AncestorSource::Root {
+        secret_id: root.local_key_secret_id,
+        secret: root.key_secret,
+    };
+    let mut best_range_width = u64::MAX;
+    let mut best_bit_depth = TIME_TREE_BIT_DEPTH;
+
+    for row in list_for_frontier(store, workspace_id, removal_frontier_id)? {
+        if !row_covers(&row, unix_minute, event_id_in_minute) {
+            continue;
+        }
+        if exclude_leaf
+            && row.bit_depth == TRIE_LEAF_BIT_DEPTH
+            && row.event_id_prefix == event_id_in_minute
+        {
+            continue;
+        }
+        let better = matches!(best, AncestorSource::Root { .. })
+            || row.range_width < best_range_width
+            || (row.range_width == best_range_width && row.bit_depth > best_bit_depth);
+        if !better {
+            continue;
+        }
+        best_range_width = row.range_width;
+        best_bit_depth = row.bit_depth;
+        best = if row.range_width > 1 {
+            AncestorSource::TimeInternal {
+                secret_id: row.local_history_node_secret_id,
+                secret: row.node_secret,
+                range_start: row.range_start,
+                range_width: row.range_width,
+            }
+        } else {
+            AncestorSource::InMinute {
+                secret_id: row.local_history_node_secret_id,
+                secret: row.node_secret,
+                range_start: row.range_start,
+                bit_depth: row.bit_depth,
+                event_id_prefix: row.event_id_prefix,
+            }
+        };
+    }
+    Ok(best)
 }
 
 /// Canonical, workspace-independent encoding of every retained node-secret
