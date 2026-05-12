@@ -9,37 +9,40 @@
 //! The event id of these canonical bytes is the workspace id.
 
 use crate::protocol::event_modules::types::{EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::{WorkspaceEvent, WORKSPACE_NAME_BYTES};
 
 pub const TYPE_WORKSPACE: u8 = 131;
-pub const WORKSPACE_WIRE_SIZE: usize = 1 + 8 + 32 + WORKSPACE_NAME_BYTES;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "workspace",
+    TYPE_WORKSPACE,
+    &[
+        Field::u64("created_at_ms"),
+        Field::id("public_key"),
+        Field::bytes("name", WORKSPACE_NAME_BYTES),
+    ],
+);
+
+pub const WORKSPACE_WIRE_SIZE: usize = SCHEMA.wire_size();
 
 pub fn encode(event: &WorkspaceEvent) -> Result<Vec<u8>, String> {
     let name = encode_name(&event.name)?;
-    let mut out = Writer::with_capacity(WORKSPACE_WIRE_SIZE);
-    out.u8(TYPE_WORKSPACE);
-    out.u64(event.created_at_ms);
-    out.id(&event.public_key);
-    out.raw(&name);
-    Ok(out.finish())
+    Ok(SCHEMA
+        .encoder()
+        .u64(event.created_at_ms)
+        .id(&event.public_key)
+        .bytes(&name)
+        .finish())
 }
 
 pub fn decode(bytes: &[u8]) -> Result<WorkspaceEvent, String> {
-    let mut reader = Reader::new(bytes, "workspace");
-    let tag = reader.u8()?;
-    if tag != TYPE_WORKSPACE {
-        return Err("expected workspace".to_string());
-    }
-    let created_at_ms = reader.u64()?;
-    let public_key = reader.id()?;
-    let name = decode_name(reader.slice(WORKSPACE_NAME_BYTES)?)?;
-    reader.finish()?;
+    let v = SCHEMA.parse(bytes)?;
     Ok(WorkspaceEvent {
-        created_at_ms,
-        public_key,
-        name,
+        created_at_ms: v.u64("created_at_ms")?,
+        public_key: v.id("public_key")?,
+        name: decode_name(v.raw("name")?)?,
     })
 }
 
