@@ -66,8 +66,9 @@ and projected into `sync.in`; the sync worker later queues responses, and
 `transit_out` sends them on routed connections. `transit_out` still drains and
 wraps per connection, but coalesces all frames for the same socket address into
 one TCP stream per outbound pass so multiple workspace routes to the same
-daemon do not build an accept backlog. Same-stream replies are reserved for the
-connection handshake response only.
+daemon do not build an accept backlog. There is no same-stream invite-bootstrap
+reply path; connection handshake responses are sent by the connection worker to
+the requester's advertised daemon address.
 
 # Content Key Wrap Derivation
 
@@ -91,26 +92,15 @@ events that were blocked on the secret. No test or daemon path should need to
 run `key-derive` to make progress; `key-derive` is only a bounded diagnostic or
 offline worker invocation.
 
-# Identity/Auth Graph Port Plan
+# Identity/Auth Graph Baseline
 
-This branch ports the latest `poc-7` identity and auth graph behavior into
-`poc-8`, but the implementation must be a `poc-8`-native translation. `poc-7`
-is a behavior reference only. `poc-8` module boundaries, storage shape,
-command/projector split, CLI locality, and worker rules are authoritative.
+The current `poc-8` identity and auth graph is a native translation of the
+latest `poc-7` behavior. `poc-7` remains a behavior reference only. `poc-8`
+module boundaries, storage shape, command/projector split, CLI locality, and
+worker rules are authoritative.
 
-The worktree for this task is:
+## Current TODOs
 
-```text
-/home/holmes/poc-8-identity-auth-graph
-branch: codex/poc8-identity-auth-graph
-```
-
-Do not implement this in the main `/home/holmes/poc-8` worktree.
-
-## Active Branch TODOs
-
-- Before merge, bring current `master` into this branch and adapt any local
-  workers to the newer worker organization model from master.
 - Deletion forward secrecy still requires real encrypted message/reaction
   events plus durable purge of obsolete event bytes and local secrets after
   durable deletion/frontier facts preserve semantic state.
@@ -692,12 +682,13 @@ The main adaptation work is:
 
 ## Required Handoff Step
 
-Commit the completed work on the same worktree branch before handoff or review:
+When this plan is used as worktree instructions, commit the completed work on
+that same worktree branch before handoff or review:
 
 ```text
-git -C /home/holmes/poc-8-identity-auth-graph status
-git -C /home/holmes/poc-8-identity-auth-graph add ...
-git -C /home/holmes/poc-8-identity-auth-graph commit -m "<clear summary>"
+git status
+git add ...
+git commit -m "<clear summary>"
 ```
 
 # Core
@@ -1140,16 +1131,18 @@ responders need indexed range summaries, event ids, presence checks, and event
 bytes from module-owned sync/negentropy tables. That is context for the sync
 module, not sync vocabulary in the core.
 
-Connection and bootstrap projectors should not need custom context in the first
-cut. Model their checks as first-level dependencies and labels:
+Connection projectors should not need custom context in the first cut. Model
+their checks as first-level dependencies and labels:
 
-- a connection request depends on the invite, peer-shared signer, or other
-  signer/prekey facts needed to verify it;
-- a connection response depends on the request it accepts;
-- invite acceptance creates or labels local trust anchors and route hints rather
+- a connection request depends on the local invite-secret fact and initiator
+  ephemeral-secret fact needed to verify its invite signature and public key;
+- a connection response depends on the request it accepts, the invite-secret
+  fact, and the relevant local ephemeral-secret fact needed to confirm the
+  handshake-derived connection secret;
+- invite acceptance creates local trust anchors and pending join facts rather
   than reaching through custom context;
 - observed/self address and route facts are labels or module rows consumed by
-  sender/outbox workers, not projector-only hidden queries.
+  connection and transit-out workers, not projector-only hidden queries.
 
 If a future connection or bootstrap behavior appears to need custom context,
 the burden is to prove that extra dependencies or labels cannot express it
@@ -1488,19 +1481,19 @@ events disappear, and it does not protect local files/backups that retained the
 purged records. TODO: add the TTL purger for old connection ephemerals,
 connection events, connection-scoped event bytes, and transit queues.
 
-The connection module also owns the transit envelope as plain functions:
+The connection module also owns transit envelope commands and projection:
 
-- `connection.wrap_bootstrap(remote_endpoint_id, inner_event) -> TransitBlob`:
-  encrypts a connection request to the invite endpoint public key.
-- `connection.wrap_connection_handshake_response(request_id, inner_connection)`:
-  encrypts the connection event with the handshake response key.
-- `connection.wrap(connection_id, inner_events) -> TransitBlob`: loads the
-  connection event, derives a symmetric AEAD key from `connection_secret` and
-  frame associated data, and encrypts a batch of shared or connection-scoped
-  canonical bytes.
-- `connection.unwrap(bytes) -> Vec<CanonicalEventBytes>`: authenticates the
-  outer frame and emits inner canonical bytes plus transit provenance for the
-  common admission pipeline.
+- `connection::transit::commands::create_bootstrap(...)` encrypts one
+  connection request to the invite endpoint public key before a connection id
+  exists.
+- `connection::transit::commands::create_connection_handshake_response(...)`
+  encrypts the connection response event with the native handshake response key.
+- `connection::transit::commands::create_connection_batch(...)` derives a
+  frame AEAD key from the projected connection response's `connection_secret`
+  and encrypts a batch of shared or connection-scoped canonical bytes.
+- `connection::transit::projector::project_network_in(...)` authenticates an
+  inbound outer frame and emits `canonical.in` rows carrying recovered inner
+  bytes plus transit provenance for the common admission pipeline.
 
 Wrapped bytes are never canonical events. They have no event id, no dependencies, and no labels — they are an opaque transit form. Only inner canonical event bytes are ids in the event store.
 
@@ -1511,30 +1504,37 @@ connection; outbound workers enforce disclosure policy before queueing bytes;
 inbound durable events still validate through codecs, dependency blocking,
 signatures, projectors, and storage constraints.*
 
-**Outbox.** No projector calls `transport.send` or emits a `SendEvent`.
+**Transit outbox.** No projector calls `transport.send` or emits a `SendEvent`.
 Projectors write rows to module-owned queues. A sync worker that wants to send a
 durable event, for example after reading a queued need from connection C for
 event E, must first check that E can be disclosed to C's remote endpoint through
 a mutual workspace. Only then may it write the id-only
-`outbox(connection_id=C, event_id=E)` row. `transit_out` claims outbox
-rows, resolves C to a current transport target, calls the transit wrap command,
-and writes a core TCP send queue row. The TCP IO worker packs those bytes into
-TCP frames and writes sockets. A slow route backs off its own target; other
-transport targets continue.
+`transit.out(connection_id=C, event_id=E)` row. `transit_out` claims
+`transit.out` rows, resolves C to a current transport target, calls the transit
+wrap command, and writes a core TCP send queue row. The TCP IO worker packs
+those bytes into TCP frames and writes sockets. A slow route backs off its own
+target; other transport targets continue.
 *Invariant: ordinary durable bytes on the wire have passed send-side disclosure
-policy before entering transit outbox. The receiving side does not trust that
+policy before entering `transit.out`. The receiving side does not trust that
 fact; after unwrap it admits only shared-scope durable bytes to the common
 pipeline, which performs dependency, signature, projector, and storage
 validation.*
 
-For the current POC, connection response projection owns connection rows and
-route learning. Request projection only validates and caches request bytes; it
-does not create a connection. Network admission attaches receive metadata as
-projector context to accepted inbound handshake records before admitting them.
-The response projector writes:
+For the current POC, request projection validates request facts, caches request
+bytes, and writes pending connection-attempt/response rows. It does not create a
+connection. Connection response projection owns connection rows, request-to-
+connection mapping, invite workspace rows, and route learning. Network
+admission attaches receive metadata as projector context to accepted inbound
+handshake records before admitting them. The projectors write:
 
 ```
+connection.connection_events[request_id] = canonical_request_bytes
+connection.pending_connection_attempts[request_id] = invite_addr
+connection.pending_connection_responses[request_id] = requester_listen_addr
+connection.connection_events[connection_id] = canonical_response_bytes
+connection.request_connections[request_id] = connection_id
 connection.connections[connection_id] = remote_endpoint
+connection.invite_workspaces[connection_id] = workspace_id          # invite-scoped connections only
 connection.transport_targets[connection_id] = route_addr             # when a reusable route is known
 ```
 
@@ -1553,20 +1553,20 @@ policy, while sync owns compare/have/need protocol decisions once a route
 exists. Plain non-invite connections still use deterministic endpoint ordering
 to avoid redundant initiators.
 
-`outbox` stores only deterministic event ids to process for a connection:
+`transit.out` stores only deterministic event ids to process for a connection:
 
 ```
-outbox:
+transit.out:
   connection_id
   event_id
   queued_at_ms
   primary key(connection_id, event_id)
 ```
 
-`outbox` is a memory row table by default and has no per-row claim, lease, or
-retry status. It is send work, not truth: if the process restarts, sync can
-recreate the same deterministic connection-scoped events and outbox rows. Each
-active connection has exactly one transit out worker owner for outbox drain
+`transit.out` is a memory row table by default and has no per-row claim, lease,
+or retry status. It is send work, not truth: if the process restarts, sync can
+recreate the same deterministic connection-scoped events and `transit.out`
+rows. Each active connection has exactly one transit out worker owner for drain
 work:
 
 ```
@@ -1778,15 +1778,15 @@ projection context:
 
 ```
 EventScope::Connection(Outgoing { connection_id })
-  -> projector writes connection-scoped byte cache + id-only transit outbox row
+  -> projector writes connection-scoped byte cache + id-only transit.out row
 
 EventScope::Connection(Incoming { connection_id })
-  -> projector writes sync.inbound_events
+  -> projector writes sync.in
 ```
 
 Inbound transit bytes are unwrapped by `transit_in`, decoded as the same
 canonical sync event bytes, admitted with incoming connection scope, projected
-to `sync.inbound_events`, and then read by `sync/worker.rs`. Core owns only TCP
+to `sync.in`, and then read by `sync/worker.rs`. Core owns only TCP
 length framing; protocol event modules own event bytes and transit wrapping.
 
 Connection transit may batch several canonical inner events into one encrypted
@@ -1794,19 +1794,19 @@ transit blob. That is still connection-domain work, not TCP framing: the
 plaintext batch is a fixed-format list of canonical event bytes, and core sees
 only one opaque `[u32 length][bytes]` frame for the resulting transit blob. The
 batch exists to keep the sender fed and to let the receiver project a coherent
-set of inbound sync events before the sync worker drains `sync.inbound_events`.
+set of inbound sync events before the sync worker drains `sync.in`.
 
 Sync request events are not shared durable data. They are connection-scoped
 transient facts by default. A debug or trace mode may choose durable storage for
 the sync work rows, but that is a storage/debug choice, not protocol truth.
 
 Projectors do not write to sockets and do not emit events. They only maintain
-sync/outbox queue rows. Commands are the only place new semantic events are
+sync/`transit.out` queue rows. Commands are the only place new semantic events are
 created. Workers may decide that a follow-up sync event is needed, but they
 express that decision by calling a module command and admitting its
 `ProposedEvent`s. Workers may also admit canonical bytes that already exist,
 such as bytes received from a connection, but decoding existing bytes is not
-event creation. A worker may write an id-only `transit.outbox` row for an
+event creation. A worker may write an id-only `transit.out` row for an
 already-existing durable shared event requested by `NeedId`; that row is send
 work, not a newly created event.
 
@@ -1828,7 +1828,7 @@ topo sync
 
 Outgoing-scoped SyncCompare / SyncHaveId / SyncNeedId projected
   -> local durable connection_scoped_events(event_id, bytes)
-  -> temp outbox(connection_id, event_id)
+  -> temp transit.out(connection_id, event_id)
 
 Incoming transit bytes
   -> transit_in runs transit projector
@@ -1836,16 +1836,16 @@ Incoming transit bytes
   -> common event pipeline admits incoming connection-scoped event
 
 Incoming-scoped SyncCompare / SyncHaveId / SyncNeedId projected
-  -> temp sync.inbound_events(connection_id, event_id, bytes)
+  -> temp sync.in(connection_id, event_id, bytes)
 
 sync::worker.run
-  -> drains sync.inbound_events by connection
+  -> drains sync.in by connection
   -> command(ctx, params) -> proposed SyncCompare / SyncHaveId / SyncNeedId
-  -> or id-only temp outbox row for requested durable event id
+  -> or id-only temp transit.out row for requested durable event id
   -> common event pipeline admits proposed sync events
 
 transit_out::run
-  -> prefix-scans temp outbox(connection_id, event_id)
+  -> prefix-scans temp transit.out(connection_id, event_id)
   -> transit_wrap command returns transit bytes
   -> writes core TCP send queue rows for those bytes
 ```
@@ -1892,14 +1892,14 @@ it defines a real event type. The implementation plan is:
 1. Preserve the current POC boundary. `sync/compare`,
    `sync/have_id`, and `sync/need_id` stay leaf event modules. Their projectors
    remain row-only: outgoing scope writes connection-scoped bytes plus temp
-   outbox rows, incoming scope writes `sync.inbound_events`. `sync/commands.rs`
+   `transit.out` rows, incoming scope writes `sync.in`. `sync/commands.rs`
    chooses compare/have/need responses from explicit context;
    `src/workers/sync.rs` owns the process-local index shape, scans queues,
    catches up the index, writes transit out rows, and consumes work.
 2. The current code already has real range negotiation: `SyncCompare` names an
    inclusive timestamp range and carries a count/fingerprint summary;
    mismatched ranges split; small leaves emit `SyncHaveId`; missing ids emit
-   `SyncNeedId`; received needs queue id-only temp outbox rows. This replaced
+   `SyncNeedId`; received needs queue id-only temp `transit.out` rows. This replaced
    the old whole-set bucket shortcut and is covered by black-box TCP tests,
    including a 10k-history/one-new-event incremental guard.
 3. Add a shared-event feed in `protocol/event_modules/schema.rs` or the closest
@@ -1956,23 +1956,29 @@ Keep the storage split explicit:
 ```
 event_modules.events(event_id, canonical_event_bytes, status, ...)
 connection.connection_events(event_id, canonical_request_or_connection_bytes) # local durable, TTL-purged
+connection.request_connections(request_id, connection_id)              # local durable, TTL-purged
+connection.connections(connection_id, remote_endpoint)                 # local durable
+connection.invite_workspaces(connection_id, workspace_id)              # local durable invite bootstrap scope
+connection.pending_connection_attempts(request_id, invite_addr)        # local durable retry work
+connection.pending_connection_responses(request_id, requester_addr)    # local durable retry work
+connection.transport_targets(connection_id, addr)                      # local durable route state
 connection.connection_scoped_events(event_id, canonical_event_bytes)   # local durable, TTL-purged
-transit.outbox(connection_id, event_id)                             # temp
-sync.inbound_events(connection_id, event_id, canonical_event_bytes)     # temp
+transit.out(connection_id, event_id)                                # temp
+sync.in(connection_id, event_id, canonical_event_bytes)                 # temp
 sync.index_*                                                           # future durable sync-owned index tables
 ```
 
-`connection/worker.rs` resolves an outbox `event_id` first from durable shared
-event storage, then from local connection-scoped event storage. Sync modules
-do not batch ids into transport frames and do not create transit blobs. They
-either propose new connection-scoped sync events through commands or write
-id-only temp outbox rows for already-existing durable event ids requested by the
-peer.
+`connection/worker.rs` drains pending connection-attempt and response rows.
+`transit_out` resolves a `transit.out` event id first from durable shared event
+storage, then from local connection-scoped event storage. Sync modules do not
+batch ids into transport frames and do not create transit blobs. They either
+propose new connection-scoped sync events through commands or write id-only temp
+`transit.out` rows for already-existing durable event ids requested by the peer.
 
-Outgoing dedupe belongs at the temp `outbox` boundary and the per-connection hot
+Outgoing dedupe belongs at the temp `transit.out` boundary and the per-connection hot
 queue, not in every projector's context. Projectors should not need
 `recently_sent` sets. If suppression beyond pending-buffer dedupe is needed
-later, add an explicit recent-send table with TTL instead of turning outbox into
+later, add an explicit recent-send table with TTL instead of turning `transit.out` into
 durable truth.
 
 ## Incoming buffer dedupe
@@ -2011,20 +2017,25 @@ Dedupe deterministic send intent before transit wrapping.
 
 ```
 NeedId
-  -> SendEvent(connection_id, inner_event_id)
-  -> outbox(connection_id, send_event_id)
+  -> transit.out(connection_id, inner_event_id)
   -> transit_out::run
-  -> connection.wrap(connection_id, inner_event)
+  -> connection::transit::commands::create_connection_batch(connection_id, inner_event)
   -> core tcp_send_queue(target: ip/port or socket_id, bytes: transit_blob)
   -> protocol TCP frame/write
-  -> delete sent outbox rows
+  -> delete sent transit.out rows
 ```
 
-Bootstrap and repair traffic uses `connection.wrap_bootstrap(remote_endpoint_id, inner_events)`. Ordinary sync/control/event traffic uses `connection.wrap(connection_id, inner_events)`.
+Bootstrap request traffic uses
+`connection::transit::commands::create_bootstrap(...)`. Connection handshake
+responses use
+`connection::transit::commands::create_connection_handshake_response(...)`.
+Ordinary sync/control/event traffic uses
+`connection::transit::commands::create_connection_batch(...)`.
 
-If send fails, leave the temp `outbox` rows for retry and back off the
-connection sender. If the process crashes before retry, later sync recreates the
-work. Dedupe remains `(connection_id, event_id)` based, not ciphertext based.
+If send fails, leave the temp `transit.out` rows for retry and back off that
+route in `transit_out`. If the process crashes before retry, later sync
+recreates the work. Dedupe remains `(connection_id, event_id)` based, not
+ciphertext based.
 
 The receiver still validates inner events normally after decrypting. Network sync messages can cause work to be attempted, but they cannot make invalid durable events valid.
 
