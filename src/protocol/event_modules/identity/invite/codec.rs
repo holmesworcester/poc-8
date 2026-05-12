@@ -7,7 +7,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::protocol::event_modules::types::{EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::InviteSecretEvent;
 
@@ -18,31 +18,38 @@ const ADDR_FAMILY_V4: u8 = 4;
 const ADDR_FAMILY_V6: u8 = 6;
 const ADDR_BLOCK_BYTES: usize = 1 + 16 + 2;
 
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "identity.invite_secret",
+    TYPE_INVITE_SECRET,
+    &[
+        Field::id("bootstrap_hash"),
+        Field::id("bootstrap_secret"),
+        Field::bytes("addr_block", ADDR_BLOCK_BYTES),
+        Field::id("workspace_id_or_zero"),
+        Field::id("invite_event_id_or_zero"),
+    ],
+);
+
 pub fn encode(event: &InviteSecretEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(1 + 32 + 32 + ADDR_BLOCK_BYTES + 32 + 32);
-    out.u8(TYPE_INVITE_SECRET);
-    out.id(&event.bootstrap_hash);
-    out.id(&event.bootstrap_secret);
-    encode_optional_addr(&mut out, event.addr);
-    out.id(&event.workspace_id.unwrap_or([0; 32]));
-    out.id(&event.invite_event_id.unwrap_or([0; 32]));
-    out.finish()
+    SCHEMA
+        .encoder()
+        .id(&event.bootstrap_hash)
+        .id(&event.bootstrap_secret)
+        .bytes(&encode_addr_block(event.addr))
+        .id(&event.workspace_id.unwrap_or([0; 32]))
+        .id(&event.invite_event_id.unwrap_or([0; 32]))
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<InviteSecretEvent, String> {
-    let mut reader = Reader::new(bytes, "invite secret");
-    let tag = reader.u8()?;
-    if tag != TYPE_INVITE_SECRET {
-        return Err("expected invite secret".to_string());
-    }
+    let v = SCHEMA.parse(bytes)?;
     let event = InviteSecretEvent {
-        bootstrap_hash: reader.id()?,
-        bootstrap_secret: reader.id()?,
-        addr: decode_optional_addr(&mut reader)?,
-        workspace_id: optional_id(reader.id()?),
-        invite_event_id: optional_id(reader.id()?),
+        bootstrap_hash: v.id("bootstrap_hash")?,
+        bootstrap_secret: v.id("bootstrap_secret")?,
+        addr: decode_addr_block(v.raw("addr_block")?)?,
+        workspace_id: optional_id(v.id("workspace_id_or_zero")?),
+        invite_event_id: optional_id(v.id("invite_event_id_or_zero")?),
     };
-    reader.finish()?;
     event.validate()
 }
 
@@ -66,54 +73,49 @@ fn optional_id(id: [u8; 32]) -> Option<[u8; 32]> {
     }
 }
 
-fn encode_optional_addr(out: &mut Writer, addr: Option<SocketAddr>) {
+fn encode_addr_block(addr: Option<SocketAddr>) -> [u8; ADDR_BLOCK_BYTES] {
+    let mut out = [0u8; ADDR_BLOCK_BYTES];
     match addr {
-        None => {
-            out.u8(ADDR_FAMILY_NONE);
-            out.raw(&[0u8; 16]);
-            out.u16(0);
-        }
-        Some(addr) => match addr.ip() {
+        None => out[0] = ADDR_FAMILY_NONE,
+        Some(a) => match a.ip() {
             IpAddr::V4(ip) => {
-                out.u8(ADDR_FAMILY_V4);
-                let mut padded = [0u8; 16];
-                padded[..4].copy_from_slice(&ip.octets());
-                out.raw(&padded);
-                out.u16(addr.port());
+                out[0] = ADDR_FAMILY_V4;
+                out[1..5].copy_from_slice(&ip.octets());
+                out[17..19].copy_from_slice(&a.port().to_be_bytes());
             }
             IpAddr::V6(ip) => {
-                out.u8(ADDR_FAMILY_V6);
-                out.raw(&ip.octets());
-                out.u16(addr.port());
+                out[0] = ADDR_FAMILY_V6;
+                out[1..17].copy_from_slice(&ip.octets());
+                out[17..19].copy_from_slice(&a.port().to_be_bytes());
             }
         },
     }
+    out
 }
 
-fn decode_optional_addr(reader: &mut Reader<'_>) -> Result<Option<SocketAddr>, String> {
-    let family = reader.u8()?;
-    let raw = reader.bytes(16)?;
-    let port = reader.u16()?;
+fn decode_addr_block(bytes: &[u8]) -> Result<Option<SocketAddr>, String> {
+    let family = bytes[0];
+    let ip_bytes = &bytes[1..17];
+    let port = u16::from_be_bytes(bytes[17..19].try_into().expect("len checked"));
     match family {
         ADDR_FAMILY_NONE => {
-            if raw.iter().any(|byte| *byte != 0) || port != 0 {
+            if ip_bytes.iter().any(|byte| *byte != 0) || port != 0 {
                 return Err("absent invite addr must zero its address bytes".to_string());
             }
             Ok(None)
         }
         ADDR_FAMILY_V4 => {
-            if raw[4..].iter().any(|byte| *byte != 0) {
+            if ip_bytes[4..].iter().any(|byte| *byte != 0) {
                 return Err("ipv4 invite addr must zero its trailing bytes".to_string());
             }
-            let octets = [raw[0], raw[1], raw[2], raw[3]];
+            let octets: [u8; 4] = ip_bytes[..4].try_into().expect("len checked");
             Ok(Some(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::from(octets)),
                 port,
             )))
         }
         ADDR_FAMILY_V6 => {
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&raw);
+            let octets: [u8; 16] = ip_bytes.try_into().expect("len checked");
             Ok(Some(SocketAddr::new(
                 IpAddr::V6(Ipv6Addr::from(octets)),
                 port,
@@ -152,7 +154,7 @@ mod tests {
 
         let err = decode(&bytes).expect_err("trailing byte must fail");
 
-        assert!(err.starts_with("trailing "), "{err}");
+        assert!(err.contains("expected"), "{err}");
     }
 
     #[test]

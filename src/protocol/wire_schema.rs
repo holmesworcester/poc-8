@@ -58,10 +58,12 @@ impl WireSchema {
     }
 
     /// Total bytes on the wire: tag + sum of field sizes.
-    pub fn wire_size(&self) -> usize {
+    pub const fn wire_size(&self) -> usize {
         let mut total: usize = 1;
-        for field in self.fields {
-            total += field.size;
+        let mut i = 0;
+        while i < self.fields.len() {
+            total += self.fields[i].size;
+            i += 1;
         }
         total
     }

@@ -8,38 +8,46 @@
 //! rows that differ only by wall-clock timing.
 
 use crate::protocol::event_modules::types::{EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::InviteAcceptedEvent;
 
 pub const TYPE_INVITE_ACCEPTED: u8 = 146;
-pub const INVITE_ACCEPTED_WIRE_SIZE: usize = 1 + 32 + 32 + 32 + 32 + 32;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "invite_accepted",
+    TYPE_INVITE_ACCEPTED,
+    &[
+        Field::id("workspace_id"),
+        Field::id("invite_event_id"),
+        Field::id("invite_secret_event_id"),
+        Field::id("bootstrap_hash"),
+        Field::id("accepted_endpoint_id"),
+    ],
+);
+
+pub const INVITE_ACCEPTED_WIRE_SIZE: usize = SCHEMA.wire_size();
 
 pub fn encode(event: &InviteAcceptedEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(INVITE_ACCEPTED_WIRE_SIZE);
-    out.u8(TYPE_INVITE_ACCEPTED);
-    out.id(&event.workspace_id);
-    out.id(&event.invite_event_id);
-    out.id(&event.invite_secret_event_id);
-    out.id(&event.bootstrap_hash);
-    out.id(&event.accepted_endpoint_id);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .id(&event.workspace_id)
+        .id(&event.invite_event_id)
+        .id(&event.invite_secret_event_id)
+        .id(&event.bootstrap_hash)
+        .id(&event.accepted_endpoint_id)
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<InviteAcceptedEvent, String> {
-    let mut reader = Reader::new(bytes, "invite_accepted");
-    let tag = reader.u8()?;
-    if tag != TYPE_INVITE_ACCEPTED {
-        return Err("expected invite_accepted".to_string());
-    }
+    let v = SCHEMA.parse(bytes)?;
     let event = InviteAcceptedEvent {
-        workspace_id: reader.id()?,
-        invite_event_id: reader.id()?,
-        invite_secret_event_id: reader.id()?,
-        bootstrap_hash: reader.id()?,
-        accepted_endpoint_id: reader.id()?,
+        workspace_id: v.id("workspace_id")?,
+        invite_event_id: v.id("invite_event_id")?,
+        invite_secret_event_id: v.id("invite_secret_event_id")?,
+        bootstrap_hash: v.id("bootstrap_hash")?,
+        accepted_endpoint_id: v.id("accepted_endpoint_id")?,
     };
-    reader.finish()?;
     validate(&event)?;
     Ok(event)
 }
@@ -113,7 +121,7 @@ mod tests {
 
         let err = decode(&bytes).expect_err("trailing byte must fail");
 
-        assert!(err.starts_with("trailing "), "{err}");
+        assert!(err.contains("expected"), "{err}");
     }
 
     /// Invariant: replay/admission can block invite_accepted on the exact local

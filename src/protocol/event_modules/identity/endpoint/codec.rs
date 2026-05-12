@@ -7,33 +7,39 @@
 
 use crate::core::crypto;
 use crate::protocol::event_modules::types::{EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::EndpointKeypair;
 
 pub const TYPE_LOCAL_ENDPOINT: u8 = 128;
 
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "identity.local_endpoint",
+    TYPE_LOCAL_ENDPOINT,
+    &[
+        Field::id("endpoint"),
+        Field::id("secret"),
+        Field::id("signing_public_key"),
+        Field::id("signing_secret"),
+    ],
+);
+
 pub fn encode(event: &EndpointKeypair) -> Vec<u8> {
-    let mut out = Writer::with_capacity(1 + 32 + 32 + 32 + 32);
-    out.u8(TYPE_LOCAL_ENDPOINT);
-    out.id(&event.endpoint);
-    out.id(&event.secret);
-    out.id(&event.signing_public_key);
-    out.id(&event.signing_secret);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .id(&event.endpoint)
+        .id(&event.secret)
+        .id(&event.signing_public_key)
+        .id(&event.signing_secret)
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<EndpointKeypair, String> {
-    let mut reader = Reader::new(bytes, "local endpoint");
-    let tag = reader.u8()?;
-    if tag != TYPE_LOCAL_ENDPOINT {
-        return Err("expected local endpoint".to_string());
-    }
-    let endpoint = reader.id()?;
-    let secret = reader.id()?;
-    let signing_public_key = reader.id()?;
-    let signing_secret = reader.id()?;
-    reader.finish()?;
+    let v = SCHEMA.parse(bytes)?;
+    let endpoint = v.id("endpoint")?;
+    let secret = v.id("secret")?;
+    let signing_public_key = v.id("signing_public_key")?;
+    let signing_secret = v.id("signing_secret")?;
     let derived = crypto::x25519_public_key(&secret);
     if derived != endpoint {
         return Err("local endpoint secret does not match endpoint".to_string());
@@ -111,7 +117,7 @@ mod tests {
 
         let err = decode(&bytes).expect_err("trailing byte must fail");
 
-        assert!(err.starts_with("trailing "), "{err}");
+        assert!(err.contains("expected"), "{err}");
     }
 
     #[test]
