@@ -9,12 +9,25 @@
 use crate::core::crypto::{self, Ed25519PrivateKey, ED25519_SIGNATURE_BYTES};
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
 use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::{MessageDeletionEvent, SignedMessageDeletionEnvelope};
 
 pub const TYPE_MESSAGE_DELETION: u8 = 11;
 pub const TYPE_SIGNED_MESSAGE_DELETION: u8 = 12;
-pub const MESSAGE_DELETION_WIRE_SIZE: usize = 1 + 32 + 8 + 32 + 32;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "message_deletion",
+    TYPE_MESSAGE_DELETION,
+    &[
+        Field::id("workspace_id"),
+        Field::u64("created_at_ms"),
+        Field::id("target_message_id"),
+        Field::id("author_user_id"),
+    ],
+);
+
+pub const MESSAGE_DELETION_WIRE_SIZE: usize = SCHEMA.wire_size();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DeletionMetadata {
@@ -25,31 +38,22 @@ struct DeletionMetadata {
 }
 
 pub fn encode(event: &MessageDeletionEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(MESSAGE_DELETION_WIRE_SIZE);
-    out.u8(TYPE_MESSAGE_DELETION);
-    out.id(&event.workspace_id);
-    out.u64(event.created_at_ms);
-    out.id(&event.target_message_id);
-    out.id(&event.author_user_id);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .id(&event.workspace_id)
+        .u64(event.created_at_ms)
+        .id(&event.target_message_id)
+        .id(&event.author_user_id)
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<MessageDeletionEvent, String> {
-    let mut reader = Reader::new(bytes, "message deletion event");
-    let tag = reader.u8()?;
-    if tag != TYPE_MESSAGE_DELETION {
-        return Err("expected message deletion event".to_string());
-    }
-    let workspace_id = reader.id()?;
-    let created_at_ms = reader.u64()?;
-    let target_message_id = reader.id()?;
-    let author_user_id = reader.id()?;
-    reader.finish()?;
+    let v = SCHEMA.parse(bytes)?;
     Ok(MessageDeletionEvent {
-        workspace_id,
-        created_at_ms,
-        target_message_id,
-        author_user_id,
+        workspace_id: v.id("workspace_id")?,
+        created_at_ms: v.u64("created_at_ms")?,
+        target_message_id: v.id("target_message_id")?,
+        author_user_id: v.id("author_user_id")?,
     })
 }
 

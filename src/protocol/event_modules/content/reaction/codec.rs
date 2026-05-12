@@ -10,6 +10,7 @@ use crate::core::crypto::{
 };
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
 use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::{
     ReactionCiphertext, ReactionEvent, SignedReactionEnvelope, REACTION_CIPHERTEXT_BYTES,
@@ -19,9 +20,23 @@ use super::types::{
 pub const TYPE_REACTION: u8 = 7;
 pub const TYPE_SIGNED_REACTION: u8 = 8;
 pub const REACTION_ENCRYPTION_PURPOSE: &[u8] = b"topo reaction emoji v2";
-/// Reaction canonical wire size after the deterministic-leaf-coord redesign.
-pub const REACTION_WIRE_SIZE: usize =
-    1 + 32 + 8 + 32 + 32 + 32 + 32 + XCHACHA20_POLY1305_NONCE_BYTES + REACTION_CIPHERTEXT_BYTES;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "reaction",
+    TYPE_REACTION,
+    &[
+        Field::id("workspace_id"),
+        Field::u64("created_at_ms"),
+        Field::id("target_message_id"),
+        Field::id("author_user_id"),
+        Field::id("removal_frontier_id"),
+        Field::id("local_history_node_secret_id"),
+        Field::bytes("nonce", XCHACHA20_POLY1305_NONCE_BYTES),
+        Field::bytes("ciphertext", REACTION_CIPHERTEXT_BYTES),
+    ],
+);
+
+pub const REACTION_WIRE_SIZE: usize = SCHEMA.wire_size();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReactionMetadata {
@@ -34,43 +49,30 @@ struct ReactionMetadata {
 }
 
 pub fn encode(event: &ReactionEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(REACTION_WIRE_SIZE);
-    out.u8(TYPE_REACTION);
-    out.id(&event.workspace_id);
-    out.u64(event.created_at_ms);
-    out.id(&event.target_message_id);
-    out.id(&event.author_user_id);
-    out.id(&event.removal_frontier_id);
-    out.id(&event.local_history_node_secret_id);
-    out.raw(&event.nonce);
-    out.raw(&event.ciphertext);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .id(&event.workspace_id)
+        .u64(event.created_at_ms)
+        .id(&event.target_message_id)
+        .id(&event.author_user_id)
+        .id(&event.removal_frontier_id)
+        .id(&event.local_history_node_secret_id)
+        .bytes(&event.nonce)
+        .bytes(&event.ciphertext)
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<ReactionEvent, String> {
-    let mut reader = Reader::new(bytes, "reaction event");
-    let tag = reader.u8()?;
-    if tag != TYPE_REACTION {
-        return Err("expected reaction event".to_string());
-    }
-    let workspace_id = reader.id()?;
-    let created_at_ms = reader.u64()?;
-    let target_message_id = reader.id()?;
-    let author_user_id = reader.id()?;
-    let removal_frontier_id = reader.id()?;
-    let local_history_node_secret_id = reader.id()?;
-    let nonce = fixed_nonce(reader.bytes(XCHACHA20_POLY1305_NONCE_BYTES)?)?;
-    let ciphertext = fixed_ciphertext(reader.bytes(REACTION_CIPHERTEXT_BYTES)?)?;
-    reader.finish()?;
+    let v = SCHEMA.parse(bytes)?;
     let event = ReactionEvent {
-        workspace_id,
-        created_at_ms,
-        target_message_id,
-        author_user_id,
-        removal_frontier_id,
-        local_history_node_secret_id,
-        nonce,
-        ciphertext,
+        workspace_id: v.id("workspace_id")?,
+        created_at_ms: v.u64("created_at_ms")?,
+        target_message_id: v.id("target_message_id")?,
+        author_user_id: v.id("author_user_id")?,
+        removal_frontier_id: v.id("removal_frontier_id")?,
+        local_history_node_secret_id: v.id("local_history_node_secret_id")?,
+        nonce: fixed_nonce(v.raw("nonce")?.to_vec())?,
+        ciphertext: fixed_ciphertext(v.raw("ciphertext")?.to_vec())?,
     };
     validate_event(&event)?;
     Ok(event)

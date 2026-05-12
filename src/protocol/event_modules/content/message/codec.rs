@@ -11,6 +11,7 @@ use crate::core::crypto::{
 };
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
 use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::{
     MessageCiphertext, MessageEvent, SignedMessageEnvelope, MESSAGE_CIPHERTEXT_BYTES,
@@ -20,13 +21,9 @@ use super::types::{
 pub const TYPE_MESSAGE: u8 = 5;
 pub const TYPE_SIGNED_MESSAGE: u8 = 6;
 pub const MESSAGE_ENCRYPTION_PURPOSE: &[u8] = b"topo message text v4";
+
 /// Message canonical wire size with disappearing-message expiry stamping
 /// and per-message setting reference.
-///
-/// Layout: type(1) || workspace(32) || created_at_ms(8) || author(32)
-///       || removal_frontier(32) || local_history_node_secret_id(32)
-///       || expires_at_minute(8) || disappearing_setting_id(32)
-///       || nonce(24) || ciphertext(MESSAGE_CIPHERTEXT_BYTES)
 ///
 /// `expires_at_minute` is the authored-time expiry; `u64::MAX` means no
 /// expiry. `disappearing_setting_id` references the policy under which
@@ -34,16 +31,23 @@ pub const MESSAGE_ENCRYPTION_PURPOSE: &[u8] = b"topo message text v4";
 /// `disappearing_messages_setting` event id or the workspace event id
 /// when no setting has been authored. The projector validates that
 /// `expires_at_minute` is consistent with the referenced policy.
-pub const MESSAGE_WIRE_SIZE: usize = 1
-    + 32
-    + 8
-    + 32
-    + 32
-    + 32
-    + 8
-    + 32
-    + XCHACHA20_POLY1305_NONCE_BYTES
-    + MESSAGE_CIPHERTEXT_BYTES;
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "message",
+    TYPE_MESSAGE,
+    &[
+        Field::id("workspace_id"),
+        Field::u64("created_at_ms"),
+        Field::id("author_user_id"),
+        Field::id("removal_frontier_id"),
+        Field::id("local_history_node_secret_id"),
+        Field::u64("expires_at_minute"),
+        Field::id("disappearing_setting_id"),
+        Field::bytes("nonce", XCHACHA20_POLY1305_NONCE_BYTES),
+        Field::bytes("ciphertext", MESSAGE_CIPHERTEXT_BYTES),
+    ],
+);
+
+pub const MESSAGE_WIRE_SIZE: usize = SCHEMA.wire_size();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MessageMetadata {
@@ -57,46 +61,32 @@ struct MessageMetadata {
 }
 
 pub fn encode(event: &MessageEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(MESSAGE_WIRE_SIZE);
-    out.u8(TYPE_MESSAGE);
-    out.id(&event.workspace_id);
-    out.u64(event.created_at_ms);
-    out.id(&event.author_user_id);
-    out.id(&event.removal_frontier_id);
-    out.id(&event.local_history_node_secret_id);
-    out.u64(event.expires_at_minute);
-    out.id(&event.disappearing_setting_id);
-    out.raw(&event.nonce);
-    out.raw(&event.ciphertext);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .id(&event.workspace_id)
+        .u64(event.created_at_ms)
+        .id(&event.author_user_id)
+        .id(&event.removal_frontier_id)
+        .id(&event.local_history_node_secret_id)
+        .u64(event.expires_at_minute)
+        .id(&event.disappearing_setting_id)
+        .bytes(&event.nonce)
+        .bytes(&event.ciphertext)
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<MessageEvent, String> {
-    let mut reader = Reader::new(bytes, "message event");
-    let tag = reader.u8()?;
-    if tag != TYPE_MESSAGE {
-        return Err("expected message event".to_string());
-    }
-    let workspace_id = reader.id()?;
-    let created_at_ms = reader.u64()?;
-    let author_user_id = reader.id()?;
-    let removal_frontier_id = reader.id()?;
-    let local_history_node_secret_id = reader.id()?;
-    let expires_at_minute = reader.u64()?;
-    let disappearing_setting_id = reader.id()?;
-    let nonce = fixed_nonce(reader.bytes(XCHACHA20_POLY1305_NONCE_BYTES)?)?;
-    let ciphertext = fixed_ciphertext(reader.bytes(MESSAGE_CIPHERTEXT_BYTES)?)?;
-    reader.finish()?;
+    let v = SCHEMA.parse(bytes)?;
     let event = MessageEvent {
-        workspace_id,
-        created_at_ms,
-        author_user_id,
-        removal_frontier_id,
-        local_history_node_secret_id,
-        expires_at_minute,
-        disappearing_setting_id,
-        nonce,
-        ciphertext,
+        workspace_id: v.id("workspace_id")?,
+        created_at_ms: v.u64("created_at_ms")?,
+        author_user_id: v.id("author_user_id")?,
+        removal_frontier_id: v.id("removal_frontier_id")?,
+        local_history_node_secret_id: v.id("local_history_node_secret_id")?,
+        expires_at_minute: v.u64("expires_at_minute")?,
+        disappearing_setting_id: v.id("disappearing_setting_id")?,
+        nonce: fixed_nonce(v.raw("nonce")?.to_vec())?,
+        ciphertext: fixed_ciphertext(v.raw("ciphertext")?.to_vec())?,
     };
     validate_event(&event)?;
     Ok(event)
@@ -380,7 +370,7 @@ mod tests {
         let mut bytes = encode(&event());
         bytes.push(0);
         let err = decode(&bytes).expect_err("trailing must fail");
-        assert!(err.starts_with("trailing "), "{err}");
+        assert!(err.contains("expected"), "{err}");
 
         assert_eq!(
             encode_text_slot(&"x".repeat(MESSAGE_TEXT_BYTES + 1)).expect_err("oversize must fail"),

@@ -16,6 +16,7 @@ use crate::core::crypto::{
 };
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
 use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::{
     FileDescriptorCiphertext, FileDescriptorPlaintext, FileEvent, SignedFileEnvelope,
@@ -28,24 +29,27 @@ pub const TYPE_SIGNED_FILE: u8 = 15;
 /// Domain-separated AAD prefix for the descriptor's sealed slot.
 pub const FILE_DESCRIPTOR_ENCRYPTION_PURPOSE: &[u8] = b"topo file descriptor v2";
 
-/// Inner wire size: tag(1) + workspace(32) + ts(8) + message_id(32) +
-/// author(32) + file_id(32) + blob_bytes(8) + total_slices(4) + slice_bytes(4)
-/// + root_hash(32) + removal_frontier(32) + local_history_node_secret(32)
-/// + nonce + sealed slot.
-pub const FILE_WIRE_SIZE: usize = 1
-    + 32
-    + 8
-    + 32
-    + 32
-    + 32
-    + 8
-    + 4
-    + 4
-    + 32
-    + 32
-    + 32
-    + XCHACHA20_POLY1305_NONCE_BYTES
-    + FILE_DESCRIPTOR_CIPHERTEXT_BYTES;
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "file",
+    TYPE_FILE,
+    &[
+        Field::id("workspace_id"),
+        Field::u64("created_at_ms"),
+        Field::id("message_id"),
+        Field::id("author_user_id"),
+        Field::id("file_id"),
+        Field::u64("blob_bytes"),
+        Field::u32("total_slices"),
+        Field::u32("slice_bytes"),
+        Field::id("root_hash"),
+        Field::id("removal_frontier_id"),
+        Field::id("local_history_node_secret_id"),
+        Field::bytes("nonce", XCHACHA20_POLY1305_NONCE_BYTES),
+        Field::bytes("ciphertext", FILE_DESCRIPTOR_CIPHERTEXT_BYTES),
+    ],
+);
+
+pub const FILE_WIRE_SIZE: usize = SCHEMA.wire_size();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileMetadata {
@@ -59,58 +63,40 @@ struct FileMetadata {
 
 pub fn encode(event: &FileEvent) -> Result<Vec<u8>, String> {
     validate(event)?;
-    let mut out = Writer::with_capacity(FILE_WIRE_SIZE);
-    out.u8(TYPE_FILE);
-    out.id(&event.workspace_id);
-    out.u64(event.created_at_ms);
-    out.id(&event.message_id);
-    out.id(&event.author_user_id);
-    out.id(&event.file_id);
-    out.u64(event.blob_bytes);
-    out.u32(event.total_slices as usize);
-    out.u32(event.slice_bytes as usize);
-    out.id(&event.root_hash);
-    out.id(&event.removal_frontier_id);
-    out.id(&event.local_history_node_secret_id);
-    out.raw(&event.nonce);
-    out.raw(&event.ciphertext);
-    Ok(out.finish())
+    Ok(SCHEMA
+        .encoder()
+        .id(&event.workspace_id)
+        .u64(event.created_at_ms)
+        .id(&event.message_id)
+        .id(&event.author_user_id)
+        .id(&event.file_id)
+        .u64(event.blob_bytes)
+        .u32(event.total_slices)
+        .u32(event.slice_bytes)
+        .id(&event.root_hash)
+        .id(&event.removal_frontier_id)
+        .id(&event.local_history_node_secret_id)
+        .bytes(&event.nonce)
+        .bytes(&event.ciphertext)
+        .finish())
 }
 
 pub fn decode(bytes: &[u8]) -> Result<FileEvent, String> {
-    let mut reader = Reader::new(bytes, "file event");
-    let tag = reader.u8()?;
-    if tag != TYPE_FILE {
-        return Err("expected file event".to_string());
-    }
-    let workspace_id = reader.id()?;
-    let created_at_ms = reader.u64()?;
-    let message_id = reader.id()?;
-    let author_user_id = reader.id()?;
-    let file_id = reader.id()?;
-    let blob_bytes = reader.u64()?;
-    let total_slices = reader.u32()?;
-    let slice_bytes = reader.u32()?;
-    let root_hash = reader.id()?;
-    let removal_frontier_id = reader.id()?;
-    let local_history_node_secret_id = reader.id()?;
-    let nonce = fixed_nonce(reader.bytes(XCHACHA20_POLY1305_NONCE_BYTES)?)?;
-    let ciphertext = fixed_ciphertext(reader.bytes(FILE_DESCRIPTOR_CIPHERTEXT_BYTES)?)?;
-    reader.finish()?;
+    let v = SCHEMA.parse(bytes)?;
     let event = FileEvent {
-        workspace_id,
-        created_at_ms,
-        message_id,
-        author_user_id,
-        file_id,
-        blob_bytes,
-        total_slices,
-        slice_bytes,
-        root_hash,
-        removal_frontier_id,
-        local_history_node_secret_id,
-        nonce,
-        ciphertext,
+        workspace_id: v.id("workspace_id")?,
+        created_at_ms: v.u64("created_at_ms")?,
+        message_id: v.id("message_id")?,
+        author_user_id: v.id("author_user_id")?,
+        file_id: v.id("file_id")?,
+        blob_bytes: v.u64("blob_bytes")?,
+        total_slices: v.u32("total_slices")?,
+        slice_bytes: v.u32("slice_bytes")?,
+        root_hash: v.id("root_hash")?,
+        removal_frontier_id: v.id("removal_frontier_id")?,
+        local_history_node_secret_id: v.id("local_history_node_secret_id")?,
+        nonce: fixed_nonce(v.raw("nonce")?.to_vec())?,
+        ciphertext: fixed_ciphertext(v.raw("ciphertext")?.to_vec())?,
     };
     validate(&event)?;
     Ok(event)

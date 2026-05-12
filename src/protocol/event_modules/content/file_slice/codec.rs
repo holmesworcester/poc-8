@@ -24,6 +24,7 @@ use crate::core::crypto::{
 };
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
 use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::{BuildSlice, FileSliceEvent, SignedFileSliceEnvelope, FILE_SLICE_PROOF_BYTES};
 
@@ -32,11 +33,23 @@ pub const TYPE_SIGNED_FILE_SLICE: u8 = 17;
 pub const FILE_SLICE_NONCE_PURPOSE: &[u8] = b"topo file slice nonce v1";
 pub const FILE_SLICE_ENCRYPTION_PURPOSE: &[u8] = b"topo file slice payload v1";
 
-/// Inner wire size: tag(1) + workspace(32) + ts(8) + file_id(32)
-/// + file_event_id(32) + slice#(4) + local_history_node_secret_id(32) + plaintext_len(4)
-/// + proof_len(4) + proof slot.
-pub const FILE_SLICE_WIRE_SIZE: usize =
-    1 + 32 + 8 + 32 + 32 + 4 + 32 + 4 + 4 + FILE_SLICE_PROOF_BYTES;
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "file_slice",
+    TYPE_FILE_SLICE,
+    &[
+        Field::id("workspace_id"),
+        Field::u64("created_at_ms"),
+        Field::id("file_id"),
+        Field::id("file_event_id"),
+        Field::u32("slice_number"),
+        Field::id("local_history_node_secret_id"),
+        Field::u32("plaintext_len"),
+        Field::u32("proof_len"),
+        Field::bytes("proof_slot", FILE_SLICE_PROOF_BYTES),
+    ],
+);
+
+pub const FILE_SLICE_WIRE_SIZE: usize = SCHEMA.wire_size();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileSliceMetadata {
@@ -170,56 +183,46 @@ pub fn encode(event: &FileSliceEvent, file_event_id: &EventId) -> Result<Vec<u8>
     if event.proof.len() > FILE_SLICE_PROOF_BYTES {
         return Err("file slice proof exceeds slot capacity".to_string());
     }
-    let mut out = Writer::with_capacity(FILE_SLICE_WIRE_SIZE);
-    out.u8(TYPE_FILE_SLICE);
-    out.id(&event.workspace_id);
-    out.u64(event.created_at_ms);
-    out.id(&event.file_id);
-    out.id(file_event_id);
-    out.u32(event.slice_number as usize);
-    out.id(&event.local_history_node_secret_id);
-    out.u32(event.plaintext_len as usize);
-    out.u32(event.proof.len());
-    out.raw(&event.proof);
-    out.raw(&vec![0u8; FILE_SLICE_PROOF_BYTES - event.proof.len()]);
-    Ok(out.finish())
+    let proof_len = u32::try_from(event.proof.len())
+        .map_err(|_| "file slice proof_len overflow".to_string())?;
+    let mut slot = vec![0u8; FILE_SLICE_PROOF_BYTES];
+    slot[..event.proof.len()].copy_from_slice(&event.proof);
+    Ok(SCHEMA
+        .encoder()
+        .id(&event.workspace_id)
+        .u64(event.created_at_ms)
+        .id(&event.file_id)
+        .id(file_event_id)
+        .u32(event.slice_number)
+        .id(&event.local_history_node_secret_id)
+        .u32(event.plaintext_len)
+        .u32(proof_len)
+        .bytes(&slot)
+        .finish())
 }
 
 pub fn decode(bytes: &[u8]) -> Result<(FileSliceEvent, EventId), String> {
-    let mut reader = Reader::new(bytes, "file slice event");
-    let tag = reader.u8()?;
-    if tag != TYPE_FILE_SLICE {
-        return Err("expected file slice event".to_string());
-    }
-    let workspace_id = reader.id()?;
-    let created_at_ms = reader.u64()?;
-    let file_id = reader.id()?;
-    let file_event_id = reader.id()?;
-    let slice_number = reader.u32()?;
-    let local_history_node_secret_id = reader.id()?;
-    let plaintext_len = reader.u32()?;
-    let proof_len = reader.u32()? as usize;
+    let v = SCHEMA.parse(bytes)?;
+    let proof_len = v.u32("proof_len")? as usize;
     if proof_len > FILE_SLICE_PROOF_BYTES {
         return Err("file slice declares more proof than the slot holds".to_string());
     }
-    let slot = reader.slice(FILE_SLICE_PROOF_BYTES)?;
-    reader.finish()?;
-
+    let slot = v.raw("proof_slot")?;
     let proof = slot[..proof_len].to_vec();
     if slot[proof_len..].iter().any(|byte| *byte != 0) {
         return Err("file slice slot has non-canonical padding".to_string());
     }
     Ok((
         FileSliceEvent {
-            workspace_id,
-            created_at_ms,
-            file_id,
-            slice_number,
-            local_history_node_secret_id,
-            plaintext_len,
+            workspace_id: v.id("workspace_id")?,
+            created_at_ms: v.u64("created_at_ms")?,
+            file_id: v.id("file_id")?,
+            slice_number: v.u32("slice_number")?,
+            local_history_node_secret_id: v.id("local_history_node_secret_id")?,
+            plaintext_len: v.u32("plaintext_len")?,
             proof,
         },
-        file_event_id,
+        v.id("file_event_id")?,
     ))
 }
 
