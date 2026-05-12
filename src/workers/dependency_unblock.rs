@@ -10,7 +10,7 @@
 //! Failure: transaction rollback preserves the unblock input and blocker edges.
 //! Fairness: `Work::Drain { limit }` bounds one call.
 
-use crate::core::daemon::{StepContext, Worker};
+use crate::core::daemon::{self, StepContext, Worker};
 use crate::core::store::Store;
 use crate::workers::common::event_pipeline::{self as pipeline, ApplyReadyReport};
 use crate::workers::DaemonWorkerContext;
@@ -40,14 +40,10 @@ fn daemon_step<C>(ctx: &mut StepContext<'_, C>) -> Result<(), String>
 where
     C: DaemonWorkerContext,
 {
-    let app = &*ctx.app;
-    let report = run(
-        app.store(),
-        Work::Drain {
-            limit: ctx.options.work_limit,
-        },
+    daemon::run_step(
+        ctx,
+        "unblock dependencies",
+        |app, limit| run(app.store(), Work::Drain { limit }),
+        |report, out| out.add("unblocked_events", report.unblocked_events),
     )
-    .map_err(|err| format!("unblock dependencies: {err}"))?;
-    ctx.report.add("unblocked_events", report.unblocked_events);
-    Ok(())
 }

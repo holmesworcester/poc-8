@@ -12,7 +12,7 @@
 //! later drain attempt.
 //! Fairness: `Work::Drain { limit }` bounds one call.
 
-use crate::core::daemon::{StepContext, Worker};
+use crate::core::daemon::{self, StepContext, Worker};
 use crate::core::store::Store;
 use crate::workers::common::event_pipeline::{self as pipeline, ApplyReadyReport, EventRegistry};
 use crate::workers::DaemonWorkerContext;
@@ -45,16 +45,13 @@ fn daemon_step<C>(ctx: &mut StepContext<'_, C>) -> Result<(), String>
 where
     C: DaemonWorkerContext,
 {
-    let app = &*ctx.app;
-    let report = run(
-        app.store(),
-        app,
-        Work::Drain {
-            limit: ctx.options.work_limit,
+    daemon::run_step(
+        ctx,
+        "project ready events",
+        |app, limit| run(app.store(), app, Work::Drain { limit }),
+        |report, out| {
+            out.add("ready_events", report.applied_events);
+            out.add("unblocked_events", report.unblocked_events);
         },
     )
-    .map_err(|err| format!("project ready events: {err}"))?;
-    ctx.report.add("ready_events", report.applied_events);
-    ctx.report.add("unblocked_events", report.unblocked_events);
-    Ok(())
 }

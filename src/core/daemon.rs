@@ -190,6 +190,21 @@ pub fn run<C>(
     run_after_bind(context, workers, options, |_| Ok(()))
 }
 
+/// Common daemon-step glue for workers whose step pulls `ctx.app` plus the
+/// turn's `work_limit`, calls a worker `run()`, prefixes errors with a context
+/// string, and emits one or more report counters from the success value.
+pub fn run_step<C, R>(
+    ctx: &mut StepContext<'_, C>,
+    error_context: &'static str,
+    run: impl FnOnce(&C, usize) -> Result<R, String>,
+    report: impl FnOnce(R, &mut DaemonReport),
+) -> Result<(), String> {
+    let work_limit = ctx.options.work_limit;
+    let outcome = run(ctx.app, work_limit).map_err(|err| format!("{error_context}: {err}"))?;
+    report(outcome, ctx.report);
+    Ok(())
+}
+
 pub fn run_after_bind<C>(
     context: &mut C,
     workers: &[Worker<C>],

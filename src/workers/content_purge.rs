@@ -14,8 +14,8 @@
 //! retried; projectors remain the authority on validity before normal reads.
 //! Fairness: `Work::Drain { limit }` bounds one scan.
 
-use crate::core::daemon::{StepContext, Worker};
-use crate::core::store::Store;
+use crate::core::daemon::{self, StepContext, Worker};
+use crate::core::store::{table_error, Store};
 use crate::protocol::event_modules::content::{file, file_slice, message, message_deletion, reaction};
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::types::EventId;
@@ -60,16 +60,12 @@ fn daemon_step<C>(ctx: &mut StepContext<'_, C>) -> Result<(), String>
 where
     C: DaemonWorkerContext,
 {
-    let report = run(
-        ctx.app.store(),
-        Work::Drain {
-            limit: ctx.options.work_limit,
-        },
+    daemon::run_step(
+        ctx,
+        "purge content",
+        |app, limit| run(app.store(), Work::Drain { limit }),
+        |report, out| out.add("purged_content_events", report.event_bytes_purged),
     )
-    .map_err(|err| format!("purge content: {err}"))?;
-    ctx.report
-        .add("purged_content_events", report.event_bytes_purged);
-    Ok(())
 }
 
 fn drain(store: &Store, limit: usize) -> Result<PurgeReport, String> {
@@ -307,10 +303,6 @@ fn has_author_deletion_label(
             .map(|author| author == *author_user_id)
             .unwrap_or(false)
     }))
-}
-
-fn table_error(err: String) -> rusqlite::Error {
-    rusqlite::Error::InvalidParameterName(err)
 }
 
 #[cfg(test)]

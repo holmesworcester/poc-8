@@ -15,7 +15,7 @@
 //! or semantically admitted here.
 //! Fairness: `Work::Drain { limit }` bounds queue drains.
 
-use crate::core::daemon::{StepContext, Worker};
+use crate::core::daemon::{self, StepContext, Worker};
 use crate::core::store::Store;
 use crate::workers::common::event_pipeline::{self as pipeline, EventRegistry, TransitInReport};
 use crate::workers::DaemonWorkerContext;
@@ -48,18 +48,15 @@ fn daemon_step<C>(ctx: &mut StepContext<'_, C>) -> Result<(), String>
 where
     C: DaemonWorkerContext,
 {
-    let app = &*ctx.app;
-    let report = run(
-        app.store(),
-        app,
-        Work::Drain {
-            limit: ctx.options.work_limit,
+    daemon::run_step(
+        ctx,
+        "drain transit in",
+        |app, limit| run(app.store(), app, Work::Drain { limit }),
+        |report, out| {
+            out.add("transit_frames", report.network_frames);
+            out.add("canonical_in", report.canonical_rows);
         },
     )
-    .map_err(|err| format!("drain transit in: {err}"))?;
-    ctx.report.add("transit_frames", report.network_frames);
-    ctx.report.add("canonical_in", report.canonical_rows);
-    Ok(())
 }
 
 #[cfg(test)]

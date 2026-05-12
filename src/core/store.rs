@@ -660,6 +660,13 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Wrap a `String` so it can be returned from inside a `write_transaction`
+/// closure as a `rusqlite::Error`. Callers receive it back as `String` after
+/// the closure unwinds.
+pub(crate) fn table_error(err: String) -> rusqlite::Error {
+    rusqlite::Error::InvalidParameterName(err)
+}
+
 /// Quote a trusted static table name after rejecting unsafe identifier bytes.
 fn quoted_table_name(table: TableName) -> rusqlite::Result<String> {
     let name = table.as_str();

@@ -12,7 +12,7 @@
 //! after the rejected input row is consumed.
 //! Fairness: `Work::Drain { limit }` bounds one call.
 
-use crate::core::daemon::{StepContext, Worker};
+use crate::core::daemon::{self, StepContext, Worker};
 use crate::core::store::Store;
 use crate::workers::common::event_pipeline::{self as pipeline, AdmitReport, EventRegistry};
 use crate::workers::DaemonWorkerContext;
@@ -45,19 +45,16 @@ fn daemon_step<C>(ctx: &mut StepContext<'_, C>) -> Result<(), String>
 where
     C: DaemonWorkerContext,
 {
-    let app = &*ctx.app;
-    let report = run(
-        app.store(),
-        app,
-        Work::Drain {
-            limit: ctx.options.work_limit,
+    daemon::run_step(
+        ctx,
+        "admit canonical in",
+        |app, limit| run(app.store(), app, Work::Drain { limit }),
+        |report, out| {
+            out.add("admitted_events", report.inserted_events);
+            out.add("blocked_events", report.blocked_events);
+            out.add("applied_events", report.applied_events);
         },
     )
-    .map_err(|err| format!("admit canonical in: {err}"))?;
-    ctx.report.add("admitted_events", report.inserted_events);
-    ctx.report.add("blocked_events", report.blocked_events);
-    ctx.report.add("applied_events", report.applied_events);
-    Ok(())
 }
 
 #[cfg(test)]
