@@ -29,8 +29,8 @@ use crate::protocol::event_modules::connection::{
 use crate::protocol::event_modules::identity::{endpoint, invite};
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::types::EventId;
-use crate::workers::pipeline_helpers::event_pipeline::{self as pipeline, EventRegistry};
-use crate::workers::{transit_out, DaemonWorkerContext};
+use crate::protocol::workers::pipeline_helpers::event_pipeline::{self as pipeline, EventRegistry};
+use crate::protocol::workers::{transit_out, DaemonWorkerContext};
 
 const PENDING_CONNECTION_LIMIT: usize = 64;
 const READY_BATCH: usize = 4096;

@@ -21,6 +21,7 @@ mod cli_harness;
 
 use std::io::{BufRead, BufReader};
 use std::process::Child;
+use std::thread;
 use std::time::Duration;
 
 use cli_harness::*;
@@ -59,24 +60,25 @@ fn keys_value(db: &str, workspace_id: &str) -> String {
 }
 
 #[test]
-fn cli_three_messages_in_same_minute_materialize_only_their_leaves() {
-    // Under the binary-tree FS, fresh encryption with no deletes materializes
-    // only the leaf row per event — every interior time-tree and trie node
-    // stays implicit and is derivable on demand from the workspace root.
-    // Three messages in the same minute therefore land as three leaves and
-    // zero internal rows.
+fn cli_minute_node_is_shared_across_messages_in_same_minute() {
     let tmp = tempfile::tempdir().unwrap();
     let db = temp_db(&tmp, "alice.db");
     let workspace_id = create_workspace(&db, "Minute", "alice", "alice-laptop");
     assert_success(topo(&["--db", &db, "key-frontier", &workspace_id]));
 
     // Pin the clock so all three messages land in unix_minute = 100.
+    // unix_minute_for(6_000_000) = 100; subsequent sends bump by 1 ms each.
     assert_success(topo(&["--db", &db, "clock", "set", "6000000"]));
     assert_success(topo(&["--db", &db, "send", &workspace_id, "first"]));
     assert_success(topo(&["--db", &db, "send", &workspace_id, "second"]));
     assert_success(topo(&["--db", &db, "send", &workspace_id, "third"]));
 
     let keys = keys_value(&db, &workspace_id);
+    // Under the binary-tree FS, fresh encryption with no deletes
+    // materializes only the leaf row per event — every interior time-tree
+    // and trie node stays implicit and is derivable on demand from the
+    // workspace root. Three messages in the same minute therefore land as
+    // three leaves and zero internal rows.
     assert_eq!(line_value(&keys, "local_history_minute_nodes"), "0");
     assert_eq!(line_value(&keys, "local_history_leaves"), "3");
     assert_eq!(line_value(&keys, "local_history_node_secrets"), "3");
@@ -166,12 +168,13 @@ fn cli_message_leaf_coord_is_deterministic_from_canonical_fields() {
         .expect("frontier hex token");
     let frontier_id = parse_hex(frontier_hex);
 
-    let recomputed =
-        message_event_id_in_minute(&workspace_bytes, &author_id, &frontier_id, 6_000_000);
-    assert_eq!(
-        observed_coord, recomputed,
-        "leaf coord must be deterministic"
+    let recomputed = message_event_id_in_minute(
+        &workspace_bytes,
+        &author_id,
+        &frontier_id,
+        6_000_000,
     );
+    assert_eq!(observed_coord, recomputed, "leaf coord must be deterministic");
 
     // Sanity-check the construction is BLAKE3-keyed-hash with the v1 domain.
     let mut info = Vec::with_capacity(32 + 32 + 32 + 8);
@@ -204,17 +207,13 @@ fn hex_nibble(byte: u8) -> u8 {
 }
 
 #[test]
-fn cli_delete_keeps_surviving_leaf_decryptable() {
-    // Two messages in the same minute, then delete the first. The retire
-    // walk materializes time-tree internals along the deletion path plus
-    // sibling time-internals to keep the retained tree covering everything
-    // outside the deleted leaf. Trie internals are added at the divergence
-    // depth between the two leaves' coords.
+fn cli_delete_wipes_minute_node_along_descend_path() {
     let tmp = tempfile::tempdir().unwrap();
     let db = temp_db(&tmp, "alice.db");
     let workspace_id = create_workspace(&db, "Delete", "alice", "alice-laptop");
     assert_success(topo(&["--db", &db, "key-frontier", &workspace_id]));
 
+    // Two messages in the same minute, then delete the first.
     assert_success(topo(&["--db", &db, "clock", "set", "6000000"]));
     assert_success(topo(&["--db", &db, "send", &workspace_id, "first"]));
     assert_success(topo(&["--db", &db, "send", &workspace_id, "second"]));
@@ -227,7 +226,26 @@ fn cli_delete_keeps_surviving_leaf_decryptable() {
     assert_success(topo(&["--db", &db, "delete-message", &workspace_id, "#1"]));
 
     let post = keys_value(&db, &workspace_id);
+    // Post-delete: surviving leaf stays. The puncturing retire walk wipes
+    // every node on the descend path from F root to the deleted leaf —
+    // including the minute_node — so no row at `(start=100, width=1,
+    // bit_depth=0)` exists post-retire. Only off-path SIBLINGS remain.
     assert_eq!(line_value(&post, "local_history_leaves"), "1");
+    assert_eq!(
+        line_value(&post, "local_history_minute_nodes"),
+        "0",
+        "minute_node for unix_minute=100 must be WIPED by retire (forward secrecy):\n{post}"
+    );
+    // Tombstones for the wiped path are present.
+    assert!(
+        post.lines().any(|line| line.starts_with("local_history_node_tombstones:")),
+        "post-delete keys output must list tombstone count:\n{post}"
+    );
+    assert_ne!(
+        line_value(&post, "local_history_node_tombstones"),
+        "0",
+        "retire must write tombstones:\n{post}"
+    );
 
     // The other message in the same minute still decodes.
     let listing = assert_success(topo(&["--db", &db, "messages", &workspace_id]));
@@ -387,7 +405,6 @@ fn cli_delete_file_retires_its_leaf_without_touching_message_leaf() {
 
     let pre = keys_value(&db, &workspace_id);
     assert_eq!(line_value(&pre, "local_history_leaves"), "2");
-    // Pre-delete: minute_node stays implicit.
     assert_eq!(line_value(&pre, "local_history_minute_nodes"), "0");
 
     assert_success(topo(&[
@@ -405,10 +422,13 @@ fn cli_delete_file_retires_its_leaf_without_touching_message_leaf() {
         "1",
         "file leaf must be retired, message leaf must remain:\n{post}"
     );
-    // Post-delete: the retire walk materializes the minute_node so the
-    // surviving message leaf can be reached without re-traversing the
-    // workspace root.
-    // See cli_delete_message_cascades_to_attached_file_leaf for assertion details.
+    // The puncturing retire walk wipes the minute_node along with the rest
+    // of the descend path. No `(width=1, bit_depth=0)` row remains.
+    assert_eq!(
+        line_value(&post, "local_history_minute_nodes"),
+        "0",
+        "minute_node for unix_minute=100 must be WIPED by retire (descend-path FS):\n{post}"
+    );
 
     // Message text still listed.
     let messages = assert_success(topo(&["--db", &db, "messages", &workspace_id]));
@@ -461,9 +481,13 @@ fn cli_delete_message_cascades_to_attached_file_leaf() {
         "0",
         "both message and file leaves must be retired by the cascade:\n{post}"
     );
-    // The retire walks materialize the minute_node so future sends can
-    // descend from a closer ancestor than the frontier root.
-    // Cascade keeps minute_node materialized for the same reason.
+    // Each retire wipes the minute_node along with the descend chain. The
+    // minute_node row is therefore gone after the cascade.
+    assert_eq!(
+        line_value(&post, "local_history_minute_nodes"),
+        "0",
+        "minute_node must be WIPED after cascade retire (descend-path FS):\n{post}"
+    );
 
     // Both projection rows are gone.
     let messages = assert_success(topo(&["--db", &db, "messages", &workspace_id]));
@@ -509,4 +533,361 @@ fn spawn_daemon(db: &str, port: u16) -> RunningDaemon {
 #[allow(dead_code)]
 fn small_pause() {
     std::thread::sleep(Duration::from_millis(50));
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent sibling-survives-delete scenario.
+//
+// Scenario (mirrors the two-peer helpers in `tests/content_cli_test.rs` /
+// `tests/black_box_sync_test.rs`, but the assertion under test is specific
+// to the binary-tree FS retire walk):
+//
+//   1. Alice and Bob join the same workspace.
+//   2. Both clocks are pinned so authoring lands in the same `unix_minute`,
+//      placing alice's `M_A` and bob's `M_B` as siblings under the same
+//      minute_node in the trie.
+//   3. Both daemons run, sync converges, key wraps complete.
+//   4. Alice sends `M_A`. Bob sends `M_B`. Each daemon's periodic sync
+//      delivers the other peer's leaf event so both stores hold both
+//      leaves in the same minute_node.
+//   5. Alice runs `delete-message` against `M_A`. Her retire walk
+//      materializes the minute_node and the trie internals between the
+//      siblings, then exact-deletes `M_A`'s leaf row and purges its
+//      canonical bytes. Cascade purge runs.
+//   6. Sync propagates the deletion event to Bob. Bob's admission also
+//      retires `M_A`'s leaf locally.
+//   7. Both peers list messages.
+//
+// Property under test: alice's surviving sibling `M_B` is still
+// decryptable on alice after the retire walk on the deleted sibling. The
+// retire walk must not damage the path used to derive `M_B`'s leaf
+// secret.
+#[test]
+fn cli_concurrent_peer_send_survives_sibling_delete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = temp_db(&tmp, "alice.db");
+    let bob = temp_db(&tmp, "bob.db");
+    let workspace_id = create_workspace(&alice, "Concurrent", "alice", "alice-laptop");
+    let alice_port = free_port();
+    let bob_port = free_port();
+
+    let _alice_daemon = spawn_pair_daemon(&alice, alice_port);
+    let _bob_daemon = spawn_pair_daemon(&bob, bob_port);
+    join_workspace(&alice, &bob, &workspace_id, alice_port, "bob", "bob-phone");
+    grant_content_key_to_peer(&alice, &bob, &workspace_id);
+
+    // Pin both clocks so authoring lands in the same `unix_minute`.
+    // unix_minute = 100 for both (6_000_000 / 60_000 == 100, and
+    // 6_000_500 / 60_000 == 100).
+    assert_success(topo(&["--db", &alice, "clock", "set", "6000000"]));
+    assert_success(topo(&["--db", &bob, "clock", "set", "6000500"]));
+
+    // Alice sends M_A; bob sends M_B. Both at minute 100, sibling leaves
+    // under the shared minute_node.
+    let m_a_text = "alice-says-A";
+    let m_b_text = "bob-says-B";
+    assert_success(topo(&["--db", &alice, "send", &workspace_id, m_a_text]));
+    assert_success(topo(&["--db", &bob, "send", &workspace_id, m_b_text]));
+
+    // Wait until both peers have both messages converged via daemon sync.
+    wait_for_messages_to_contain(&alice, &workspace_id, m_b_text);
+    wait_for_messages_to_contain(&bob, &workspace_id, m_a_text);
+
+    // Sanity: at this moment alice should see both messages, indicating
+    // her local store has both leaves (M_A authored locally, M_B received
+    // and decrypted). If decryption of M_B had failed, this would have
+    // panicked already.
+    let pre = assert_success(topo(&["--db", &alice, "messages", &workspace_id]));
+    assert!(pre.contains(m_a_text), "alice missing M_A pre-delete:\n{pre}");
+    assert!(pre.contains(m_b_text), "alice missing M_B pre-delete:\n{pre}");
+
+    // Alice deletes her own message M_A. The retire walk on her side
+    // materializes the minute_node + trie internals between (M_A's
+    // event_id_in_minute) and (M_B's event_id_in_minute), exact-deletes
+    // M_A's leaf row, and purges M_A's canonical bytes.
+    assert_success(topo(&[
+        "--db",
+        &alice,
+        "delete-message",
+        &workspace_id,
+        "#1",
+    ]));
+
+    // Wait for the deletion to propagate via daemon sync to bob.
+    wait_for_messages_count_at(&bob, &workspace_id, "1");
+
+    // Property assertion: alice can still see M_B. If the retire walk had
+    // damaged the path used to derive M_B's leaf secret on alice's side,
+    // this listing would either be empty or produce a decryption error.
+    let alice_post = assert_success(topo(&["--db", &alice, "messages", &workspace_id]));
+    assert_eq!(
+        line_value(&alice_post, "messages"),
+        "1",
+        "alice must see exactly one surviving message:\n{alice_post}",
+    );
+    assert!(
+        alice_post.contains(m_b_text),
+        "alice cannot see surviving sibling M_B after deleting M_A:\n{alice_post}",
+    );
+    assert!(
+        !alice_post.contains(m_a_text),
+        "alice's M_A must be retired:\n{alice_post}",
+    );
+
+    // Symmetric bob-side: bob saw the deletion via sync; M_A is gone, M_B
+    // remains.
+    let bob_post = assert_success(topo(&["--db", &bob, "messages", &workspace_id]));
+    assert_eq!(
+        line_value(&bob_post, "messages"),
+        "1",
+        "bob must see exactly one surviving message:\n{bob_post}",
+    );
+    assert!(
+        bob_post.contains(m_b_text),
+        "bob cannot see surviving sibling M_B after sync converged:\n{bob_post}",
+    );
+    assert!(
+        !bob_post.contains(m_a_text),
+        "bob's M_A must be retired by sync'd deletion:\n{bob_post}",
+    );
+
+    // Decryption-error sentinel: neither peer's listing should mention any
+    // failure-marker that the message renderer prints when AEAD opens
+    // fail. The message renderer formats failures as `(<error>)`-style
+    // bracketed strings; the cleanest assertion is that no listing line
+    // contains the literal `decrypt` token.
+    for (label, listing) in [("alice", &alice_post), ("bob", &bob_post)] {
+        for line in listing.lines() {
+            assert!(
+                !line.contains("decrypt error") && !line.contains("decryption failed"),
+                "{label} listing reports decryption failure: {line}\nfull:\n{listing}",
+            );
+        }
+    }
+}
+
+// --- two-peer helpers (local copies of the patterns in
+// `tests/black_box_sync_test.rs` and `tests/content_cli_test.rs`).
+
+fn join_workspace(
+    host: &str,
+    joiner: &str,
+    workspace_id: &str,
+    port: u16,
+    username: &str,
+    device_name: &str,
+) {
+    let invite = workspace_invite_for_addr(host, workspace_id, port);
+    let accepted = match try_accept_with_identity_retry(joiner, &invite, username, device_name) {
+        Ok(output) => output,
+        Err(err) => panic!("workspace invite accept failed: {err}"),
+    };
+    assert_eq!(line_value(&accepted, "workspace_id"), workspace_id);
+    wait_for_local_workspace_join(joiner, workspace_id, username);
+    wait_for_users_contains(host, workspace_id, username);
+}
+
+fn workspace_invite_for_addr(db: &str, workspace_id: &str, port: u16) -> String {
+    let addr = format!("127.0.0.1:{port}");
+    let out = assert_success(topo(&[
+        "--db",
+        db,
+        "invite",
+        "--workspace",
+        workspace_id,
+        "--public-addr",
+        &addr,
+    ]));
+    invite_link_from_output(&out)
+}
+
+fn invite_link_from_output(output: &str) -> String {
+    output
+        .lines()
+        .find(|line| line.starts_with("topo://invite/"))
+        .unwrap_or_else(|| panic!("missing invite link in output:\n{output}"))
+        .to_string()
+}
+
+fn wait_for_local_workspace_join(db: &str, workspace_id: &str, username: &str) {
+    let mut last = String::new();
+    for _ in 0..300 {
+        let recipient = topo(&["--db", db, "key-recipient", workspace_id]);
+        let users = topo(&["--db", db, "users", workspace_id]);
+        if recipient.status.success() && users.status.success() {
+            let users = stdout(&users);
+            if users.contains(username) {
+                return;
+            }
+            last = users;
+        } else {
+            last = format!(
+                "key-recipient stderr:\n{}\nusers stderr:\n{}",
+                stderr(&recipient),
+                stderr(&users)
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("workspace join never projected for {username}: {last}");
+}
+
+fn wait_for_users_contains(db: &str, workspace_id: &str, username: &str) {
+    let mut last = String::new();
+    for _ in 0..300 {
+        let users = topo(&["--db", db, "users", workspace_id]);
+        if users.status.success() {
+            let users = stdout(&users);
+            if users.contains(username) {
+                return;
+            }
+            last = users;
+        } else {
+            last = stderr(&users);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("user {username} never appeared in {db}: {last}");
+}
+
+fn try_accept_with_identity_retry(
+    db: &str,
+    invite: &str,
+    username: &str,
+    device_name: &str,
+) -> Result<String, String> {
+    let mut last = String::new();
+    for _ in 0..200 {
+        let output = topo(&[
+            "--db",
+            db,
+            "accept",
+            invite,
+            "--username",
+            username,
+            "--devicename",
+            device_name,
+        ]);
+        if output.status.success() {
+            return Ok(stdout(&output));
+        }
+        last = stderr(&output);
+        if !last.contains("open tcp stream") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(last)
+}
+
+fn spawn_pair_daemon(db: &str, port: u16) -> RunningDaemon {
+    // Same shape as `spawn_daemon` above but uses `--sync-ms` so periodic
+    // outbound sync runs at the same cadence as content_cli tests.
+    let port = port.to_string();
+    let mut child = spawn_topo(&[
+        "--db",
+        db,
+        "start",
+        "--listen",
+        "127.0.0.1",
+        &port,
+        "--sync-ms",
+        "100",
+        "--quiet-ms",
+        "100",
+    ]);
+    let stdout = child.stdout.take().expect("daemon stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut first = String::new();
+    reader.read_line(&mut first).expect("daemon first line");
+    assert!(
+        first.starts_with("listening: "),
+        "daemon did not report listening: {first}"
+    );
+    RunningDaemon { child }
+}
+
+fn grant_content_key_to_peer(alice: &str, peer: &str, workspace_id: &str) {
+    let recipient = assert_success(topo(&["--db", peer, "key-recipient", workspace_id]));
+    let recipient_key_id = line_value(&recipient, "recipient_key_id");
+    let frontier = assert_success(topo(&["--db", alice, "key-frontier", workspace_id]));
+    let removal_frontier_id = line_value(&frontier, "removal_frontier_id");
+    let wrapped = key_wrap_with_retry(alice, workspace_id, &removal_frontier_id, &recipient_key_id);
+    assert_eq!(line_value(&wrapped, "recipient_key_id"), recipient_key_id);
+    wait_for_key_access(peer, workspace_id, &removal_frontier_id, "yes");
+}
+
+fn wait_for_key_access(
+    db: &str,
+    workspace_id: &str,
+    removal_frontier_id: &str,
+    expected: &str,
+) -> String {
+    let mut last = String::new();
+    for _ in 0..300 {
+        let output = topo(&["--db", db, "key-access", workspace_id, removal_frontier_id]);
+        if output.status.success() {
+            let out = stdout(&output);
+            if line_value(&out, "access") == expected {
+                return out;
+            }
+            last = out;
+        } else {
+            last = stderr(&output);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("key access did not reach {expected}: {last}");
+}
+
+fn key_wrap_with_retry(
+    db: &str,
+    workspace_id: &str,
+    removal_frontier_id: &str,
+    recipient_key_id: &str,
+) -> String {
+    let mut last = String::new();
+    for _ in 0..300 {
+        let output = topo(&[
+            "--db",
+            db,
+            "key-wrap",
+            workspace_id,
+            removal_frontier_id,
+            recipient_key_id,
+        ]);
+        if output.status.success() {
+            return stdout(&output);
+        }
+        last = stderr(&output);
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("key-wrap never succeeded: {last}");
+}
+
+
+fn wait_for_messages_to_contain(db: &str, workspace_id: &str, expected: &str) {
+    let mut last = String::new();
+    for _ in 0..300 {
+        let out = assert_success(topo(&["--db", db, "messages", workspace_id]));
+        if out.contains(expected) {
+            return;
+        }
+        last = out;
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("messages in {db} never contained `{expected}`; last output:\n{last}");
+}
+
+fn wait_for_messages_count_at(db: &str, workspace_id: &str, expected: &str) {
+    let mut last = String::new();
+    for _ in 0..300 {
+        let out = assert_success(topo(&["--db", db, "messages", workspace_id]));
+        if line_value(&out, "messages") == expected {
+            return;
+        }
+        last = out;
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("messages count in {db} did not reach {expected}; last:\n{last}");
 }

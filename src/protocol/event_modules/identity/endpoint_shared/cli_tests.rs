@@ -28,6 +28,7 @@ fn admits_received_device_invite_then_signed_endpoint_shared_join() {
     let workspace = workspace::commands::create(workspace::commands::CreateWorkspace {
         created_at_ms: 1,
         public_key: crypto::ed25519_public_key(&workspace_private_key),
+        disappearing_ttl_minutes: 0,
         name: "Workspace".to_string(),
     })
     .expect("create workspace");

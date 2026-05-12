@@ -60,8 +60,8 @@ fn production_text_before_unit_tests(text: &str) -> &str {
 }
 
 fn worker_implementation_files(root: &Path) -> Vec<std::path::PathBuf> {
-    let common_root = root.join("src/workers/pipeline_helpers");
-    rust_files(&root.join("src/workers"))
+    let common_root = root.join("src/protocol/workers/pipeline_helpers");
+    rust_files(&root.join("src/protocol/workers"))
         .into_iter()
         .filter(|path| {
             path.file_name()
@@ -245,7 +245,7 @@ fn daemon_runner_is_core_and_protocol_supplies_workers() {
         "core daemon should run opaque worker objects without naming protocol workers"
     );
 
-    let workers = source_text(&root.join("src/workers/mod.rs"));
+    let workers = source_text(&root.join("src/protocol/workers/mod.rs"));
     assert!(
         workers.contains("pub fn daemon_workers")
             && workers.contains("transit_in::daemon_worker")
@@ -630,7 +630,7 @@ fn worker_implementations_live_in_workers_folder() {
 
     assert!(
         offenders.is_empty(),
-        "worker implementations live under src/workers; event modules may re-export them but must not own worker.rs files:\n{}",
+        "worker implementations live under src/protocol/workers; event modules may re-export them but must not own worker.rs files:\n{}",
         offenders.join("\n")
     );
 }
@@ -638,7 +638,7 @@ fn worker_implementations_live_in_workers_folder() {
 #[test]
 fn workers_folder_has_standard_catalog_shape() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workers_root = root.join("src/workers");
+    let workers_root = root.join("src/protocol/workers");
     let required = [
         "mod.rs",
         "README.md",
@@ -664,7 +664,7 @@ fn workers_folder_has_standard_catalog_shape() {
 
     assert!(
         missing.is_empty(),
-        "src/workers is the worker catalog and must contain the contract plus current worker implementations:\n{}",
+        "src/protocol/workers is the worker catalog and must contain the contract plus current worker implementations:\n{}",
         missing.join("\n")
     );
 }
@@ -673,15 +673,15 @@ fn workers_folder_has_standard_catalog_shape() {
 fn socket_receive_is_transit_in_and_outbound_is_transit_out() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        !root.join("src/workers/connection_io.rs").exists(),
+        !root.join("src/protocol/workers/connection_io.rs").exists(),
         "transit mechanics should live behind transit_in and transit_out"
     );
     assert!(
-        root.join("src/workers/connection.rs").exists(),
+        root.join("src/protocol/workers/connection.rs").exists(),
         "connection policy should live in the connection worker, with facts in event modules/projectors and bytes in transit workers"
     );
 
-    let catalog = source_text(&root.join("src/workers/mod.rs"));
+    let catalog = source_text(&root.join("src/protocol/workers/mod.rs"));
     assert!(
         catalog.contains("transit_in::daemon_worker()")
             && catalog.contains("event_admission::daemon_worker()")
@@ -981,6 +981,7 @@ fn functional_cli_and_network_tests_use_black_box_setup() {
         "tests/encryption_cli_test.rs",
         "tests/generate_cli_test.rs",
         "tests/invite_accept_cli_test.rs",
+        "tests/view_cli_test.rs",
     ];
     let forbidden = [
         "use topo::core::",
@@ -1094,7 +1095,7 @@ fn core_does_not_own_protocol_worker_or_wire_codec() {
         .collect::<Vec<_>>();
     assert!(
         offenders.is_empty(),
-        "core maintains queues/storage only; worker implementations live under src/workers and wire codec helpers live under src/protocol:\n{}",
+        "core maintains queues/storage only; worker implementations live under src/protocol/workers and wire codec helpers live under src/protocol:\n{}",
         offenders.join("\n")
     );
 }
@@ -1102,7 +1103,7 @@ fn core_does_not_own_protocol_worker_or_wire_codec() {
 #[test]
 fn common_event_pipeline_has_no_domain_branching_vocabulary() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let files = [root.join("src/workers/pipeline_helpers/event_pipeline.rs")];
+    let files = [root.join("src/protocol/workers/pipeline_helpers/event_pipeline.rs")];
     let forbidden = [
         "connection",
         "sync",
@@ -1115,7 +1116,7 @@ fn common_event_pipeline_has_no_domain_branching_vocabulary() {
     let violations = file_contains_violations(root, &files, &forbidden);
     assert!(
         violations.is_empty(),
-        "src/workers/pipeline_helpers/event_pipeline.rs owns common admission/apply, but concrete branching belongs in event_modules::Modules or domain workers:\n{}",
+        "src/protocol/workers/pipeline_helpers/event_pipeline.rs owns common admission/apply, but concrete branching belongs in event_modules::Modules or domain workers:\n{}",
         violations.join("\n")
     );
 }
@@ -1352,7 +1353,7 @@ fn event_store_lifecycle_is_worker_owned_not_schema_owned() {
     }
 
     let event_lifecycle =
-        source_text(&root.join("src/workers/pipeline_helpers/event_lifecycle.rs"));
+        source_text(&root.join("src/protocol/workers/pipeline_helpers/event_lifecycle.rs"));
     for required in [
         "pub(crate) fn insert_event(",
         "pub(crate) fn set_event_status(",
@@ -1375,7 +1376,7 @@ fn local_retention_purge_is_worker_owned_not_schema_owned() {
         "protocol/event_modules/schema.rs declares event-store rows and codecs; local retention purge belongs in workers"
     );
 
-    let purging = source_text(&root.join("src/workers/pipeline_helpers/purging.rs"));
+    let purging = source_text(&root.join("src/protocol/workers/pipeline_helpers/purging.rs"));
     assert!(
         purging.contains("fn purge_event_storage_in_tx")
             && purging.contains("local retention cleanup only")
@@ -1450,7 +1451,7 @@ fn sync_event_module_does_not_own_transport_or_frame_io() {
 #[test]
 fn sync_worker_drains_projected_rows_not_direct_ingest_work() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let worker = source_text(&root.join("src/workers/sync.rs"));
+    let worker = source_text(&root.join("src/protocol/workers/sync.rs"));
     assert!(
         worker.contains("DrainIn"),
         "sync worker should drain projected sync in rows"
@@ -1492,7 +1493,7 @@ fn sync_canonical_bytes_do_not_encode_inbound_or_outbound_direction() {
 #[test]
 fn transit_out_is_id_only_and_transit_batches_inner_events() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let schema = source_text(&root.join("src/workers/schema.rs"));
+    let schema = source_text(&root.join("src/protocol/workers/schema.rs"));
     assert!(
         schema.contains("pub fn transit_out_row(")
             && schema.contains("Schema::memory_row_table(\"transit.out.v1\", TRANSIT_OUT)")
@@ -1896,11 +1897,11 @@ fn new_poc8_modules_document_responsibility_boundaries() {
         root.join("src/core/logical_clock.rs"),
         root.join("src/protocol/event_modules/content/cli.rs"),
         root.join("src/protocol/event_modules/identity/cli.rs"),
-        root.join("src/workers/connection.rs"),
-        root.join("src/workers/transit_out.rs"),
-        root.join("src/workers/pipeline_helpers/mod.rs"),
-        root.join("src/workers/content_purge.rs"),
-        root.join("src/workers/encryption.rs"),
+        root.join("src/protocol/workers/connection.rs"),
+        root.join("src/protocol/workers/transit_out.rs"),
+        root.join("src/protocol/workers/pipeline_helpers/mod.rs"),
+        root.join("src/protocol/workers/content_purge.rs"),
+        root.join("src/protocol/workers/encryption.rs"),
         root.join("tests/content_cli_test.rs"),
         root.join("tests/encryption_cli_test.rs"),
         root.join("tests/invite_accept_cli_test.rs"),
@@ -2076,7 +2077,7 @@ fn event_records_are_constructed_only_by_codecs() {
 #[test]
 fn command_output_contains_events_not_state_changes() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let text = std::fs::read_to_string(root.join("src/workers/pipeline_helpers/event_pipeline.rs"))
+    let text = std::fs::read_to_string(root.join("src/protocol/workers/pipeline_helpers/event_pipeline.rs"))
         .expect("read worker");
     let start = text
         .find("pub struct CommandOutput")
@@ -2091,7 +2092,7 @@ fn command_output_contains_events_not_state_changes() {
 #[test]
 fn proposed_event_carries_deterministic_id_and_record() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let text = std::fs::read_to_string(root.join("src/workers/pipeline_helpers/event_pipeline.rs"))
+    let text = std::fs::read_to_string(root.join("src/protocol/workers/pipeline_helpers/event_pipeline.rs"))
         .expect("read worker");
     let start = text
         .find("pub struct ProposedEvent")
@@ -2113,7 +2114,7 @@ fn proposed_event_carries_deterministic_id_and_record() {
 #[test]
 fn projection_output_contains_rows_deletes_and_labels_not_events() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let text = std::fs::read_to_string(root.join("src/workers/pipeline_helpers/event_pipeline.rs"))
+    let text = std::fs::read_to_string(root.join("src/protocol/workers/pipeline_helpers/event_pipeline.rs"))
         .expect("read worker");
     let start = text
         .find("pub struct ProjectionOutput")
@@ -2151,7 +2152,7 @@ fn core_files_do_not_contain_sync_protocol_logic() {
         "src/core/store.rs",
         "src/core/network_queues.rs",
         "src/core/tcp.rs",
-        "src/workers/pipeline_helpers/event_pipeline.rs",
+        "src/protocol/workers/pipeline_helpers/event_pipeline.rs",
     ];
     let forbidden = ["negentropy", "Compare", "Have", "Need", "differing_buckets"];
     let mut violations = Vec::new();

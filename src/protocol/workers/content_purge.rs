@@ -25,10 +25,10 @@ use crate::protocol::event_modules::content::{
 };
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::types::EventId;
-use crate::workers::encryption as encryption_worker;
-use crate::workers::pipeline_helpers::event_pipeline::EventRegistry;
-use crate::workers::pipeline_helpers::purging;
-use crate::workers::DaemonWorkerContext;
+use crate::protocol::workers::encryption as encryption_worker;
+use crate::protocol::workers::pipeline_helpers::event_pipeline::EventRegistry;
+use crate::protocol::workers::pipeline_helpers::purging;
+use crate::protocol::workers::DaemonWorkerContext;
 
 use message_deletion::schema as message_deletion_schema;
 
@@ -205,6 +205,7 @@ fn purge_deleted_message(
             event.workspace_id,
             message_id,
             event.author_user_id,
+            event.created_at_ms / message::types::UNIX_MINUTE_MS,
         )])
         .map_err(|err| format!("write message tombstone: {err}"))?;
     report.tombstones_written += inserted;
@@ -428,7 +429,7 @@ mod tests {
     use crate::protocol::event_modules::schema::EventLabel;
     use crate::protocol::event_modules::types::{event_id, EventStatus};
     use crate::protocol::Protocol;
-    use crate::workers::pipeline_helpers::event_lifecycle;
+    use crate::protocol::workers::pipeline_helpers::event_lifecycle;
 
     use super::*;
 
@@ -450,6 +451,8 @@ mod tests {
             removal_frontier_id: FRONTIER,
             local_history_node_secret_id: LEAF_NODE_ID,
             leaf_node_secret: KEY_SECRET,
+            expires_at_minute: u64::MAX,
+            disappearing_setting_id: [1; 32],
             text: text.to_string(),
         })
         .expect("message");

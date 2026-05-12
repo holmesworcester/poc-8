@@ -75,6 +75,9 @@ pub fn message_event_id_in_minute(
     crypto::blake3_keyed_hash(workspace_id, MESSAGE_LEAF_COORD_DOMAIN, &info_bytes)
 }
 
+/// Sentinel for "no expiry" in `MessageEvent::expires_at_minute`.
+pub const EXPIRES_NEVER: u64 = u64::MAX;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageEvent {
     pub workspace_id: EventId,
@@ -82,6 +85,22 @@ pub struct MessageEvent {
     pub author_user_id: EventId,
     pub removal_frontier_id: EventId,
     pub local_history_node_secret_id: EventId,
+    /// Authoring-time expiry. The canonical bytes commit to this value so a
+    /// late-arriving workspace setting cannot retroactively change a
+    /// message's expiry; `EXPIRES_NEVER` means no expiry. The projector
+    /// consults this field to reject expired-at-receive messages and to
+    /// drive the disappearing-minute worker; admission stays generic.
+    pub expires_at_minute: u64,
+    /// Reference to the disappearing-messages policy under which this
+    /// message was authored — either a signed
+    /// `disappearing_messages_setting` event id or the `workspace_id`
+    /// itself when no setting has been admitted yet (the workspace event
+    /// carries the slice-1 fallback `disappearing_ttl_minutes`). Added to
+    /// the message's dependencies so the projector validates the stamped
+    /// `expires_at_minute` against the policy the author claims to have
+    /// honored. See `disappearing_messages_plan.md` §6 for the trust
+    /// model and the latest-setting gap.
+    pub disappearing_setting_id: EventId,
     pub nonce: XChaCha20Poly1305Nonce,
     pub ciphertext: MessageCiphertext,
 }

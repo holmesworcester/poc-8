@@ -3,8 +3,16 @@
 //! The workspace format is fixed-width:
 //!
 //! ```text
-//! type(1) || created_at_ms(8) || public_key(32) || name_utf8_zero_padded(64)
+//! type(1) || created_at_ms(8) || public_key(32) || disappearing_ttl_minutes(4)
+//!   || name_utf8_zero_padded(64)
 //! ```
+//!
+//! `disappearing_ttl_minutes` is the workspace-wide TTL stamped onto every
+//! authored content event. `0` means disappearing messages are disabled
+//! for the workspace; non-zero values fix expiry at authoring time. The
+//! field is in the canonical bytes so the workspace id commits to the
+//! TTL choice; slice 2 will introduce admin-signed setting events that
+//! supersede the initial value at projection time.
 //!
 //! The event id of these canonical bytes is the workspace id.
 
@@ -14,7 +22,7 @@ use crate::protocol::wire::{Reader, Writer};
 use super::types::{WorkspaceEvent, WORKSPACE_NAME_BYTES};
 
 pub const TYPE_WORKSPACE: u8 = 131;
-pub const WORKSPACE_WIRE_SIZE: usize = 1 + 8 + 32 + WORKSPACE_NAME_BYTES;
+pub const WORKSPACE_WIRE_SIZE: usize = 1 + 8 + 32 + 4 + WORKSPACE_NAME_BYTES;
 
 pub fn encode(event: &WorkspaceEvent) -> Result<Vec<u8>, String> {
     let name = encode_name(&event.name)?;
@@ -22,6 +30,7 @@ pub fn encode(event: &WorkspaceEvent) -> Result<Vec<u8>, String> {
     out.u8(TYPE_WORKSPACE);
     out.u64(event.created_at_ms);
     out.id(&event.public_key);
+    out.u32(event.disappearing_ttl_minutes as usize);
     out.raw(&name);
     Ok(out.finish())
 }
@@ -34,11 +43,13 @@ pub fn decode(bytes: &[u8]) -> Result<WorkspaceEvent, String> {
     }
     let created_at_ms = reader.u64()?;
     let public_key = reader.id()?;
+    let disappearing_ttl_minutes = reader.u32()?;
     let name = decode_name(reader.slice(WORKSPACE_NAME_BYTES)?)?;
     reader.finish()?;
     Ok(WorkspaceEvent {
         created_at_ms,
         public_key,
+        disappearing_ttl_minutes,
         name,
     })
 }
@@ -91,6 +102,7 @@ mod tests {
         WorkspaceEvent {
             created_at_ms: 42,
             public_key: [7; 32],
+            disappearing_ttl_minutes: 0,
             name: "Engineering".to_string(),
         }
     }
@@ -112,9 +124,22 @@ mod tests {
     #[test]
     fn rejects_non_canonical_name_padding() {
         let mut encoded = encode(&event()).expect("encode workspace");
-        let name_start = 1 + 8 + 32;
+        let name_start = 1 + 8 + 32 + 4;
         encoded[name_start + "Engineering".len() + 1] = b'x';
         assert!(decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn carries_disappearing_ttl_minutes() {
+        let event = WorkspaceEvent {
+            created_at_ms: 42,
+            public_key: [7; 32],
+            disappearing_ttl_minutes: 5,
+            name: "Ops".to_string(),
+        };
+        let encoded = encode(&event).expect("encode workspace");
+        let decoded = decode(&encoded).expect("decode workspace");
+        assert_eq!(decoded.disappearing_ttl_minutes, 5);
     }
 
     #[test]

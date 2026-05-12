@@ -324,6 +324,7 @@ mod tests {
                 ],
                 labels: Vec::new(),
                 receive: None,
+                now_unix_minute: None,
             },
         })
         .expect("project response");
@@ -368,6 +369,7 @@ mod tests {
                     fixture.responder_endpoint,
                     true,
                 )),
+                now_unix_minute: None,
             },
         })
         .expect("project response");
@@ -409,6 +411,7 @@ mod tests {
                         fixture.responder_endpoint,
                         true,
                     )),
+                    now_unix_minute: None,
                 },
             })
             .expect_err("unauthorized response receive must fail"),
@@ -446,6 +449,7 @@ mod tests {
                         [99; 32],
                         true,
                     )),
+                    now_unix_minute: None,
                 },
             })
             .expect_err("wrong receive sender must fail"),

@@ -15,6 +15,7 @@ use super::types::{WorkspaceEvent, WorkspacePublicKey};
 pub struct CreateWorkspace {
     pub created_at_ms: u64,
     pub public_key: WorkspacePublicKey,
+    pub disappearing_ttl_minutes: u32,
     pub name: String,
 }
 
@@ -27,6 +28,7 @@ pub fn create(input: CreateWorkspace) -> Result<CommandOutput<CreateWorkspaceOut
     let event = WorkspaceEvent {
         created_at_ms: input.created_at_ms,
         public_key: input.public_key,
+        disappearing_ttl_minutes: input.disappearing_ttl_minutes,
         name: input.name,
     };
     let bytes = codec::encode(&event)?;
@@ -51,6 +53,7 @@ mod tests {
         let output = create(CreateWorkspace {
             created_at_ms: 77,
             public_key: [5; 32],
+            disappearing_ttl_minutes: 0,
             name: "Design".to_string(),
         })
         .expect("create workspace");
@@ -75,6 +78,7 @@ mod tests {
         let err = create(CreateWorkspace {
             created_at_ms: 77,
             public_key: [5; 32],
+            disappearing_ttl_minutes: 0,
             name: "bad\0name".to_string(),
         })
         .expect_err("reject NUL name");

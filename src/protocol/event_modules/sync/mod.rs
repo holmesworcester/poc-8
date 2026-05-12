@@ -8,15 +8,16 @@
 //! context. The worker owns queue draining and the process-local sync index.
 //!
 //! This module owns sync event syntax, projection, and command logic.
-//! `crate::workers::sync` owns scheduling, queue consumption, and worker state.
+//! `crate::protocol::workers::sync` owns scheduling, queue consumption, and worker state.
 
 pub mod cli;
 pub mod commands;
 pub mod compare;
 pub mod have_id;
 pub mod need_id;
-pub use crate::workers::sync as worker;
-pub use crate::workers::sync::SyncIndex;
+pub mod schema;
+pub use crate::protocol::workers::sync as worker;
+pub use crate::protocol::workers::sync::SyncIndex;
 
 use crate::protocol::event_modules::connection;
 use crate::protocol::event_modules::types::EventRecord;

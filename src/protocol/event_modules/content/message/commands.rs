@@ -24,6 +24,16 @@ pub struct SendMessage {
     pub removal_frontier_id: EventId,
     pub local_history_node_secret_id: EventId,
     pub leaf_node_secret: XChaCha20Poly1305Key,
+    /// Authoring-time expiry stamped into the canonical bytes.
+    /// `super::types::EXPIRES_NEVER` (i.e. `u64::MAX`) means no expiry.
+    pub expires_at_minute: u64,
+    /// Reference to the disappearing-messages policy under which this
+    /// message is being authored. Either a signed
+    /// `disappearing_messages_setting` event id (when one has been
+    /// admitted) or the workspace event id (slice-1 fallback). Becomes a
+    /// dependency of the resulting message; the projector validates that
+    /// `expires_at_minute` is consistent with the referenced policy.
+    pub disappearing_setting_id: EventId,
     pub text: String,
 }
 
@@ -47,6 +57,8 @@ pub fn send(input: SendMessage) -> Result<CommandOutput<SendMessageOutput>, Stri
         author_user_id: input.author_user_id,
         removal_frontier_id: input.removal_frontier_id,
         local_history_node_secret_id: input.local_history_node_secret_id,
+        expires_at_minute: input.expires_at_minute,
+        disappearing_setting_id: input.disappearing_setting_id,
         nonce: crypto::random_xchacha20poly1305_nonce(),
         ciphertext: [0; super::types::MESSAGE_CIPHERTEXT_BYTES],
     };
@@ -93,6 +105,8 @@ mod tests {
             removal_frontier_id: [4; 32],
             local_history_node_secret_id: [5; 32],
             leaf_node_secret: [6; 32],
+            expires_at_minute: super::super::types::EXPIRES_NEVER,
+            disappearing_setting_id: [1; 32],
             text: "private message".to_string(),
         })
         .expect("send");
@@ -137,6 +151,8 @@ mod tests {
             removal_frontier_id: [4; 32],
             local_history_node_secret_id: [5; 32],
             leaf_node_secret: [6; 32],
+            expires_at_minute: super::super::types::EXPIRES_NEVER,
+            disappearing_setting_id: [1; 32],
             text: "hello".to_string(),
         };
         // The two outputs will not be byte-identical because each draws a

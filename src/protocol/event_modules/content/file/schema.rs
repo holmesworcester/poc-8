@@ -13,11 +13,28 @@
 use std::collections::BTreeMap;
 
 use crate::core::store::{Schema, Store, TableName, TableRow};
+use crate::protocol::event_modules::content::message;
 use crate::protocol::event_modules::types::EventId;
+use crate::protocol::event_modules::worker::AdmitDecision;
 use crate::protocol::wire::{Reader, Writer};
 
+use super::codec;
 use super::types::{FileEvent, SealedFileRow, FILE_DESCRIPTOR_CIPHERTEXT_BYTES};
 use crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES;
+
+/// Receive-side admission gate for signed file descriptors.
+///
+/// Drops the file event if its parent message is already tombstoned.
+/// Mirrors the cascade predicate the content_purge worker uses for files
+/// when the parent message is later tombstoned.
+pub fn admit_check_received(store: &Store, bytes: &[u8]) -> Result<AdmitDecision, String> {
+    let envelope = codec::decode_signed(bytes)?;
+    let file = codec::decode(&envelope.payload)?;
+    if message::schema::message_tombstone_exists(store, file.workspace_id, file.message_id)? {
+        return Ok(AdmitDecision::Drop);
+    }
+    Ok(AdmitDecision::Admit)
+}
 
 pub const FILES: TableName = TableName::new("content.files");
 pub const FILES_BY_MESSAGE: TableName = TableName::new("content.files_by_message");

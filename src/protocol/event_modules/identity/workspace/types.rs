@@ -14,6 +14,7 @@ pub type WorkspacePublicKey = [u8; 32];
 pub struct WorkspaceEvent {
     pub created_at_ms: u64,
     pub public_key: WorkspacePublicKey,
+    pub disappearing_ttl_minutes: u32,
     pub name: String,
 }
 
@@ -22,5 +23,6 @@ pub struct WorkspaceRow {
     pub workspace_id: WorkspaceId,
     pub created_at_ms: u64,
     pub public_key: WorkspacePublicKey,
+    pub disappearing_ttl_minutes: u32,
     pub name: String,
 }

@@ -61,6 +61,650 @@ union. **The current implementation diverges from that spec**: see the
 "Acknowledged divergence from the plan" section below. This design assumes
 the corrected primitives and surfaces the gap explicitly.
 
+## Implementation Note (Supersedes Sections 1–5)
+
+The slices that shipped on the `task-disappearing-messages` branch do **not**
+introduce an `expired_minute` event, do **not** tombstone whole minutes, and
+do **not** sync any expiry-related fact between peers. The earlier sections
+(1–5) describe an `expired_minute`-event-based design that was abandoned;
+this note records what actually got built and why.
+
+### What ships
+
+  * **Per-message stamping (slices 1 + 3).** Each `MessageEvent` commits in
+    canonical bytes to its own `expires_at_minute: u64` and a
+    `disappearing_setting_id: EventId` — the policy under which it was
+    authored, either a signed `disappearing_messages_setting` or the
+    workspace event id (slice-1 fallback). The projector validates the
+    stamped expiry against the referenced policy.
+  * **Per-peer clock-driven retirement (slice 1).** The
+    `disappearing_minute_expiry` daemon-step worker scans `sealed_messages`
+    every tick. For each row whose `expires_at_minute < now_unix_minute`,
+    it deletes the read-model + sealed rows, writes a
+    `MESSAGE_TOMBSTONES` row (which triggers the existing `content_purge`
+    cascade for reactions/files), purges the message's canonical bytes,
+    and calls `RetireDeletedEventLeaf` for the message's per-event leaf.
+  * **Re-arrival rejection.** The message projector reads
+    `now_unix_minute` from `EventContext` and tombstones expired-at-receive
+    messages with a deletion label so re-arrivals can't resurrect them.
+  * **Cascade through `content_purge` (slice 4).** Reactions, files, and
+    file_slices are reclaimed in the same daemon tick via `content_purge`
+    by gating on the parent message's tombstone. Reaction leaves are
+    additionally retired by the disappearing-minute worker
+    (parent-driven).
+
+### What does *not* ship (deliberate simplifications)
+
+  * **No `expired_minute` event.** Convergence is provided by canonical-bytes
+    equality of the original messages: every peer admits the same bytes,
+    derives the same `expires_at_minute`, and reaches the same retirement
+    decision when its own clock crosses the boundary. There is no shared
+    "expiry fact" event to converge on.
+  * **No whole-minute tombstone — and not as a future optimization
+    either.** The encryption-worker TODO at
+    `src/workers/encryption.rs:1147` describes a `RetireExpiredMinute`
+    primitive that would consolidate retirement to one tombstone per
+    minute instead of one per leaf. **This optimization is permanently
+    off the table for mutable-TTL disappearing messages**, because
+    whole-minute retirement breaks eventual consistency in two ways:
+
+      1. *Same minute, different TTLs.* A setting change mid-minute
+         leaves message X (TTL=1h) and message Y (TTL=24h) both in
+         minute M with different stamped expiries. When the clock
+         crosses M+1h, whole-minute retire would wipe Y along with X
+         even though Y still has 23h to live.
+      2. *Late-arriving messages in a "retired" minute.* Peer A's
+         clock crosses M+TTL and whole-minute retires M. Peer B
+         delivers a message Y authored in M with a longer effective
+         TTL (or under a setting peer A hasn't seen yet). Peer A
+         cannot decrypt Y — the minute_node is gone — and silently
+         drops it. Peer C (clock not yet crossed) admits Y normally.
+         Permanent divergence on Y's existence.
+
+    Per-leaf retirement avoids both: the minute_node is wiped on the
+    descend path of *one* leaf at a time, and surviving siblings in
+    the same minute remain reachable via the trie cover materialized
+    by that walk. We pay per-leaf cost for the consistency.
+  * **No deletion-summary commitment** (the abandoned slice-3
+    `Hset(deleted_set, retained_cover, expired_minute_set)`). Convergence
+    on the cover summary already implies agreement on retained state, and
+    the deletion *path* is implied by canonical-bytes equality of the
+    original messages.
+
+### Mutable-TTL ⇒ dirty-tree consequence
+
+Per-message stamping monotonically fixes each message's expiry at
+authoring; the admin can still flip-flop the policy ("strict" 1 minute
+→ "less strict" 5 minutes → strict again) without retroactively
+changing already-authored messages' stamps. That gives us monotonicity
+*per message*, but loses the property that "all leaves in minute M
+retire together at minute M+TTL" — different leaves in a minute can
+retire at different boundaries. The FS tree therefore accumulates
+per-leaf tombstones over time; pruning that debris requires either:
+
+  1. A future fixed-TTL workspace mode (immutable disappearing setting
+     baked into workspace creation), enabling whole-minute retirement.
+  2. A periodic key rotation (new `removal_frontier`) that starts a
+     fresh subtree, leaving the old debris tombstoned in a frontier
+     nobody authors under anymore.
+
+### Why keep the time axis at all (under mutable TTL)
+
+The 2-axis tree (time tree + within-minute trie) is preserved despite
+not exploiting whole-minute retirement under mutable TTLs. The
+**actual** reason is per-retirement cover-cost reduction, which I had
+wrong in an earlier draft. Walking through it:
+
+The retire walk wipes the **F root** in addition to the descend path
+(see `after_retire_authoring_under_wiped_frontier_errors`). Once F is
+wiped, no future event under F can derive *anything* — F is dead.
+That means the FS guarantee for the retired leaf doesn't depend on
+covering unknown future events; it depends on the trunk being gone.
+
+Therefore the retire walk only needs to materialize coverage at
+**actually-existing tree levels** (the path from F root through to the
+leaf), not at every possible bit depth from 0 to 256. The cost is
+**constant per retirement**, set by the **tree's structural depth**:
+
+  * **Time tree**: depth ≤ log₂(`TIME_TREE_ROOT_WIDTH`) ≈ 57. The
+    walk materializes both descend and sibling at each level
+    (skipping the width-1 sibling). All ~57 sibling internals are
+    retained; all ~57 descend internals are wiped + tombstoned.
+  * **Within-minute trie**: depth = log₂(messages_per_minute). For
+    typical chat workloads this is ≤ 7. Sibling internals at each
+    divergence depth are retained; descend internals are wiped.
+
+Per-retirement cost ≈ 30 KB cover state + ~7 KB tombstones in
+practice. **Constant**, set by tree dimensions.
+
+If we collapsed to a single 256-bit trie keyed on event_id, the
+constant would be tree-depth-256 instead of tree-depth-57 + log(N):
+
+  * Per retirement: ~256 sibling internals × 400 B ≈ **130 KB**
+  * Plus ~256 tombstones × 128 B ≈ **33 KB**
+  * Total ≈ **160 KB per retirement**, vs the 2-axis tree's ~30 KB.
+
+The time axis is **paying for itself** in per-retirement cover-state
+reduction (~5× cheaper), independently of whether mutable or fixed
+TTLs are in play. Whole-minute retirement (one tombstone per minute
+instead of per leaf) is an *additional* optimization that fixed-TTL
+workspaces could claw back, but the depth-bound benefit is already
+present.
+
+So the design choice for this branch is unambiguously "keep the time
+axis." Eliminating it would *increase* per-retirement cost, not
+decrease it.
+
+### Frontier rotation cost
+
+Because every retirement wipes F, the workspace must rotate to a new
+removal_frontier before authoring continues. With slice-1's
+clock-driven expiry firing whenever a stamped expiry boundary is
+crossed, the disappearing-messages worker can rapidly trigger
+frontier rotations.
+
+In practice retirements within a single tick under the same
+already-wiped F are cheap (only the leaf row + tombstone, no walk).
+The expensive part is the **first** retirement under each frontier.
+Frontier rotation cadence is therefore a practical operational
+concern: too frequent and the workspace pays the ~30 KB-per-rotation
+cost often; too infrequent and stale debris accumulates under wiped
+frontiers. The cleanup story is mostly amortized via rotation
+itself — once a frontier is dead, its accumulated tombstone debris
+is no longer touched by any walk.
+
+### Future work: compact retirement event
+
+Today the retire walk admits ~57 individual `LocalHistoryNodeSecret`
+events (one per materialized sibling + descend-path internal) plus
+the wipe transaction writes ~58 tombstone rows. The on-disk shape is
+many small records.
+
+A cleaner design batches the entire retirement into **one** local
+event (`retirement_cover` or similar) whose canonical bytes carry
+the compact representation of:
+
+  * The full descend path being wiped (each entry: `range_start`,
+    `range_width`, `bit_depth`, `event_id_prefix`, retired
+    `node_id`).
+  * Every sibling-side internal materialized along that path (each
+    entry: same coords + the retained `node_secret`).
+  * The retired leaf id.
+
+The projector decodes the compact event and writes all rows +
+tombstones in a single projection transaction. Benefits:
+
+  * Single canonical event id for the entire retirement → auditable
+    as one fact, not ~115 facts.
+  * Wire size dropped from ~30 KB (separate events + their
+    canonical-bytes overhead, dependency lists, signing-prefix
+    headers per event) to ~8 KB (one event with packed entries).
+  * Determinism still holds: both peers compute the same retirement
+    walk from the same shared state, yielding byte-identical
+    canonical bytes for the cover event, and therefore the same
+    event id.
+  * Idempotent admission: a re-admit of the same retirement event is
+    a no-op via the standard duplicate-id check.
+
+Implementation requires:
+
+  * A new event type `local_retirement_cover` (or similar) in the
+    encryption module. Local-only scope (each peer derives its own).
+  * Codec encoding for the compact path/sibling/tombstone arrays.
+  * Projector that walks the array and writes
+    `LOCAL_HISTORY_NODE_SECRETS` rows for siblings, exact-deletes
+    descend-path rows, writes
+    `LOCAL_HISTORY_NODE_TOMBSTONES` rows.
+  * Replacing the per-node `ensure_time_split` /
+    `ensure_trie_split` admissions in
+    `retire_deleted_event_leaf` with a single compute-then-admit
+    step.
+
+This is a substantial restructure of `src/workers/encryption.rs`
+(which is ~950 lines today, much of it the per-node walk
+machinery). It deserves its own slice. Documented here so the
+refactor target is clear; not implemented in the
+disappearing-messages branch.
+
+### Latest-setting trust gap (recap)
+
+Authors pick which admitted setting to reference. A malicious peer can
+reference an *older more-permissive* setting to extend their messages'
+effective TTL. Honest authors always reference the latest. Closing the
+gap requires committing to a specific epoch (time-based, logical
+order, or counter-based — see §6). Out of scope.
+
+## Chosen Direction: Option 5 (Monotonic Floor + Per-Message TTL with FS)
+
+> **CORRECTION TO EARLIER FRAMING IN THIS DOC.** Below this section,
+> earlier prose treated "decoupled from rotation" as forcing
+> best-effort (no-FS) deletion. That was based on conflating two
+> concepts: **rotation** (creating a fresh root key F + re-wrapping
+> to all N recipients — expensive) versus **F-wipe** (the retire
+> walk's wipe of F's row + materialization of sibling cover —
+> local, deterministic, no wraps).
+>
+> **Rotation is the expensive thing we are avoiding. F-wipe is the
+> FS mechanism we are keeping.** After F-wipe, sibling internals
+> serve as the new effective roots for their subtrees. Each peer
+> derived those siblings locally during the walk via the
+> deterministic KDF — no new key wraps to recipients are required.
+> A correctly-implemented `closest_retained_ancestor` falls back to
+> the deepest covering sibling when F is wiped, and authoring of
+> new messages continues from that sibling.
+>
+> So option 5 = per-message TTL **with full crypto-FS** + monotonic
+> floor + per-leaf retirement (no whole-minute coalescing) + cover
+> horizon (see below). The "best-effort / give up FS" framing in
+> the rest of this section is wrong and will be rewritten.
+
+After mapping six coherent design options for slice 5, we are landing on
+**option 5: a monotonically-advancing workspace deletion floor combined
+with the existing per-message TTL stamping, full F-wipe FS per
+retirement, and a sync-delay cover horizon that bounds long-run
+storage**. The decision is driven explicitly by:
+
+  1. **Decoupled from key rotation in the user's sense (no fresh
+     root key, no re-wrapping to N recipients).** F-wipe and
+     sibling cover are the FS mechanism; new authoring continues
+     under the materialized siblings. No `removal_frontier` change
+     is forced by any disappearing-messages event.
+  2. **What users actually wanted** (per product research). Users
+     want a monotonic, all-history-respecting floor — when the
+     admin tightens the policy, messages older than the new floor
+     are gone everywhere within sync latency.
+
+### UI prompt on tightening
+
+Tightening is the only operation that destroys past content. The admin
+console must present the consequence explicitly before the change is
+authored:
+
+> **You are about to change to a shorter disappearing messages limit.**
+> Messages older than 18 months will be deleted now as users' apps
+> become aware of this change. This will delete all messages older
+> than 18 months and cannot be undone.
+
+(The "18 months" example assumes the new floor is `now − 18 months`;
+the prompt fills in the actual floor based on the new setting.) On
+loosening, no prompt is required — past messages are unaffected and
+new messages get the longer TTL going forward.
+
+### The rotation/FS/determinism trilemma
+
+Forward secrecy for an individual retired leaf requires *some* secret
+on the F→leaf derivation path to be irrecoverable. With the current
+deterministic-from-parent KDF, this means **at least one ancestor
+must be wiped**. The choices are:
+
+  * **Wipe F (current slice 1–4 model).** Forward secrecy holds. But
+    F is the workspace's authoring root — wiping it forces a frontier
+    rotation. **Rejected** by the no-rotation constraint above.
+  * **Wipe a strict ancestor of F.** Not possible: F *is* the root;
+    nothing above it is on the deterministic chain.
+  * **Wipe only intermediate nodes between F and the leaf, keep F.**
+    Useless: F's KDF is deterministic, so the wiped intermediates can
+    be recomputed from F. No FS gain. Confirmed by reading
+    `derive_event_leaf` at `src/workers/encryption.rs:599` — the
+    closest retained ancestor walk descends from any retained
+    ancestor whose range covers the target coord, and F covers
+    everything.
+
+Conclusion: **without rotation, deterministic-KDF-tree FS for the
+retired leaf is not available**. We do not get cryptographic forward
+secrecy on the disappeared message under this constraint. We get
+**best-effort deletion**: the row is exact-deleted, the canonical
+bytes are purged, peers converge on the deletion within sync latency,
+and any peer that had not yet snapshotted the plaintext loses it.
+This is the same regime that Signal/WhatsApp disappearing messages
+operate in (best-effort device-side deletion; not crypto-FS), and it
+matches the product expectation per the research above.
+
+If true crypto-FS is later required for a higher-tier policy, the
+escape hatch is option 6 (TTL as frontier property + scheduled
+rotation), which is explicitly *not* what we are landing here.
+
+### Cost of key cover per deletion (option 5, no-rotation)
+
+Because we cannot get FS for the retired leaf without wiping F, the
+retire walk that materializes sibling cover **does not exist** in this
+model. There is nothing to "preserve" — F still covers everything via
+KDF. The cost shape splits into two regimes:
+
+There are two distinct retirement events, with very different cost
+shapes. The chop happens on **every** setting admit (cheap GC of
+debris below the floor); the per-message tombstone happens once per
+disappearance and is the dominant ongoing cost.
+
+#### Every setting admit: chop + GC
+
+The signed `disappearing_messages_setting` event carries
+`expires_at_or_before_minute` (the floor). At admit time, the client
+computes the floor as
+
+```
+new_floor = max(previous_floor, current_minute - new_ttl_minutes)
+```
+
+This is monotonic non-decreasing by construction. Crucially, the
+floor advances on **every** setting admit (because elapsed time
+since the previous admit is non-zero), regardless of whether the
+admin tightened or loosened the TTL. So every setting admit gets a
+chop for `[previous_floor, new_floor)` — a prefix-range deletion in
+the time tree (root width `2^57`):
+
+  * **At most ~57 "fully-left subtree" tombstones**, one per bit of
+    `new_floor` where the boundary places an entire subtree inside
+    the chop range. Each tombstone covers an entire subtree in one
+    row.
+  * **At most ~57 boundary descend-path tombstones** for the
+    `root → new_floor` walk where the boundary cuts the subtree.
+
+~128 B raw per tombstone → **~14 KB per setting admit, constant in
+the number of messages chopped**.
+
+The directional UX semantics fall out for free:
+
+  * **Tightening** (smaller `new_ttl`): the floor advances
+    aggressively because `current - new_ttl` is close to `now`.
+    Many live messages may be swept. Admin UI fires the deletion
+    warning prompt.
+  * **Loosening** (larger `new_ttl`): the floor still advances by
+    roughly `(time_since_previous_admit)` worth, but in this case
+    every message it crosses has *already* been disposed of by its
+    own per-message TTL stamp (since the previous TTL was strict).
+    No live content is deleted; the chop is pure GC of accumulated
+    tombstone debris. No prompt needed.
+  * **Re-issue at same TTL** (admin "compact" action): identical to
+    loosening — floor advances by elapsed time, sweeps debris, no
+    live content touched.
+
+The "compact" action is the operational escape hatch for workspaces
+that rarely change their disappearing-messages policy: re-issuing
+the current setting is free GC and can be wired into a "compact
+workspace" admin action or scheduled monthly.
+
+Determinism: the chop is a pure function of `(previous_floor,
+new_floor, TIME_TREE_ROOT_WIDTH)`. Both peers compute byte-identical
+tombstone rows from byte-identical inputs.
+
+#### Per-message TTL retirement (the dominant ongoing cost)
+
+After (and between) any chops, every message disappears on its own
+stamped `expires_at_minute`. **These cannot be coalesced into a coarse
+range tombstone**, because messages in the same minute can carry
+different stamped TTLs.
+
+> **Note on sibling-key cost.** A reasonable question is: doesn't every
+> per-message retirement create a giant set of sibling keys (~30 KB
+> from the F-wipe walk)? In the slice 1–4 (F-wipe) implementation,
+> yes — each retirement materializes the time-tree + trie sibling
+> chain. **Option 5 explicitly skips that walk** because it does not
+> attempt crypto-FS for the disappeared leaf; F is retained, F still
+> derives every other live message via KDF, so no sibling cover needs
+> to be persisted. The ~30 KB per-retirement debris that the F-wipe
+> model produces is the very cost option 5 is designed to avoid. The
+> cost numbers below are for option 5, not the F-wipe model.
+
+Mixed-TTL example:
+
+  * A message authored under a strict TTL (say, 1 day) stamps
+    `expires_at_minute = authored_minute + 1440`.
+  * A message authored under a permissive TTL (say, 7 days) stamps
+    `expires_at_minute = authored_minute + 10080`.
+  * Both can occur in the same minute if a setting change happened
+    mid-minute, or even just under a permissive policy where some
+    authors choose tighter per-author defaults.
+
+Coalescing all of minute M's leaves into one minute-node tombstone
+would require all messages in M to share a TTL, which is not
+guaranteed under monotonic-floor + per-message-stamping.
+
+Per per-message retirement:
+
+| Component | Bytes |
+|---|---|
+| `LOCAL_HISTORY_NODE_TOMBSTONES` row for the leaf | ~128 |
+| `MESSAGE_TOMBSTONES` row | ~128 |
+| `MESSAGES` + `SEALED_MESSAGES` row deletes | reclaims storage |
+| Canonical bytes purge | reclaims storage |
+| **Net cover overhead per disappearance** | **~256 B** |
+
+Plus ~128 B per cascaded reaction/file/file_slice leaf tombstone.
+
+These accumulate at the message-disappearance rate. A workspace with
+1000 disappearances/day produces ~256 KB/day of tombstone debris;
+over a year, ~93 MB. **This is the dominant ongoing cost of
+disappearing messages in option 5.**
+
+Determinism: the leaf coord is a deterministic function of the
+message's canonical bytes (`workspace_id`, `author_user_id`,
+`removal_frontier_id`, `created_at_ms`). All peers tombstone the same
+coord with byte-identical tombstone rows; clock skew may stagger the
+firing time but cannot change the result.
+
+#### Bulk GC happens only at tightening, and only for already-debris
+
+When a tightening chop fires, its coarse subtree tombstones subsume
+any pre-existing per-message tombstones whose coords fall within the
+chopped range. The chop projector can exact-delete those subsumed
+rows; their convergence purpose is now served by the coarser
+tombstone. **This is a one-shot reclaim at chop time; it does not
+prevent future accumulation.**
+
+Going forward, debris above the floor accumulates linearly. Only
+*another* tightening can sweep it. Without periodic tightening, the
+tombstone table grows unbounded at the message rate.
+
+Operational implication: the implementation should make periodic
+re-tightening (or an admin-initiated "compact" action that re-issues
+the current floor) cheap and obvious in the UI, since this is the
+only mechanism that bounds tombstone storage.
+
+#### Comparison
+
+Compare to the F-wipe model documented in earlier sections: ~30 KB
+walk per first-retirement-under-frontier and forced rotation. The
+no-rotation model is ~two orders of magnitude cheaper *per
+retirement* at the cost of (a) dropping crypto-FS for the disappeared
+message and (b) accepting unbounded tombstone accumulation between
+tightening events.
+
+#### Hypothetical: cost if we *did* walk to full depth
+
+The earlier user question — "what if we walk all the way down the path
+for each delete to a depth where birthday collision is very
+improbable" — assumes the F-wipe regime. Reproduced here for the
+record because the numbers are useful for sizing:
+
+For a target trie depth `D` chosen so that the probability of two
+event ids sharing a `D`-bit prefix is below ~2⁻⁴⁰ across the workspace
+lifetime (`P ≈ N² / 2^(D+1)` for `N` events), reasonable choices are:
+
+| `N` lifetime events | Required `D` | Per-retirement cost (with time-tree, F-wipe regime) |
+|---|---|---|
+| 10⁶ (≈ 2²⁰) | 80 | ~72 KB |
+| 10⁹ (≈ 2³⁰) | 110 | ~88 KB |
+| any (paranoid) | 128 | **~97 KB** |
+| any (full BLAKE3) | 256 | ~155 KB |
+
+Breakdown at `D = 128` (time tree depth 57 + trie depth 128):
+
+  * Retained sibling internals: `(57 + 128) × ~400 B = ~74 KB`
+  * Descend-path tombstones: `(57 + 128 + 2) × ~128 B = ~24 KB`
+
+Per-row sizes used: `LOCAL_HISTORY_NODE_SECRETS` row (178 B) + the
+admitted `LocalHistoryNodeSecret` event canonical bytes (~217 B) ≈
+400 B per retained sibling; `LOCAL_HISTORY_NODE_TOMBSTONES` row 128 B.
+
+These numbers are not the chosen design — they are the cost we'd pay
+if we kept F-wipe and chased birthday safety via depth. Option 5
+discards the walk entirely, so neither the depth nor the sibling
+materialization is incurred.
+
+### Setting-change work shape
+
+A setting change admits a new `disappearing_messages_setting`. Its
+shape depends on whether the new setting tightens or loosens:
+
+**Tightening** (new floor `> latest floor`):
+
+  1. Admit the setting event.
+  2. Apply the prefix-range deletion `[0, new_floor)` against the
+     time tree: ≤57 fully-left subtree tombstones + ≤57 boundary
+     descend-path tombstones (~14 KB constant time-tree work).
+  3. GC-delete any per-message tombstone rows whose coords fall
+     under one of the new subtree tombstones (subsumed by the
+     coarser tombstone).
+  4. Exact-delete `MESSAGES`, `SEALED_MESSAGES`, `MESSAGE_TOMBSTONES`
+     rows for messages with `created_at_ms / UNIX_MINUTE_MS <
+     new_floor`, and purge their canonical bytes.
+
+**Loosening** (new floor `=` latest floor; only the per-message TTL
+authoring policy changes):
+
+  1. Admit the setting event.
+  2. Done. No chop, no retirement.
+
+The per-message TTL stamping at *authoring time* keys off "the latest
+admitted setting at the moment of authoring", so a loosening setting
+takes effect for new messages immediately. Messages already authored
+under a stricter prior setting keep their stricter stamped
+`expires_at_minute` and continue to disappear on schedule via the
+ordinary per-message expiry worker.
+
+Cost scaling:
+
+  * Tightening: **one-time ~14 KB** time-tree work, plus
+    linear-in-locally-stored-subsumed-rows GC reclaim.
+  * Loosening: **zero** retirement work.
+  * Ongoing per-message TTL expiry (always running, in both regimes):
+    per-leaf retirement walk (~1–22 KB cover depending on tree
+    proximity to existing siblings; see "Cover horizon" below for
+    the long-run bound).
+
+### Cover horizon: GC sibling cover after the sync-delay horizon
+
+Per-message retirements maintain sibling cover so future messages in
+not-yet-seen minutes can still be derived. But "future messages in
+old minutes" only matters during the **sync-delay horizon** — the
+maximum plausible time a peer is offline before delivering messages
+it authored. After that horizon no new authentic messages will
+arrive in those old minutes, and the sibling cover for those
+minutes is dead weight on disk.
+
+The two-phase lifetime per time range:
+
+  1. **Active window** (`[now − sync_horizon, now]`). Sibling cover
+     is maintained. Per-leaf retirements walk from the closest
+     covering sibling to the leaf, materializing siblings along
+     the way. Stragglers can still deliver messages in this window
+     and have their leaves derived. FS for retired messages comes
+     from F-wipe + sibling cover, exactly as in slices 1–4.
+  2. **Sealed** (older than `now − sync_horizon`). Sibling cover
+     for the range is exact-deleted. A coarse "sealed range"
+     tombstone replaces it (the same shape as a monotonic-floor
+     chop: ≤57 subtree tombstones + ≤57 boundary descend
+     tombstones, ~14 KB constant per sealing). No new messages are
+     admittable in this range — a peer attempting to deliver one
+     finds no covering ancestor and rejects the admit. Already-
+     admitted messages stay on disk; their leaf rows hold the
+     secret directly so cover removal does not affect decryption.
+     FS for past retirements is preserved by the wiped descend
+     path and the now-removed cover.
+
+Determinism: the horizon is part of the workspace setting (or a
+fixed protocol constant). All peers compute byte-identical sealing
+boundaries from `(now, sync_horizon)`.
+
+#### Storage in steady state
+
+With cover horizon, per-peer storage is bounded by **active-window
+activity**, not by lifetime retirement count:
+
+```
+working_set ≈
+    active_window_retirements × ~5 KB     // sibling cover within horizon
+  + alive_messages × ~400 B               // leaf rows for live messages
+  + sealed_ranges × ~14 KB                // sealing tombstones
+  + retired_messages × ~150 B             // message-tombstone markers
+```
+
+Worked example: workspace at 100 retirements/day, 30-day horizon,
+~5 K alive messages, running for a year:
+
+  * Active-window cover: 3 000 retirements × 5 KB ≈ **15 MB**
+  * Live leaf rows: 5 000 × 400 B ≈ **2 MB**
+  * 12 sealings (one per month): 12 × 14 KB ≈ **170 KB**
+  * Tombstones for retired-but-still-tracked messages:
+    36 500/year × 150 B ≈ **5.5 MB/year** (themselves swept by
+    sealings on a longer timescale)
+
+Per-peer steady-state working set: **tens of MB**, stable as
+old ranges seal and new ones enter the active window. Without the
+horizon, the same workload monotonically grows into hundreds of
+MB to GBs (per the table earlier in this doc).
+
+#### Trade-off
+
+A peer offline longer than the sync horizon cannot deliver
+messages it authored before the horizon — on receivers' machines,
+the cover is gone and the leaf is non-derivable. For chat-style
+products this is acceptable (~30-day offline tolerance is plenty)
+and the upper bound is part of the design rather than an
+accidental property.
+
+### What slice 5 needs to ship
+
+  1. Extend `disappearing_messages_setting` canonical bytes with an
+     `expires_at_or_before_minute: u64` floor field, monotonically
+     non-decreasing across successive admitted settings.
+  2. Projector enforces monotonicity: a setting with a smaller floor
+     than the workspace's current latest floor is rejected at admit
+     time.
+  3. Worker fans out per-message retirements for all messages whose
+     `created_at_ms / UNIX_MINUTE_MS < floor`, regardless of their
+     stamped `expires_at_minute`. The floor wins.
+  4. Per-message `expires_at_minute` continues to drive the time-based
+     expiry path (slice 1 behavior); the floor only adds a second
+     trigger.
+  5. CLI test: tightening the floor deletes pre-floor messages on both
+     peers; loosening does not resurrect.
+  6. Keep the F-wipe walk and sibling-cover materialization. The
+     existing `RetireDeletedEventLeaf` primitive is the FS mechanism
+     for option 5 — there is no "best-effort" fallback variant.
+  7. Fix `closest_retained_ancestor` (`src/workers/encryption.rs:534`)
+     to fall back to the deepest covering sibling when F is wiped
+     instead of erroring at `root_source(...)?`. This is a slice-1
+     follow-up that is a *prerequisite* for slice 5 — without it the
+     workspace wedges on the first retirement.
+  8. Add a `cover_horizon_minutes` field to the workspace setting (or
+     a protocol constant) and a periodic worker that seals time-tree
+     subtrees fully behind `now − cover_horizon_minutes`. Sealing
+     reuses the same chop primitive as the monotonic-floor tightening
+     path; the only difference is what triggers it (clock advance vs
+     setting admit).
+  9. CLI test: a peer offline for longer than `cover_horizon_minutes`
+     cannot deliver pre-horizon messages — receivers reject the
+     admit cleanly with a "no covering ancestor" error.
+
+### What this gives up
+
+  * **No cryptographic forward secrecy on the disappeared leaf.** A
+    peer who snapshotted the encrypted bytes plus the workspace's
+    F secret before the deletion can still decrypt the message. We
+    rely on the deletion fact propagating before snapshots are taken
+    by attackers.
+  * **No per-frontier debris bound from F-wipe.** The frontier stays
+    alive as long as the admin wants; tombstones accumulate under it
+    until an explicit rotation is triggered for other reasons (key
+    compromise, recipient turnover, etc.).
+
+Both of these are acceptable per the product research: users
+prioritized "the message is gone everywhere on schedule" over "an
+attacker who already has my workspace key cannot decrypt the
+already-snapshotted ciphertext".
+
 ## Acknowledged Divergence From The Plan
 
 The phase-two slice landed in
@@ -507,64 +1151,108 @@ existed and is now gone, per RULES.md "purging may remove physical
 evidence, but it must not be the only representation of a semantic
 change".
 
-## 6. Cover Summary And Monotonicity
+## 6. Convergence, Per-Message Setting Reference, And The Trust Model
 
-The deletion summary commits to both individual deletes and expired
-minutes:
+### Convergence comes from per-message stamping, not from a global
+deletion summary
+
+Each message commits to its own `expires_at_minute` in canonical bytes.
+Two peers admitting the same byte sequence reach the same retirement
+decision once their local clocks cross the stamped boundary. There is
+no need for a shared "history of deletions" hash: every peer derives
+identical retirement behavior from the byte-equal admitted set.
+
+This is the load-bearing convergence claim. An earlier draft of this
+section described an `Hset` deletion-summary commitment over
+`(deleted_set, retained_cover, expired_minute_set)`. That commitment is
+not necessary for convergence — it summarizes a state that is already
+implied by canonical-bytes equality. It is preserved at the bottom of
+this section as a future-work option for cross-peer audit / reporting,
+but it is not part of the slice that ships.
+
+### Per-message setting reference
+
+`MessageEvent` carries `disappearing_setting_id: EventId` in canonical
+bytes. The reference is one of:
+
+  * The event id of a signed `disappearing_messages_setting` event for
+    the workspace, when one has been admitted at authoring time. The
+    author records *which setting they honored*.
+  * The workspace event id, as the slice-1 fallback when no setting has
+    been authored yet. The workspace event itself carries
+    `disappearing_ttl_minutes` for this purpose.
+
+The reference is added to the message's dependencies, so the projector
+loads it through normal context. The projector enforces:
+
+  * The reference is either the workspace event for that workspace, or
+    a signed `disappearing_messages_setting` for that workspace; any
+    other dep type is rejected.
+  * `expires_at_minute` matches what the referenced setting permits:
+    - If `permitted_ttl == 0` → `expires_at_minute == EXPIRES_NEVER`
+    - Else → `expires_at_minute == authored_minute + permitted_ttl`
+      where `authored_minute = floor(created_at_ms / 60_000)`
+  * Mismatches are rejected at projection.
+
+This eliminates the trust gap of the prior draft, where authors could
+stamp arbitrary expiry. An author can now only stamp an expiry that
+*some* admin-authored setting (or the workspace creation TTL) explicitly
+permits.
+
+### Trust model and known gap: latest-setting enforcement
+
+A peer can still pick any setting it wants as the reference, including
+an *older* setting whose `ttl_minutes` is larger than the latest. The
+projector accepts any reference that is *some* admitted setting, not
+specifically the *latest*. This is intentional for the slice that
+ships: closing the gap requires an answer to the epoch question.
+
+Concretely, a malicious peer can extend the effective TTL of its own
+messages by referencing a stale setting. They cannot stamp arbitrary
+expiry, but they can pick the maximum TTL ever set for the workspace.
+Honest peers honor the stamped expiry as canonical fact, and
+disappearance still happens; it just happens at the older setting's
+boundary instead of the latest.
+
+### Future work: closing the latest-setting gap with epochs
+
+Three options for upgrading from "best effort" to "strict enforcement"
+of the latest setting:
+
+  * **Time-based** (simplest): the projector enumerates admitted
+    settings for the workspace and rejects a message whose referenced
+    setting was already superseded by a strictly newer setting at
+    `message.created_at_ms`. Trusts admin clocks within a clock-skew
+    bound.
+  * **Logical order**: each setting carries a sequence number signed by
+    the admin, or chains a dep on the prior setting. Eliminates clock
+    trust but requires admins to coordinate.
+  * **Counter-based**: a per-workspace monotonic counter, e.g. derived
+    from a hash chain over admitted settings. Self-converging without
+    clock trust.
+
+All three are out of scope for this slice. The per-message reference
+field gives us the hook for any of them later.
+
+### Future work: optional `Hset` deletion summary commitment
+
+The earlier draft of this section proposed:
 
 ```text
 history_summary_id = Hset(
-    "history-delete-summary",
+    "history-delete-summary v1",
     deleted_set,           // sorted by (unix_minute, event_id)
     retained_cover,        // sorted by canonical node prefix
     expired_minute_set,    // sorted by unix_minute
 )
 ```
 
-`Hset` is a domain-separated BLAKE3 hash over the concatenation of:
-
-```text
-"history-delete-summary v1"
-|| u32_be(deleted_set.len())
-|| (for each entry sorted by (unix_minute, event_id):
-      u64_be(unix_minute) || event_id)
-|| u32_be(retained_cover.len())
-|| (for each entry sorted by node_prefix:
-      u8(width_bits) || u64_be(node_prefix))
-|| u32_be(expired_minute_set.len())
-|| (for each entry sorted by unix_minute:
-      u64_be(unix_minute))
-```
-
-Sorts are bytewise lexicographic. All multi-byte integers are big-endian.
-Set sizes are `u32_be` to fail loudly past 2^32 entries; production-scale
-expiry should never approach that bound.
-
-### Monotonicity claims
-
-1. **Set-equality ⇒ id-equality.** Two peers with the same
-   `(deleted_set, expired_minute_set)` derive the same `retained_cover` and
-   therefore the same `history_summary_id`, regardless of the order in
-   which deletes and minute expiries arrived.
-2. **Idempotent expiry application.** Applying the same `expired_minute`
-   event twice is a no-op: the second admission is a duplicate by event id,
-   the second projection is a no-op because the read-model rows are already
-   gone, and the canonical-bytes purge is a no-op because the bytes are
-   already missing. The summary is unchanged.
-3. **Re-running the worker against the same logical-clock value is
-   idempotent.** The set of candidate minutes the worker enumerates is
-   determined by `now_minute` and the active setting; `expired_minute`
-   events are admitted only when the corresponding row does not yet
-   exist. Running the worker N times at the same logical time yields the
-   same summary as running it once.
-4. **Delete-then-expire and expire-then-delete commute.** A
-   `message_deletion` for an individual message followed by minute-level
-   expiry of that minute, vs. minute-level expiry followed by an arriving
-   `message_deletion`, both reach the same final
-   `(deleted_set, expired_minute_set)`. The deletion-set entry for that
-   single message is redundant once the whole minute is in the expired-set,
-   but it does not change the summary id (the deleted-set is still hashed
-   in).
+with a domain-separated BLAKE3 over the canonical sorted concatenation.
+Useful as an audit primitive — it lets an external observer see two
+peers agree on the entire deletion-and-expiry path that produced the
+current cover, not just on the cover itself. Not required for
+convergence (convergence is implied by canonical-bytes equality of
+admitted messages), so deferred.
 
 ## 7. Edge Cases The Design Must Handle
 
@@ -743,18 +1431,64 @@ baked into workspace creation as a fixed argument.
     purge of file-slice ciphertext when the parent message minute
     expires.
 
-### Slice 5: rotation interplay
+### Slice 5: monotonic floor + rotation decoupling (option 5, chosen)
 
-16. Test interaction with `recipient_key_tombstone` and
-    `removal_frontier`: a frontier change mid-TTL leaves old-frontier
-    minutes punctured under the old frontier's history tree; expiry
-    worker enumerates per-frontier.
-17. Test invite-time history grant: a newly invited endpoint receives
-    only retained-cover nodes for not-yet-expired minutes, never an
-    expired minute's secret.
+See "Chosen Direction: Option 5" above for the full design rationale,
+the rotation/FS/determinism trilemma, and the cost analysis. The
+shipping work for this slice is:
 
-After slice 5, disappearing messages compose with the rest of the
-encryption plan: rotation, deletion, history-tree puncture, and ciphertext
-purge all share the same deletion-summary commitment, and the daemon's
-tick-driven worker keeps the on-disk state aligned with the current
-logical time.
+16. Add `expires_at_or_before_minute: u64` floor field to
+    `disappearing_messages_setting` canonical bytes. Projector
+    enforces monotonic non-decreasing across successive settings
+    (tightenings advance the floor; loosenings keep it equal).
+17. Add a `RetireDeletedEventLeafBestEffort` primitive (or a flag on
+    the existing one) that writes only the leaf tombstone +
+    read-model deletes + canonical bytes purge — *no F-wipe, no
+    sibling materialization walk*. This is the per-message
+    disappearing-messages retirement path used by the ongoing
+    expiry worker.
+18. Add a `ChopTimeTreePrefix(floor_minute)` primitive that performs
+    the prefix-range deletion `[0, floor_minute)` against the time
+    tree: writes ≤57 subtree tombstones + ≤57 boundary descend
+    tombstones, deterministically derived from `(floor_minute,
+    TIME_TREE_ROOT_WIDTH)`. This fires *only on tightening setting
+    changes* (when the floor strictly advances). Loosenings do not
+    invoke the chop.
+19. Setting projector, on a tightening change, calls
+    `ChopTimeTreePrefix(new_floor)` and then GC-deletes any
+    pre-existing per-message tombstone rows whose coords fall under
+    a new subtree tombstone (subsumed). On a loosening change, the
+    projector only persists the new setting; nothing else fires.
+20. The ongoing expiry worker (slice 1's
+    `disappearing_minute_expiry`) fans out per-message best-effort
+    retirements for messages whose stamped `expires_at_minute` has
+    been crossed by the clock — regardless of whether the message is
+    above or below the floor (it usually is above; the chop already
+    cleared everything below). The F-wipe walk is swapped out for
+    the best-effort primitive from step 17.
+19. Admin UI prompt on tightening:
+    > You are about to change to a shorter disappearing messages
+    > limit. Messages older than {floor_age} will be deleted now as
+    > users' apps become aware of this change. This will delete all
+    > messages older than {floor_age} and cannot be undone.
+20. CLI tests:
+    * Tightening the floor deletes pre-floor messages on both peers.
+    * Loosening does not resurrect deleted messages and does not
+      retroactively extend live messages' stamped TTLs.
+    * Setting events with a floor below the current latest floor are
+      rejected at admit time.
+21. Test interaction with `removal_frontier` rotation initiated for
+    *other* reasons (recipient turnover, key compromise): old-frontier
+    leaf tombstones survive the rotation as best-effort cleanup
+    artifacts; new-frontier authoring is uninterrupted.
+22. Test invite-time history grant: a newly invited endpoint never
+    receives canonical bytes for messages already past the floor, even
+    if their stamped `expires_at_minute` had not yet been crossed.
+
+After slice 5, disappearing messages are decoupled from rotation:
+admins can change the policy freely, the clock-driven and floor-driven
+expiry workers do their work without forcing a frontier change, and
+rotation cadence is governed solely by recipient/key-compromise
+concerns (its actual scaling cost driver). The trade-off — best-effort
+deletion rather than crypto-FS for the disappeared leaf — is accepted
+per the product research documented above.

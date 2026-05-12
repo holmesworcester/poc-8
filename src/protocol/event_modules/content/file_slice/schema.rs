@@ -9,10 +9,40 @@
 
 use crate::core::crypto::XCHACHA20_POLY1305_TAG_BYTES;
 use crate::core::store::{Schema, Store, TableName, TableRow};
+use crate::protocol::event_modules::content::{file, message};
 use crate::protocol::event_modules::types::EventId;
+use crate::protocol::event_modules::worker::AdmitDecision;
 use crate::protocol::wire::{Reader, Writer};
 
+use super::codec;
 use super::types::{FileSliceEvent, FileSliceRow};
+
+/// Receive-side admission gate for signed file slices.
+///
+/// Drops the slice if its parent message (resolved through the file
+/// descriptor it names) is already tombstoned. If the descriptor is not
+/// present locally we cannot prove the parent state, so the gate admits and
+/// lets the normal blocked-event machinery handle it.
+pub fn admit_check_received(store: &Store, bytes: &[u8]) -> Result<AdmitDecision, String> {
+    let envelope = codec::decode_signed(bytes)?;
+    let (_slice, file_event_id) = codec::decode(&envelope.payload)?;
+    let descriptor_bytes =
+        crate::protocol::event_modules::schema::event_bytes(store, &file_event_id)
+            .map_err(|err| format!("load file descriptor bytes: {err}"))?;
+    let Some(descriptor_bytes) = descriptor_bytes else {
+        return Ok(AdmitDecision::Admit);
+    };
+    let descriptor_envelope = file::codec::decode_signed(&descriptor_bytes)?;
+    let descriptor = file::codec::decode(&descriptor_envelope.payload)?;
+    if message::schema::message_tombstone_exists(
+        store,
+        descriptor.workspace_id,
+        descriptor.message_id,
+    )? {
+        return Ok(AdmitDecision::Drop);
+    }
+    Ok(AdmitDecision::Admit)
+}
 
 pub const FILE_SLICES: TableName = TableName::new("content.file_slices");
 
