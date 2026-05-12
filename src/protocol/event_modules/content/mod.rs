@@ -55,14 +55,14 @@ pub fn admit_check_received(
     let bytes = &record.canonical_bytes;
     match bytes.first().copied() {
         Some(message::codec::TYPE_SIGNED_MESSAGE) => {
-            message::schema::admit_check_received(store, bytes)
+            message::projector::admit_check_received(store, bytes)
         }
         Some(reaction::codec::TYPE_SIGNED_REACTION) => {
-            reaction::schema::admit_check_received(store, bytes)
+            reaction::projector::admit_check_received(store, bytes)
         }
-        Some(file::codec::TYPE_SIGNED_FILE) => file::schema::admit_check_received(store, bytes),
+        Some(file::codec::TYPE_SIGNED_FILE) => file::projector::admit_check_received(store, bytes),
         Some(file_slice::codec::TYPE_SIGNED_FILE_SLICE) => {
-            file_slice::schema::admit_check_received(store, bytes)
+            file_slice::projector::admit_check_received(store, bytes)
         }
         _ => Ok(AdmitDecision::Admit),
     }
