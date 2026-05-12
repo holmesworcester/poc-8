@@ -4,124 +4,119 @@
 //! durable enough for the matching response to name it as a dependency. The
 //! request itself names its invite-secret dependency and carries an invite-key
 //! signature over the request transcript, so bootstrap authorization goes
-//! through the same dependency/context path as every other local fact. The fixed
-//! magic prefix keeps connection establishment separate from ordinary tagged
-//! events, while `Reader::finish` ensures malformed extra bytes are rejected.
+//! through the same dependency/context path as every other local fact.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::core::crypto::ED25519_SIGNATURE_BYTES;
 use crate::protocol::event_modules::types::{EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
-use super::super::types::EVENT_MAGIC;
 use super::types::RequestEvent;
 
-pub const TAG: u8 = 1;
+pub const TYPE_CONNECTION_REQUEST: u8 = 132;
+pub const TAG: u8 = TYPE_CONNECTION_REQUEST;
 
 const ADDR_FAMILY_NONE: u8 = 0;
 const ADDR_FAMILY_V4: u8 = 4;
 const ADDR_FAMILY_V6: u8 = 6;
 const ADDR_BLOCK_BYTES: usize = 1 + 16 + 2;
 
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "connection.request",
+    TYPE_CONNECTION_REQUEST,
+    &[
+        Field::id("from_endpoint"),
+        Field::id("to_endpoint"),
+        Field::id("nonce"),
+        Field::id("invite_event_id"),
+        Field::id("bootstrap_hash"),
+        Field::bytes("invite_signature", ED25519_SIGNATURE_BYTES),
+        Field::id("invite_secret_event_id"),
+        Field::id("initiator_ephemeral_secret_event_id"),
+        Field::id("initiator_ephemeral_public_key"),
+        Field::bytes("from_listen_addr", ADDR_BLOCK_BYTES),
+    ],
+);
+
 pub fn encode(event: &RequestEvent) -> Vec<u8> {
-    let mut out =
-        Writer::with_capacity(10 + 1 + 32 * 8 + ED25519_SIGNATURE_BYTES + ADDR_BLOCK_BYTES);
-    out.raw(EVENT_MAGIC);
-    out.u8(TAG);
-    out.id(&event.from_endpoint);
-    out.id(&event.to_endpoint);
-    out.id(&event.nonce);
-    out.id(&event.invite_event_id);
-    out.id(&event.bootstrap_hash);
-    out.raw(&event.invite_signature);
-    out.id(&event.invite_secret_event_id);
-    out.id(&event.initiator_ephemeral_secret_event_id);
-    out.id(&event.initiator_ephemeral_public_key);
-    encode_optional_addr(&mut out, event.from_listen_addr);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .id(&event.from_endpoint)
+        .id(&event.to_endpoint)
+        .id(&event.nonce)
+        .id(&event.invite_event_id)
+        .id(&event.bootstrap_hash)
+        .bytes(&event.invite_signature)
+        .id(&event.invite_secret_event_id)
+        .id(&event.initiator_ephemeral_secret_event_id)
+        .id(&event.initiator_ephemeral_public_key)
+        .bytes(&encode_addr_block(event.from_listen_addr))
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<RequestEvent, String> {
-    if !bytes.starts_with(EVENT_MAGIC) {
-        return Err("not a connection event".to_string());
-    }
-    let mut reader = Reader::new(&bytes[EVENT_MAGIC.len()..], "connection request");
-    let tag = reader.u8()?;
-    if tag != TAG {
-        return Err("expected connection request".to_string());
-    }
-    let event = RequestEvent {
-        from_endpoint: reader.id()?,
-        to_endpoint: reader.id()?,
-        nonce: reader.id()?,
-        invite_event_id: reader.id()?,
-        bootstrap_hash: reader.id()?,
-        invite_signature: fixed_signature(reader.bytes(ED25519_SIGNATURE_BYTES)?)?,
-        invite_secret_event_id: reader.id()?,
-        initiator_ephemeral_secret_event_id: reader.id()?,
-        initiator_ephemeral_public_key: reader.id()?,
-        from_listen_addr: decode_optional_addr(&mut reader)?,
-    };
-    reader.finish()?;
-    Ok(event)
+    let v = SCHEMA.parse(bytes)?;
+    Ok(RequestEvent {
+        from_endpoint: v.id("from_endpoint")?,
+        to_endpoint: v.id("to_endpoint")?,
+        nonce: v.id("nonce")?,
+        invite_event_id: v.id("invite_event_id")?,
+        bootstrap_hash: v.id("bootstrap_hash")?,
+        invite_signature: v
+            .raw("invite_signature")?
+            .try_into()
+            .map_err(|_| "invite signature length".to_string())?,
+        invite_secret_event_id: v.id("invite_secret_event_id")?,
+        initiator_ephemeral_secret_event_id: v.id("initiator_ephemeral_secret_event_id")?,
+        initiator_ephemeral_public_key: v.id("initiator_ephemeral_public_key")?,
+        from_listen_addr: decode_addr_block(v.raw("from_listen_addr")?)?,
+    })
 }
 
-fn fixed_signature(bytes: Vec<u8>) -> Result<[u8; ED25519_SIGNATURE_BYTES], String> {
-    bytes
-        .try_into()
-        .map_err(|_| "connection request invite signature length mismatch".to_string())
-}
-
-fn encode_optional_addr(out: &mut Writer, addr: Option<SocketAddr>) {
-    // Always reserve the same byte count so the request stays fixed-width.
+fn encode_addr_block(addr: Option<SocketAddr>) -> [u8; ADDR_BLOCK_BYTES] {
+    let mut out = [0u8; ADDR_BLOCK_BYTES];
     match addr {
-        None => {
-            out.u8(ADDR_FAMILY_NONE);
-            out.raw(&[0u8; 16]);
-            out.u16(0);
-        }
-        Some(addr) => match addr.ip() {
+        None => out[0] = ADDR_FAMILY_NONE,
+        Some(a) => match a.ip() {
             IpAddr::V4(ip) => {
-                out.u8(ADDR_FAMILY_V4);
-                let mut padded = [0u8; 16];
-                padded[..4].copy_from_slice(&ip.octets());
-                out.raw(&padded);
-                out.u16(addr.port());
+                out[0] = ADDR_FAMILY_V4;
+                out[1..5].copy_from_slice(&ip.octets());
+                out[17..19].copy_from_slice(&a.port().to_be_bytes());
             }
             IpAddr::V6(ip) => {
-                out.u8(ADDR_FAMILY_V6);
-                out.raw(&ip.octets());
-                out.u16(addr.port());
+                out[0] = ADDR_FAMILY_V6;
+                out[1..17].copy_from_slice(&ip.octets());
+                out[17..19].copy_from_slice(&a.port().to_be_bytes());
             }
         },
     }
+    out
 }
 
-fn decode_optional_addr(reader: &mut Reader<'_>) -> Result<Option<SocketAddr>, String> {
-    let family = reader.u8()?;
-    let raw = reader.bytes(16)?;
-    let port = reader.u16()?;
+fn decode_addr_block(bytes: &[u8]) -> Result<Option<SocketAddr>, String> {
+    let family = bytes[0];
+    let ip_bytes = &bytes[1..17];
+    let port = u16::from_be_bytes(bytes[17..19].try_into().expect("len checked"));
     match family {
         ADDR_FAMILY_NONE => {
-            if raw.iter().any(|byte| *byte != 0) || port != 0 {
+            if ip_bytes.iter().any(|byte| *byte != 0) || port != 0 {
                 return Err("absent listen addr must zero its address bytes".to_string());
             }
             Ok(None)
         }
         ADDR_FAMILY_V4 => {
-            if raw[4..].iter().any(|byte| *byte != 0) {
+            if ip_bytes[4..].iter().any(|byte| *byte != 0) {
                 return Err("ipv4 listen addr must zero its trailing bytes".to_string());
             }
-            let octets = [raw[0], raw[1], raw[2], raw[3]];
+            let octets: [u8; 4] = ip_bytes[..4].try_into().expect("len checked");
             Ok(Some(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::from(octets)),
                 port,
             )))
         }
         ADDR_FAMILY_V6 => {
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&raw);
+            let octets: [u8; 16] = ip_bytes.try_into().expect("len checked");
             Ok(Some(SocketAddr::new(
                 IpAddr::V6(Ipv6Addr::from(octets)),
                 port,
@@ -132,7 +127,7 @@ fn decode_optional_addr(reader: &mut Reader<'_>) -> Result<Option<SocketAddr>, S
 }
 
 pub fn is_request(bytes: &[u8]) -> bool {
-    bytes.starts_with(EVENT_MAGIC) && bytes.get(EVENT_MAGIC.len()) == Some(&TAG)
+    bytes.first() == Some(&TYPE_CONNECTION_REQUEST)
 }
 
 pub fn record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {

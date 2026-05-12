@@ -6,8 +6,6 @@ use crate::protocol::event_modules::types::EventId;
 
 pub type ConnectionId = [u8; 32];
 
-pub(super) const EVENT_MAGIC: &[u8; 10] = b"TOPOCONN1\0";
-
 pub(crate) fn event_id(bytes: &[u8]) -> EventId {
     *blake3::hash(bytes).as_bytes()
 }

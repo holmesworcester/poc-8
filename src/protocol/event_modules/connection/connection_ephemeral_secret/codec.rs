@@ -2,44 +2,46 @@
 
 use crate::core::crypto;
 use crate::protocol::event_modules::types::{EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
-use super::super::types::EVENT_MAGIC;
 use super::types::EphemeralSecretEvent;
 
-pub const TAG: u8 = 3;
+pub const TYPE_CONNECTION_EPHEMERAL_SECRET: u8 = 138;
+pub const TAG: u8 = TYPE_CONNECTION_EPHEMERAL_SECRET;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "connection.ephemeral_secret",
+    TYPE_CONNECTION_EPHEMERAL_SECRET,
+    &[
+        Field::id("owner_endpoint"),
+        Field::id("ephemeral_private_key"),
+        Field::id("ephemeral_public_key"),
+        Field::u64("created_at_ms"),
+    ],
+);
 
 pub fn encode(event: &EphemeralSecretEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(10 + 1 + 32 * 3 + 8);
-    out.raw(EVENT_MAGIC);
-    out.u8(TAG);
-    out.id(&event.owner_endpoint);
-    out.id(&event.ephemeral_private_key);
-    out.id(&event.ephemeral_public_key);
-    out.u64(event.created_at_ms);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .id(&event.owner_endpoint)
+        .id(&event.ephemeral_private_key)
+        .id(&event.ephemeral_public_key)
+        .u64(event.created_at_ms)
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<EphemeralSecretEvent, String> {
-    if !bytes.starts_with(EVENT_MAGIC) {
-        return Err("not a connection event".to_string());
-    }
-    let mut reader = Reader::new(&bytes[EVENT_MAGIC.len()..], "connection ephemeral secret");
-    if reader.u8()? != TAG {
-        return Err("expected connection ephemeral secret".to_string());
-    }
-    let event = EphemeralSecretEvent {
-        owner_endpoint: reader.id()?,
-        ephemeral_private_key: reader.id()?,
-        ephemeral_public_key: reader.id()?,
-        created_at_ms: reader.u64()?,
-    };
-    reader.finish()?;
-    Ok(event)
+    let v = SCHEMA.parse(bytes)?;
+    Ok(EphemeralSecretEvent {
+        owner_endpoint: v.id("owner_endpoint")?,
+        ephemeral_private_key: v.id("ephemeral_private_key")?,
+        ephemeral_public_key: v.id("ephemeral_public_key")?,
+        created_at_ms: v.u64("created_at_ms")?,
+    })
 }
 
 pub fn is_ephemeral_secret(bytes: &[u8]) -> bool {
-    bytes.starts_with(EVENT_MAGIC) && bytes.get(EVENT_MAGIC.len()) == Some(&TAG)
+    bytes.first() == Some(&TYPE_CONNECTION_EPHEMERAL_SECRET)
 }
 
 pub fn record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {

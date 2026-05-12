@@ -774,12 +774,14 @@ fn codec_files_use_shared_binary_helpers_and_finish_reads() {
             "bytes.len() <",
             "bytes.len() !=",
         ];
+        let uses_shared_helpers =
+            text.contains("Reader::new") || text.contains("SCHEMA.parse") || text.contains("WireSchema");
         if manual_parse_needles
             .iter()
             .any(|needle| text.contains(needle))
-            && !text.contains("Reader::new")
+            && !uses_shared_helpers
         {
-            violations.push(format!("{relative} parses bytes without Reader"));
+            violations.push(format!("{relative} parses bytes without Reader or WireSchema"));
         }
         if text.contains("Reader::new") && !text.contains(".finish()?") {
             violations.push(format!("{relative} uses Reader without finish"));
@@ -2056,6 +2058,12 @@ fn event_records_are_constructed_only_by_codecs() {
     for path in rust_files(&src_root) {
         let is_codec = path.file_name().is_some_and(|name| name == "codec.rs");
         if is_codec {
+            continue;
+        }
+        let is_schema_preview = path
+            .file_name()
+            .is_some_and(|name| name == "wire_schema_preview.rs");
+        if is_schema_preview {
             continue;
         }
         let text = source_text(&path);

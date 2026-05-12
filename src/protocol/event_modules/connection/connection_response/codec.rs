@@ -1,8 +1,8 @@
 //! Wire codec for connection response events.
 //!
-//! Responses use the same connection magic as requests and are local protocol
-//! history. They exist for the fact-graph model of connection establishment:
-//! "endpoint B answered request R and committed to connection id C".
+//! Responses are local protocol history. They exist for the fact-graph model
+//! of connection establishment: "endpoint B answered request R and committed
+//! to connection id C".
 //!
 //! The request id is both a body field and the event dependency. That is the
 //! important boundary: the response projector validates the request/response
@@ -15,57 +15,63 @@
 //! response is useful; the projector owns those checks.
 
 use crate::protocol::event_modules::types::{EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
-use super::super::types::EVENT_MAGIC;
 use super::types::ResponseEvent;
 
-pub const TAG: u8 = 2;
+pub const TYPE_CONNECTION_RESPONSE: u8 = 133;
+pub const TAG: u8 = TYPE_CONNECTION_RESPONSE;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "connection.response",
+    TYPE_CONNECTION_RESPONSE,
+    &[
+        Field::id("from_endpoint"),
+        Field::id("to_endpoint"),
+        Field::id("request_id"),
+        Field::id("invite_secret_event_id"),
+        Field::id("initiator_ephemeral_secret_event_id"),
+        Field::id("responder_ephemeral_secret_event_id"),
+        Field::id("responder_ephemeral_public_key"),
+        Field::id("handshake_hash"),
+        Field::id("connection_secret"),
+    ],
+);
 
 pub fn encode(event: &ResponseEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(10 + 1 + 32 * 10);
-    out.raw(EVENT_MAGIC);
-    out.u8(TAG);
-    out.id(&event.from_endpoint);
-    out.id(&event.to_endpoint);
-    out.id(&event.request_id);
-    out.id(&event.invite_secret_event_id);
-    out.id(&event.initiator_ephemeral_secret_event_id);
-    out.id(&event.responder_ephemeral_secret_event_id);
-    out.id(&event.responder_ephemeral_public_key);
-    out.id(&event.handshake_hash);
-    out.id(&event.connection_secret);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .id(&event.from_endpoint)
+        .id(&event.to_endpoint)
+        .id(&event.request_id)
+        .id(&event.invite_secret_event_id)
+        .id(&event.initiator_ephemeral_secret_event_id)
+        .id(&event.responder_ephemeral_secret_event_id)
+        .id(&event.responder_ephemeral_public_key)
+        .id(&event.handshake_hash)
+        .id(&event.connection_secret)
+        .finish()
 }
 
 /// Decode canonical response bytes and reject malformed tags/trailing bytes.
 pub fn decode(bytes: &[u8]) -> Result<ResponseEvent, String> {
-    if !bytes.starts_with(EVENT_MAGIC) {
-        return Err("not a connection event".to_string());
-    }
-    let mut reader = Reader::new(&bytes[EVENT_MAGIC.len()..], "connection response");
-    let tag = reader.u8()?;
-    if tag != TAG {
-        return Err("expected connection response".to_string());
-    }
-    let event = ResponseEvent {
-        from_endpoint: reader.id()?,
-        to_endpoint: reader.id()?,
-        request_id: reader.id()?,
-        invite_secret_event_id: reader.id()?,
-        initiator_ephemeral_secret_event_id: reader.id()?,
-        responder_ephemeral_secret_event_id: reader.id()?,
-        responder_ephemeral_public_key: reader.id()?,
-        handshake_hash: reader.id()?,
-        connection_secret: reader.id()?,
-    };
-    reader.finish()?;
-    Ok(event)
+    let v = SCHEMA.parse(bytes)?;
+    Ok(ResponseEvent {
+        from_endpoint: v.id("from_endpoint")?,
+        to_endpoint: v.id("to_endpoint")?,
+        request_id: v.id("request_id")?,
+        invite_secret_event_id: v.id("invite_secret_event_id")?,
+        initiator_ephemeral_secret_event_id: v.id("initiator_ephemeral_secret_event_id")?,
+        responder_ephemeral_secret_event_id: v.id("responder_ephemeral_secret_event_id")?,
+        responder_ephemeral_public_key: v.id("responder_ephemeral_public_key")?,
+        handshake_hash: v.id("handshake_hash")?,
+        connection_secret: v.id("connection_secret")?,
+    })
 }
 
 /// Fast tag check used by registry dispatch.
 pub fn is_response(bytes: &[u8]) -> bool {
-    bytes.starts_with(EVENT_MAGIC) && bytes.get(EVENT_MAGIC.len()) == Some(&TAG)
+    bytes.first() == Some(&TYPE_CONNECTION_RESPONSE)
 }
 
 /// Build the common event record for response admission.
