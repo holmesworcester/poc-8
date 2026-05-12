@@ -18,6 +18,43 @@ use super::types::{
     TransitEnvelope, BOOTSTRAP_PURPOSE, CONNECTION_PURPOSE, INVITE_BOOTSTRAP_PURPOSE,
 };
 
+/// Plaintext byte budget for one transit batch. The cap is the inner plaintext,
+/// not the wire frame; per-event length-prefix overhead is included by the
+/// caller via the `inner_size` closure passed to `batch_inner_events`.
+pub const TRANSIT_TARGET_PLAINTEXT_BYTES: usize = 32 * 1024 * 1024;
+
+/// Per-event length-prefix overhead written by the inner-event codec. Callers
+/// that bin-pack transit items must include this in their plaintext accounting.
+pub const PER_EVENT_PLAINTEXT_OVERHEAD: usize = 4;
+
+/// Greedily groups `items` into batches whose summed `inner_size` stays at or
+/// below `TRANSIT_TARGET_PLAINTEXT_BYTES`. Items whose own `inner_size` already
+/// exceeds the cap are emitted in their own single-item batch — the caller
+/// decides whether to reject oversize inputs upstream.
+pub fn batch_inner_events<T, F>(items: Vec<T>, inner_size: F) -> Vec<Vec<T>>
+where
+    F: Fn(&T) -> usize,
+{
+    let mut batches: Vec<Vec<T>> = Vec::new();
+    let mut current: Vec<T> = Vec::new();
+    let mut current_bytes = 0usize;
+    for item in items {
+        let item_bytes = inner_size(&item);
+        if !current.is_empty()
+            && current_bytes.saturating_add(item_bytes) > TRANSIT_TARGET_PLAINTEXT_BYTES
+        {
+            batches.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes = current_bytes.saturating_add(item_bytes);
+        current.push(item);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
 pub fn create_bootstrap(
     local: &EndpointKeypair,
     recipient_endpoint: EndpointId,
@@ -120,4 +157,91 @@ pub fn create_connection_batch(
         nonce,
         ciphertext,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity_size(n: &usize) -> usize {
+        *n
+    }
+
+    #[test]
+    fn empty_input_emits_no_batches() {
+        let batches = batch_inner_events(Vec::<usize>::new(), identity_size);
+        assert!(batches.is_empty());
+    }
+
+    #[test]
+    fn single_item_under_cap_is_one_batch() {
+        let batches = batch_inner_events(vec![10usize], identity_size);
+        assert_eq!(batches, vec![vec![10usize]]);
+    }
+
+    #[test]
+    fn items_summing_under_cap_stay_in_one_batch() {
+        let batches = batch_inner_events(vec![1usize, 2, 3, 4], identity_size);
+        assert_eq!(batches, vec![vec![1usize, 2, 3, 4]]);
+    }
+
+    #[test]
+    fn exact_cap_fit_is_one_batch() {
+        let batches = batch_inner_events(
+            vec![TRANSIT_TARGET_PLAINTEXT_BYTES / 2, TRANSIT_TARGET_PLAINTEXT_BYTES / 2],
+            identity_size,
+        );
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 2);
+    }
+
+    #[test]
+    fn item_that_would_cross_cap_starts_a_new_batch() {
+        let half = TRANSIT_TARGET_PLAINTEXT_BYTES / 2;
+        let over_half = half + 1;
+        let batches = batch_inner_events(vec![half, over_half], identity_size);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0], vec![half]);
+        assert_eq!(batches[1], vec![over_half]);
+    }
+
+    #[test]
+    fn oversize_single_item_is_emitted_in_its_own_batch() {
+        let oversize = TRANSIT_TARGET_PLAINTEXT_BYTES + 1;
+        let batches = batch_inner_events(vec![oversize], identity_size);
+        assert_eq!(batches, vec![vec![oversize]]);
+    }
+
+    #[test]
+    fn oversize_first_item_does_not_swallow_following_items() {
+        let oversize = TRANSIT_TARGET_PLAINTEXT_BYTES + 1;
+        let batches = batch_inner_events(vec![oversize, 5], identity_size);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0], vec![oversize]);
+        assert_eq!(batches[1], vec![5]);
+    }
+
+    #[test]
+    fn each_item_above_half_cap_forces_one_item_per_batch() {
+        // Any pair sums to more than the cap, so the greedy packer must emit
+        // one batch per item without dropping or merging any.
+        let big = TRANSIT_TARGET_PLAINTEXT_BYTES / 2 + 1;
+        let batches = batch_inner_events(vec![big, big, big], identity_size);
+        assert_eq!(batches.len(), 3);
+        for batch in &batches {
+            assert_eq!(batch.len(), 1);
+            assert_eq!(batch[0], big);
+        }
+    }
+
+    #[test]
+    fn per_event_overhead_is_accounted_when_caller_includes_it() {
+        // Two items each at exactly half the cap fit by raw byte length, but
+        // adding PER_EVENT_PLAINTEXT_OVERHEAD per item pushes the pair over.
+        let half = TRANSIT_TARGET_PLAINTEXT_BYTES / 2;
+        let items = vec![half, half];
+        let batches =
+            batch_inner_events(items, |n| PER_EVENT_PLAINTEXT_OVERHEAD.saturating_add(*n));
+        assert_eq!(batches.len(), 2);
+    }
 }

@@ -75,8 +75,6 @@ struct SendReport {
     received_events: usize,
 }
 
-const TRANSIT_TARGET_PLAINTEXT_BYTES: usize = 32 * 1024 * 1024;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Work {
     SendConnectionRequest {
@@ -260,7 +258,9 @@ fn drain_and_wrap_transit_out_for_connection(
         return Ok(DrainedTransitOut::default());
     }
     let remote = schema::remote_endpoint(store, connection_id)?;
-    let batches = batch_transit_out_items(items);
+    let batches = transit::commands::batch_inner_events(items, |item| {
+        transit::commands::PER_EVENT_PLAINTEXT_OVERHEAD.saturating_add(item.event_bytes.len())
+    });
     let mut outgoing = Vec::with_capacity(batches.len());
     let mut sent_transit_out = Vec::with_capacity(batches.len());
     for batch in batches {
@@ -285,27 +285,6 @@ fn drain_and_wrap_transit_out_for_connection(
         outgoing,
         sent_transit_out,
     })
-}
-
-fn batch_transit_out_items(items: Vec<TransitOutItem>) -> Vec<Vec<TransitOutItem>> {
-    let mut batches: Vec<Vec<TransitOutItem>> = Vec::new();
-    let mut current = Vec::new();
-    let mut current_bytes = 0usize;
-    for item in items {
-        let item_bytes = 4usize.saturating_add(item.event_bytes.len());
-        if !current.is_empty()
-            && current_bytes.saturating_add(item_bytes) > TRANSIT_TARGET_PLAINTEXT_BYTES
-        {
-            batches.push(std::mem::take(&mut current));
-            current_bytes = 0;
-        }
-        current_bytes = current_bytes.saturating_add(item_bytes);
-        current.push(item);
-    }
-    if !current.is_empty() {
-        batches.push(current);
-    }
-    batches
 }
 
 pub(crate) fn remember_sent_rows(
