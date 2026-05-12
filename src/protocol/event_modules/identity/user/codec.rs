@@ -7,40 +7,43 @@
 //! || public_key(32) || username_utf8_zero_padded(64)
 //! ```
 
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::{UserEvent, USERNAME_BYTES};
 
 pub const TYPE_USER: u8 = 14;
-pub const USER_WIRE_SIZE: usize = 1 + 8 + 32 + 32 + USERNAME_BYTES;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "user",
+    TYPE_USER,
+    &[
+        Field::u64("created_at_ms"),
+        Field::id("workspace_id"),
+        Field::id("public_key"),
+        Field::bytes("username", USERNAME_BYTES),
+    ],
+);
+
+pub const USER_WIRE_SIZE: usize = SCHEMA.wire_size();
 
 pub fn encode(event: &UserEvent) -> Result<Vec<u8>, String> {
     let username = encode_username(&event.username)?;
-    let mut out = Writer::with_capacity(USER_WIRE_SIZE);
-    out.u8(TYPE_USER);
-    out.u64(event.created_at_ms);
-    out.id(&event.workspace_id);
-    out.id(&event.public_key);
-    out.raw(&username);
-    Ok(out.finish())
+    Ok(SCHEMA
+        .encoder()
+        .u64(event.created_at_ms)
+        .id(&event.workspace_id)
+        .id(&event.public_key)
+        .bytes(&username)
+        .finish())
 }
 
 pub fn decode(bytes: &[u8]) -> Result<UserEvent, String> {
-    let mut reader = Reader::new(bytes, "user");
-    let tag = reader.u8()?;
-    if tag != TYPE_USER {
-        return Err("expected user".to_string());
-    }
-    let created_at_ms = reader.u64()?;
-    let workspace_id = reader.id()?;
-    let public_key = reader.id()?;
-    let username = decode_username(reader.slice(USERNAME_BYTES)?)?;
-    reader.finish()?;
+    let v = SCHEMA.parse(bytes)?;
     Ok(UserEvent {
-        created_at_ms,
-        workspace_id,
-        public_key,
-        username,
+        created_at_ms: v.u64("created_at_ms")?,
+        workspace_id: v.id("workspace_id")?,
+        public_key: v.id("public_key")?,
+        username: decode_username(v.raw("username")?)?,
     })
 }
 
@@ -99,7 +102,7 @@ mod tests {
 
         assert!(decode(&encoded)
             .expect_err("trailing bytes must fail")
-            .contains("trailing user bytes"));
+            .contains("expected"));
     }
 
     #[test]

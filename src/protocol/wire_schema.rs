@@ -77,7 +77,14 @@ impl WireSchema {
 
     /// Verify the bytes look like an event of this schema and return a borrowed
     /// view that supports field-by-name access.
+    ///
+    /// Tag is checked first so callers can distinguish "wrong event type"
+    /// (different tag) from "malformed event of the expected type" (wrong
+    /// length) without parsing the rest of the bytes.
     pub fn parse<'a>(&'static self, bytes: &'a [u8]) -> Result<Parsed<'a>, String> {
+        if bytes.is_empty() || bytes[0] != self.tag {
+            return Err(format!("expected {}", self.label));
+        }
         let expected = self.wire_size();
         if bytes.len() != expected {
             return Err(format!(
@@ -85,12 +92,6 @@ impl WireSchema {
                 self.label,
                 expected,
                 bytes.len()
-            ));
-        }
-        if bytes[0] != self.tag {
-            return Err(format!(
-                "{}: tag mismatch (expected {}, got {})",
-                self.label, self.tag, bytes[0]
             ));
         }
         Ok(Parsed { schema: self, bytes })

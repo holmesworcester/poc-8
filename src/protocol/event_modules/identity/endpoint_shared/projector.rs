@@ -405,7 +405,7 @@ mod tests {
 
         assert_eq!(
             project_signed(&envelope, &event).expect_err("wrong payload must fail"),
-            "expected endpoint shared"
+            "expected endpoint_shared"
         );
     }
 }

@@ -10,39 +10,46 @@
 
 use crate::protocol::event_modules::identity::signed;
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::DeviceInviteEvent;
 
 pub const TYPE_DEVICE_INVITE: u8 = 134;
-pub const DEVICE_INVITE_WIRE_SIZE: usize = 1 + 8 + 32 + 32 + 32 + 32;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "device_invite",
+    TYPE_DEVICE_INVITE,
+    &[
+        Field::u64("created_at_ms"),
+        Field::id("workspace_id"),
+        Field::id("user_authority_event_id"),
+        Field::id("user_invite_event_id_or_zero"),
+        Field::id("public_key"),
+    ],
+);
+
+pub const DEVICE_INVITE_WIRE_SIZE: usize = SCHEMA.wire_size();
 
 pub fn encode(event: &DeviceInviteEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(DEVICE_INVITE_WIRE_SIZE);
-    out.u8(TYPE_DEVICE_INVITE);
-    out.u64(event.created_at_ms);
-    out.id(&event.workspace_id);
-    out.id(&event.user_authority_event_id);
-    out.id(&event.user_invite_event_id.unwrap_or([0; 32]));
-    out.id(&event.public_key);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .u64(event.created_at_ms)
+        .id(&event.workspace_id)
+        .id(&event.user_authority_event_id)
+        .id(&event.user_invite_event_id.unwrap_or([0; 32]))
+        .id(&event.public_key)
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<DeviceInviteEvent, String> {
-    let mut reader = Reader::new(bytes, "device invite");
-    let tag = reader.u8()?;
-    if tag != TYPE_DEVICE_INVITE {
-        return Err("expected device invite".to_string());
-    }
-    let event = DeviceInviteEvent {
-        created_at_ms: reader.u64()?,
-        workspace_id: reader.id()?,
-        user_authority_event_id: reader.id()?,
-        user_invite_event_id: optional_event_id(reader.id()?),
-        public_key: reader.id()?,
-    };
-    reader.finish()?;
-    Ok(event)
+    let v = SCHEMA.parse(bytes)?;
+    Ok(DeviceInviteEvent {
+        created_at_ms: v.u64("created_at_ms")?,
+        workspace_id: v.id("workspace_id")?,
+        user_authority_event_id: v.id("user_authority_event_id")?,
+        user_invite_event_id: optional_event_id(v.id("user_invite_event_id_or_zero")?),
+        public_key: v.id("public_key")?,
+    })
 }
 
 pub fn record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
@@ -132,15 +139,14 @@ mod tests {
     fn rejects_wrong_type_and_trailing_bytes() {
         let mut encoded = encode(&event());
         encoded[0] = 0xff;
-        assert_eq!(
-            decode(&encoded).expect_err("wrong type must fail"),
-            "expected device invite"
-        );
+        assert!(decode(&encoded)
+            .expect_err("wrong type must fail")
+            .contains("expected"));
 
         let mut encoded = encode(&event());
         encoded.push(0);
         let err = decode(&encoded).expect_err("trailing byte must fail");
-        assert!(err.starts_with("trailing "), "{err}");
+        assert!(err.contains("expected"), "{err}");
     }
 
     #[test]

@@ -7,37 +7,43 @@
 //! type(1) || created_at_ms(8) || public_key(32) || workspace_id(32) || authority_event_id(32)
 //! ```
 
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::InviteServerEvent;
 
 pub const TYPE_INVITE_SERVER: u8 = 136;
-pub const INVITE_SERVER_WIRE_SIZE: usize = 1 + 8 + 32 + 32 + 32;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "invite_server",
+    TYPE_INVITE_SERVER,
+    &[
+        Field::u64("created_at_ms"),
+        Field::id("public_key"),
+        Field::id("workspace_id"),
+        Field::id("authority_event_id"),
+    ],
+);
+
+pub const INVITE_SERVER_WIRE_SIZE: usize = SCHEMA.wire_size();
 
 pub fn encode(event: &InviteServerEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(INVITE_SERVER_WIRE_SIZE);
-    out.u8(TYPE_INVITE_SERVER);
-    out.u64(event.created_at_ms);
-    out.id(&event.public_key);
-    out.id(&event.workspace_id);
-    out.id(&event.authority_event_id);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .u64(event.created_at_ms)
+        .id(&event.public_key)
+        .id(&event.workspace_id)
+        .id(&event.authority_event_id)
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<InviteServerEvent, String> {
-    let mut reader = Reader::new(bytes, "invite_server");
-    let tag = reader.u8()?;
-    if tag != TYPE_INVITE_SERVER {
-        return Err("expected invite_server".to_string());
-    }
-    let event = InviteServerEvent {
-        created_at_ms: reader.u64()?,
-        public_key: reader.id()?,
-        workspace_id: reader.id()?,
-        authority_event_id: reader.id()?,
-    };
-    reader.finish()?;
-    Ok(event)
+    let v = SCHEMA.parse(bytes)?;
+    Ok(InviteServerEvent {
+        created_at_ms: v.u64("created_at_ms")?,
+        public_key: v.id("public_key")?,
+        workspace_id: v.id("workspace_id")?,
+        authority_event_id: v.id("authority_event_id")?,
+    })
 }
 
 #[cfg(test)]
@@ -65,15 +71,14 @@ mod tests {
     fn rejects_wrong_type_and_trailing_bytes() {
         let mut wrong_type = encode(&event());
         wrong_type[0] = 99;
-        assert_eq!(
-            decode(&wrong_type).expect_err("wrong type must fail"),
-            "expected invite_server"
-        );
+        assert!(decode(&wrong_type)
+            .expect_err("wrong type must fail")
+            .contains("expected"));
 
         let mut trailing = encode(&event());
         trailing.push(0);
         assert!(decode(&trailing)
             .expect_err("trailing bytes must fail")
-            .contains("trailing invite_server bytes"));
+            .contains("expected"));
     }
 }

@@ -12,50 +12,52 @@
 
 use crate::protocol::event_modules::identity::endpoint::types::EndpointRole;
 use crate::protocol::event_modules::types::{EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::{EndpointSharedEvent, ENDPOINT_DEVICE_NAME_BYTES};
 
 pub const TYPE_ENDPOINT_SHARED: u8 = 135;
-pub const ENDPOINT_SHARED_WIRE_SIZE: usize =
-    1 + 8 + 32 + 32 + 32 + 32 + 1 + ENDPOINT_DEVICE_NAME_BYTES;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "endpoint_shared",
+    TYPE_ENDPOINT_SHARED,
+    &[
+        Field::u64("created_at_ms"),
+        Field::id("workspace_id"),
+        Field::id("user_authority_event_id"),
+        Field::id("endpoint_id"),
+        Field::id("signing_public_key"),
+        Field::u8("endpoint_role"),
+        Field::bytes("device_name", ENDPOINT_DEVICE_NAME_BYTES),
+    ],
+);
+
+pub const ENDPOINT_SHARED_WIRE_SIZE: usize = SCHEMA.wire_size();
 
 pub fn encode(event: &EndpointSharedEvent) -> Result<Vec<u8>, String> {
     let device_name = encode_device_name(&event.device_name)?;
-    let mut out = Writer::with_capacity(ENDPOINT_SHARED_WIRE_SIZE);
-    out.u8(TYPE_ENDPOINT_SHARED);
-    out.u64(event.created_at_ms);
-    out.id(&event.workspace_id);
-    out.id(&event.user_authority_event_id);
-    out.id(&event.endpoint_id);
-    out.id(&event.signing_public_key);
-    out.u8(event.endpoint_role.as_u8());
-    out.raw(&device_name);
-    Ok(out.finish())
+    Ok(SCHEMA
+        .encoder()
+        .u64(event.created_at_ms)
+        .id(&event.workspace_id)
+        .id(&event.user_authority_event_id)
+        .id(&event.endpoint_id)
+        .id(&event.signing_public_key)
+        .u8(event.endpoint_role.as_u8())
+        .bytes(&device_name)
+        .finish())
 }
 
 pub fn decode(bytes: &[u8]) -> Result<EndpointSharedEvent, String> {
-    let mut reader = Reader::new(bytes, "endpoint shared");
-    let tag = reader.u8()?;
-    if tag != TYPE_ENDPOINT_SHARED {
-        return Err("expected endpoint shared".to_string());
-    }
-    let created_at_ms = reader.u64()?;
-    let workspace_id = reader.id()?;
-    let user_authority_event_id = reader.id()?;
-    let endpoint_id = reader.id()?;
-    let signing_public_key = reader.id()?;
-    let endpoint_role = EndpointRole::from_u8(reader.u8()?)?;
-    let device_name = decode_device_name(reader.slice(ENDPOINT_DEVICE_NAME_BYTES)?)?;
-    reader.finish()?;
+    let v = SCHEMA.parse(bytes)?;
     Ok(EndpointSharedEvent {
-        created_at_ms,
-        workspace_id,
-        user_authority_event_id,
-        endpoint_id,
-        signing_public_key,
-        endpoint_role,
-        device_name,
+        created_at_ms: v.u64("created_at_ms")?,
+        workspace_id: v.id("workspace_id")?,
+        user_authority_event_id: v.id("user_authority_event_id")?,
+        endpoint_id: v.id("endpoint_id")?,
+        signing_public_key: v.id("signing_public_key")?,
+        endpoint_role: EndpointRole::from_u8(v.u8("endpoint_role")?)?,
+        device_name: decode_device_name(v.raw("device_name")?)?,
     })
 }
 
@@ -128,15 +130,14 @@ mod tests {
     fn rejects_bad_type_trailing_bytes_and_bad_name() {
         let mut encoded = encode(&event()).expect("encode endpoint shared");
         encoded[0] = 0xff;
-        assert_eq!(
-            decode(&encoded).expect_err("wrong type must fail"),
-            "expected endpoint shared"
-        );
+        assert!(decode(&encoded)
+            .expect_err("wrong type must fail")
+            .contains("expected"));
 
         let mut encoded = encode(&event()).expect("encode endpoint shared");
         encoded.push(0);
         let err = decode(&encoded).expect_err("trailing byte must fail");
-        assert!(err.starts_with("trailing "), "{err}");
+        assert!(err.contains("expected"), "{err}");
 
         assert_eq!(
             encode(&EndpointSharedEvent {

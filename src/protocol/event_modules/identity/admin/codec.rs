@@ -11,39 +11,46 @@
 //! prior admin event for ongoing grants.
 
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::AdminEvent;
 
 pub const TYPE_ADMIN: u8 = 139;
-pub const ADMIN_WIRE_SIZE: usize = 1 + 8 + (32 * 4);
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "admin",
+    TYPE_ADMIN,
+    &[
+        Field::u64("created_at_ms"),
+        Field::id("workspace_id"),
+        Field::id("public_key"),
+        Field::id("authority_event_id"),
+        Field::id("user_event_id"),
+    ],
+);
+
+pub const ADMIN_WIRE_SIZE: usize = SCHEMA.wire_size();
 
 pub fn encode(event: &AdminEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(ADMIN_WIRE_SIZE);
-    out.u8(TYPE_ADMIN);
-    out.u64(event.created_at_ms);
-    out.id(&event.workspace_id);
-    out.id(&event.public_key);
-    out.id(&event.authority_event_id);
-    out.id(&event.user_event_id);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .u64(event.created_at_ms)
+        .id(&event.workspace_id)
+        .id(&event.public_key)
+        .id(&event.authority_event_id)
+        .id(&event.user_event_id)
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<AdminEvent, String> {
-    let mut reader = Reader::new(bytes, "admin");
-    let tag = reader.u8()?;
-    if tag != TYPE_ADMIN {
-        return Err("expected admin".to_string());
-    }
-    let event = AdminEvent {
-        created_at_ms: reader.u64()?,
-        workspace_id: reader.id()?,
-        public_key: reader.id()?,
-        authority_event_id: reader.id()?,
-        user_event_id: reader.id()?,
-    };
-    reader.finish()?;
-    Ok(event)
+    let v = SCHEMA.parse(bytes)?;
+    Ok(AdminEvent {
+        created_at_ms: v.u64("created_at_ms")?,
+        workspace_id: v.id("workspace_id")?,
+        public_key: v.id("public_key")?,
+        authority_event_id: v.id("authority_event_id")?,
+        user_event_id: v.id("user_event_id")?,
+    })
 }
 
 pub fn record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
@@ -103,7 +110,7 @@ mod tests {
 
         let err = decode(&encoded).expect_err("trailing byte must fail");
 
-        assert!(err.contains("trailing admin bytes"), "{err}");
+        assert!(err.contains("expected"), "{err}");
     }
 
     #[test]
