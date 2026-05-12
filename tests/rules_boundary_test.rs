@@ -2061,12 +2061,6 @@ fn event_records_are_constructed_only_by_codecs() {
         if is_codec {
             continue;
         }
-        let is_schema_preview = path
-            .file_name()
-            .is_some_and(|name| name == "wire_schema_preview.rs");
-        if is_schema_preview {
-            continue;
-        }
         let text = source_text(&path);
         if text.lines().any(|line| {
             let line = line.trim_start();
