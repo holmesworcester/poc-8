@@ -1971,7 +1971,7 @@ fn gc_subsumed_tombstones(
     .collect();
     // Collect message-tombstone keys whose authored_minute is subsumed.
     let message_keys_to_delete: Vec<Vec<u8>> =
-        crate::protocol::event_modules::content::message::schema::list_message_tombstones_for_workspace(
+        crate::protocol::event_modules::content::message::queries::list_message_tombstones_for_workspace(
             store,
             workspace_id,
         )?

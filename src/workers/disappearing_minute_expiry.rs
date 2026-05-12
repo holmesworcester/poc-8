@@ -20,6 +20,7 @@
 use crate::core::daemon::{StepContext, Worker};
 use crate::core::logical_clock;
 use crate::core::store::Store;
+use crate::protocol::event_modules::content::message::queries as message_queries;
 use crate::protocol::event_modules::content::message::schema as message_schema;
 use crate::protocol::event_modules::content::message::types::{
     message_event_id_in_minute, UNIX_MINUTE_MS,
@@ -203,7 +204,7 @@ fn process_job<R: EventRegistry>(
     // row so `content_purge` will cascade to reactions/files/slices on
     // its next tick (see `content_purge::purge_reaction_for_deleted_message`
     // and friends, which gate purges on
-    // `message::schema::message_tombstone_exists`), and purge the
+    // `message::queries::message_tombstone_exists`), and purge the
     // message's canonical bytes — all in one transaction.
     let messages_deleted = store
         .write_transaction(|tx_store| {
@@ -254,7 +255,7 @@ fn sealed_messages_for_workspace(
     store: &Store,
     workspace_id: EventId,
 ) -> Result<Vec<message_schema::SealedMessageRow>, String> {
-    Ok(message_schema::list_sealed(store, usize::MAX)?
+    Ok(message_queries::list_sealed(store, usize::MAX)?
         .into_iter()
         .filter(|row| row.workspace_id == workspace_id)
         .collect())

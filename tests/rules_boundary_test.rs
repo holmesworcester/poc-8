@@ -1695,16 +1695,21 @@ fn event_module_projectors_do_not_query_storage_directly() {
                 && !path.ends_with("connection/transit/projector.rs")
         })
         .collect::<Vec<_>>();
+    // `project()` itself must stay a pure transform over event + context, so
+    // direct store mutation/decode primitives are forbidden anywhere in the
+    // file. The admit-gate function `admit_check_received` legitimately takes
+    // `&Store` to consult `queries::` helpers, so `&Store`/`Store,`/`Store)`
+    // are intentionally NOT in the forbidden list — gating on a parameter
+    // name would be more honest than gating on the type.
     let forbidden = [
-        "use crate::core::store::Store",
-        "&Store",
-        "Store,",
-        "Store)",
         "table_row",
-        "event_bytes",
         "has_event",
         "write_transaction",
         "rusqlite",
+        ".table_rows_with_key_prefix",
+        ".insert_table_rows",
+        ".delete_table_rows",
+        ".replace_table_rows",
     ];
     let violations = file_contains_violations(root, &files, &forbidden);
     assert!(

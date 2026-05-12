@@ -532,7 +532,7 @@ fn run_keys_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
         workspace_id,
     )?;
     let message_tombstones =
-        crate::protocol::event_modules::content::message::schema::list_message_tombstones_for_workspace(
+        crate::protocol::event_modules::content::message::queries::list_message_tombstones_for_workspace(
             &context.store,
             workspace_id,
         )?;
@@ -813,10 +813,10 @@ fn run_disappearing_status_command(
     // Live messages = opened (`MESSAGES`) + still-sealed
     // (`SEALED_MESSAGES`). The CLI `messages` listing folds these two
     // together, so this matches what an operator sees.
-    let live_messages = message_schema::count_for_workspace(&context.store, workspace_id)?
-        + message_schema::count_sealed_for_workspace(&context.store, workspace_id)?;
+    let live_messages = message_queries::count_for_workspace(&context.store, workspace_id)?
+        + message_queries::count_sealed_for_workspace(&context.store, workspace_id)?;
     let message_tombstones =
-        message_schema::list_message_tombstones_for_workspace(&context.store, workspace_id)?
+        message_queries::list_message_tombstones_for_workspace(&context.store, workspace_id)?
             .len();
     let leaf_tombstones = local_history_node_secret::queries::list_tombstones_for_workspace(
         &context.store,
@@ -888,13 +888,13 @@ fn run_disappearing_tighten_command(
     // command directly. We sum opened + still-sealed rows because the
     // sealed projection is what receivers see before key derivation.
     let mut messages_below_floor: usize = 0;
-    for row in message_schema::list_for_workspace(&context.store, workspace_id)? {
+    for row in message_queries::list_for_workspace(&context.store, workspace_id)? {
         let authored_minute = row.created_at_ms / UNIX_MINUTE_MS;
         if authored_minute < target_floor {
             messages_below_floor += 1;
         }
     }
-    for row in message_schema::list_sealed_for_workspace(&context.store, workspace_id)? {
+    for row in message_queries::list_sealed_for_workspace(&context.store, workspace_id)? {
         let authored_minute = row.created_at_ms / UNIX_MINUTE_MS;
         if authored_minute < target_floor {
             messages_below_floor += 1;

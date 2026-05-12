@@ -232,7 +232,7 @@ fn purge_reaction_for_deleted_message(
 ) -> Result<(), String> {
     let envelope = reaction::codec::decode_signed(bytes)?;
     let event = reaction::codec::decode(&envelope.payload)?;
-    if !message::schema::message_tombstone_exists(
+    if !message::queries::message_tombstone_exists(
         store,
         event.workspace_id,
         event.target_message_id,
@@ -277,7 +277,7 @@ fn purge_file_for_deleted_message_or_file_deletion(
     let envelope = file::codec::decode_signed(bytes)?;
     let event = file::codec::decode(&envelope.payload)?;
     let parent_deleted =
-        message::schema::message_tombstone_exists(store, event.workspace_id, event.message_id)?;
+        message::queries::message_tombstone_exists(store, event.workspace_id, event.message_id)?;
     let file_self_deleted = has_file_deletion_label(store, &file_event_id, &event.author_user_id)?;
     if !parent_deleted && !file_self_deleted {
         return Ok(());
@@ -359,7 +359,7 @@ fn purge_file_slice_for_deleted_file(
         };
         let descriptor_envelope = file::codec::decode_signed(&descriptor_bytes)?;
         let descriptor = file::codec::decode(&descriptor_envelope.payload)?;
-        message::schema::message_tombstone_exists(
+        message::queries::message_tombstone_exists(
             store,
             descriptor.workspace_id,
             descriptor.message_id,
@@ -540,11 +540,11 @@ mod tests {
             .expect("reaction bytes")
             .is_none());
         assert!(
-            message::schema::message_tombstone_exists(&store, WORKSPACE, message_id)
+            message::queries::message_tombstone_exists(&store, WORKSPACE, message_id)
                 .expect("tombstone")
         );
         assert!(
-            message::schema::message_by_id(&store, WORKSPACE, message_id)
+            message::queries::message_by_id(&store, WORKSPACE, message_id)
                 .expect("message row")
                 .is_none()
         );
@@ -578,7 +578,7 @@ mod tests {
             .expect("message bytes")
             .is_some());
         assert!(
-            !message::schema::message_tombstone_exists(&store, WORKSPACE, message_id)
+            !message::queries::message_tombstone_exists(&store, WORKSPACE, message_id)
                 .expect("tombstone")
         );
     }

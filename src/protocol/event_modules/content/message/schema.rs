@@ -4,16 +4,18 @@
 //! messages in one workspace with a bounded prefix scan. Author and signer ids
 //! are stored alongside the text so display queries can join with users without
 //! re-decoding canonical bytes.
+//!
+//! Reads (lookups, scans, tombstone-existence queries) live in
+//! `queries.rs`. The receive-side admit gate lives in `projector.rs`.
 
-use crate::core::store::{Schema, Store, TableName, TableRow};
+use crate::core::store::{Schema, TableName, TableRow};
 use crate::protocol::event_modules::types::EventId;
-use crate::protocol::event_modules::worker::AdmitDecision;
 use crate::protocol::wire::{Reader, Writer};
 
 use super::codec;
 use super::types::{
-    unix_minute_for, MessageCiphertext, MessageEvent, MessagePlaintext, MessageRow,
-    EXPIRES_NEVER, MESSAGE_CIPHERTEXT_BYTES, MESSAGE_TEXT_BYTES, UNIX_MINUTE_MS,
+    MessageCiphertext, MessageEvent, MessagePlaintext, MessageRow, MESSAGE_CIPHERTEXT_BYTES,
+    MESSAGE_TEXT_BYTES,
 };
 
 pub const MESSAGES: TableName = TableName::new("content.messages");
@@ -119,81 +121,6 @@ pub fn decode_sealed_message_row(key: &[u8], value: &[u8]) -> Result<SealedMessa
     })
 }
 
-pub fn list_sealed(store: &Store, limit: usize) -> Result<Vec<SealedMessageRow>, String> {
-    store
-        .table_rows_with_key_prefix(SEALED_MESSAGES, &[], limit)
-        .map_err(|err| format!("load sealed messages: {err}"))?
-        .into_iter()
-        .map(|(key, value)| decode_sealed_message_row(&key, &value))
-        .collect()
-}
-
-/// Count sealed message rows scoped to one workspace. Sealed rows are
-/// the receive-side projection; opening one to a `MessageRow` requires
-/// the matching local key material. The CLI's `messages` listing folds
-/// sealed + opened rows together, so callers building a "live message"
-/// status display should sum this count with `count_for_workspace` to
-/// get the same total.
-pub fn count_sealed_for_workspace(
-    store: &Store,
-    workspace_id: EventId,
-) -> Result<usize, String> {
-    store
-        .table_rows_with_key_prefix(SEALED_MESSAGES, &workspace_id, usize::MAX)
-        .map(|rows| rows.len())
-        .map_err(|err| format!("count sealed messages: {err}"))
-}
-
-/// Iterate sealed-message rows within one workspace. Surfaces the
-/// per-row `created_at_ms` so a status view can count rows whose
-/// authored minute falls below a deletion floor.
-pub fn list_sealed_for_workspace(
-    store: &Store,
-    workspace_id: EventId,
-) -> Result<Vec<SealedMessageRow>, String> {
-    store
-        .table_rows_with_key_prefix(SEALED_MESSAGES, &workspace_id, usize::MAX)
-        .map_err(|err| format!("load sealed messages: {err}"))?
-        .into_iter()
-        .map(|(key, value)| decode_sealed_message_row(&key, &value))
-        .collect()
-}
-
-/// Receive-side admission gate for signed message events.
-///
-/// Runs in the common pipeline's `drain_canonical_in` step before storage,
-/// so message bytes whose id is already tombstoned (a previous TTL expiry or
-/// author deletion has fired) never re-enter `EVENTS` or the in-memory
-/// admitted-event index. If the message's stamped `expires_at_minute` is
-/// past the local logical clock, the gate writes a tombstone row directly
-/// and drops the bytes; this catches re-deliveries after a previous local
-/// expiry, and replaces the projector's old `is_expired_at_receive` branch
-/// (which fired too late, after the bytes were already stored).
-pub fn admit_check_received(store: &Store, bytes: &[u8]) -> Result<AdmitDecision, String> {
-    let envelope = codec::decode_signed(bytes)?;
-    let event = codec::decode(&envelope.payload)?;
-    let event_id = crate::protocol::event_modules::types::event_id(bytes);
-    if message_tombstone_exists(store, event.workspace_id, event_id)? {
-        return Ok(AdmitDecision::Drop);
-    }
-    if event.expires_at_minute == EXPIRES_NEVER {
-        return Ok(AdmitDecision::Admit);
-    }
-    let Some(now_ms) = crate::core::logical_clock::logical_time(store)? else {
-        return Ok(AdmitDecision::Admit);
-    };
-    if event.expires_at_minute >= now_ms / UNIX_MINUTE_MS {
-        return Ok(AdmitDecision::Admit);
-    }
-    let row = message_tombstone_row(
-        event.workspace_id,
-        event_id,
-        event.author_user_id,
-        unix_minute_for(event.created_at_ms),
-    );
-    Ok(AdmitDecision::WriteRowsAndDrop(vec![row]))
-}
-
 pub fn message_tombstone_row(
     workspace_id: EventId,
     message_id: EventId,
@@ -208,18 +135,6 @@ pub fn message_tombstone_row(
         key: message_key(workspace_id, message_id),
         value,
     }
-}
-
-pub fn message_tombstone_exists(
-    store: &Store,
-    workspace_id: EventId,
-    message_id: EventId,
-) -> Result<bool, String> {
-    let key = message_key(workspace_id, message_id);
-    store
-        .table_row(MESSAGE_TOMBSTONES, &key)
-        .map(|row| row.is_some())
-        .map_err(|err| format!("load message tombstone: {err}"))
 }
 
 /// Decoded view of a `MESSAGE_TOMBSTONES` row.
@@ -266,18 +181,6 @@ pub fn decode_message_tombstone_row(
     })
 }
 
-pub fn list_message_tombstones_for_workspace(
-    store: &Store,
-    workspace_id: EventId,
-) -> Result<Vec<MessageTombstoneRow>, String> {
-    store
-        .table_rows_with_key_prefix(MESSAGE_TOMBSTONES, &workspace_id, usize::MAX)
-        .map_err(|err| format!("load message tombstones: {err}"))?
-        .into_iter()
-        .map(|(key, value)| decode_message_tombstone_row(&key, &value))
-        .collect()
-}
-
 pub fn decode_message_row(key: &[u8], value: &[u8]) -> Result<MessageRow, String> {
     if key.len() != 64 {
         return Err("message row key is malformed".to_string());
@@ -302,41 +205,6 @@ pub fn decode_message_row(key: &[u8], value: &[u8]) -> Result<MessageRow, String
         signer_endpoint_shared_id,
         text,
     })
-}
-
-pub fn list_for_workspace(store: &Store, workspace_id: EventId) -> Result<Vec<MessageRow>, String> {
-    let mut rows = store
-        .table_rows_with_key_prefix(MESSAGES, &workspace_id, usize::MAX)
-        .map_err(|err| format!("load messages: {err}"))?
-        .into_iter()
-        .map(|(key, value)| decode_message_row(&key, &value))
-        .collect::<Result<Vec<_>, _>>()?;
-    rows.sort_by(|a, b| {
-        a.created_at_ms
-            .cmp(&b.created_at_ms)
-            .then_with(|| a.message_id.cmp(&b.message_id))
-    });
-    Ok(rows)
-}
-
-pub fn count_for_workspace(store: &Store, workspace_id: EventId) -> Result<usize, String> {
-    store
-        .table_rows_with_key_prefix(MESSAGES, &workspace_id, usize::MAX)
-        .map(|rows| rows.len())
-        .map_err(|err| format!("count messages: {err}"))
-}
-
-pub fn message_by_id(
-    store: &Store,
-    workspace_id: EventId,
-    message_id: EventId,
-) -> Result<Option<MessageRow>, String> {
-    let key = message_key(workspace_id, message_id);
-    store
-        .table_row(MESSAGES, &key)
-        .map_err(|err| format!("load message: {err}"))?
-        .map(|value| decode_message_row(&key, &value))
-        .transpose()
 }
 
 fn encode_value(
@@ -373,136 +241,4 @@ fn encode_sealed_value(signer_endpoint_shared_id: EventId, event: &MessageEvent)
     out.raw(&event.nonce);
     out.raw(&event.ciphertext);
     out.finish()
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::core::logical_clock;
-    use crate::protocol::event_modules::types::event_id;
-    use crate::protocol::Protocol;
-
-    use super::*;
-
-    /// Build a signed message canonical record. The bytes are *not* admitted
-    /// to EVENTS — the gate runs before storage, so the tests assert the
-    /// gate's decision against bytes alone.
-    fn signed_message_bytes(
-        workspace_id: [u8; 32],
-        author_user_id: [u8; 32],
-        created_at_ms: u64,
-        expires_at_minute: u64,
-    ) -> Vec<u8> {
-        let inner = MessageEvent {
-            workspace_id,
-            created_at_ms,
-            author_user_id,
-            removal_frontier_id: [30; 32],
-            local_history_node_secret_id: [40; 32],
-            expires_at_minute,
-            disappearing_setting_id: workspace_id,
-            nonce: [0; 24],
-            ciphertext: [0; MESSAGE_CIPHERTEXT_BYTES],
-        };
-        let payload = codec::encode(&inner);
-        let envelope = codec::sign([8; 32], &[7; 32], payload);
-        codec::encode_signed(&envelope)
-    }
-
-    #[test]
-    fn admit_passes_message_with_no_tombstone_and_no_clock() {
-        let store = Protocol::open_memory_store().expect("store");
-        let bytes = signed_message_bytes([1; 32], [2; 32], 0, EXPIRES_NEVER);
-        let decision = admit_check_received(&store, &bytes).expect("admit");
-        assert_eq!(decision, AdmitDecision::Admit);
-    }
-
-    #[test]
-    fn admit_drops_message_with_existing_tombstone_silently() {
-        let store = Protocol::open_memory_store().expect("store");
-        let workspace_id = [7; 32];
-        let author_user_id = [3; 32];
-        let bytes = signed_message_bytes(workspace_id, author_user_id, 0, EXPIRES_NEVER);
-        let id = event_id(&bytes);
-
-        // Pre-write the tombstone exactly as the disappearing-minute worker
-        // or content_purge worker would.
-        store
-            .insert_table_rows(vec![message_tombstone_row(workspace_id, id, author_user_id, 0)])
-            .expect("insert tombstone");
-
-        let decision = admit_check_received(&store, &bytes).expect("admit");
-        assert_eq!(decision, AdmitDecision::Drop);
-
-        // EVENTS must remain unchanged: the canonical bytes were not
-        // inserted by the gate, and no projector ran.
-        assert!(
-            crate::protocol::event_modules::schema::event_bytes(&store, &id)
-                .expect("event bytes")
-                .is_none(),
-            "EVENTS must stay empty when the gate drops"
-        );
-        // The pre-existing tombstone must still be the only one.
-        let tombstones =
-            list_message_tombstones_for_workspace(&store, workspace_id).expect("list");
-        assert_eq!(tombstones.len(), 1);
-    }
-
-    #[test]
-    fn admit_drops_expired_at_receive_message_at_admission() {
-        let store = Protocol::open_memory_store().expect("store");
-        let workspace_id = [9; 32];
-        let author_user_id = [4; 32];
-        let created_at_ms = 100 * UNIX_MINUTE_MS;
-        let bytes = signed_message_bytes(workspace_id, author_user_id, created_at_ms, 101);
-        let id = event_id(&bytes);
-
-        // Pin the local clock past the message's stamped expiry.
-        logical_clock::set_logical_time(&store, 102 * UNIX_MINUTE_MS).expect("set clock");
-
-        let decision = admit_check_received(&store, &bytes).expect("admit");
-        let rows = match decision {
-            AdmitDecision::WriteRowsAndDrop(rows) => rows,
-            other => panic!("expected WriteRowsAndDrop, got {other:?}"),
-        };
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].table, MESSAGE_TOMBSTONES);
-
-        // Apply the gate's row writes (drain_canonical_in does this in the
-        // same transaction). After the gate's tombstone is in place, the
-        // EVENTS row must still be absent.
-        store.insert_table_rows(rows).expect("insert tombstone");
-        assert!(
-            crate::protocol::event_modules::schema::event_bytes(&store, &id)
-                .expect("event bytes")
-                .is_none(),
-            "EVENTS must stay empty when the gate drops"
-        );
-        // A subsequent admit attempt now hits the existing-tombstone branch.
-        let again = admit_check_received(&store, &bytes).expect("admit again");
-        assert_eq!(again, AdmitDecision::Drop);
-    }
-
-    #[test]
-    fn admit_passes_finite_expiry_message_when_clock_is_before_expiry() {
-        let store = Protocol::open_memory_store().expect("store");
-        let workspace_id = [11; 32];
-        let author_user_id = [5; 32];
-        let created_at_ms = 100 * UNIX_MINUTE_MS;
-        // Stamped expiry = 105; clock = 102 -> not expired yet.
-        let bytes = signed_message_bytes(workspace_id, author_user_id, created_at_ms, 105);
-        logical_clock::set_logical_time(&store, 102 * UNIX_MINUTE_MS).expect("set clock");
-        let decision = admit_check_received(&store, &bytes).expect("admit");
-        assert_eq!(decision, AdmitDecision::Admit);
-    }
-
-    #[test]
-    fn admit_passes_never_expire_message_at_any_clock() {
-        let store = Protocol::open_memory_store().expect("store");
-        let workspace_id = [13; 32];
-        let author_user_id = [6; 32];
-        let bytes = signed_message_bytes(workspace_id, author_user_id, 0, EXPIRES_NEVER);
-        logical_clock::set_logical_time(&store, u64::MAX - 1).expect("set clock");
-        let decision = admit_check_received(&store, &bytes).expect("admit");
-        assert_eq!(decision, AdmitDecision::Admit);
-    }
 }
