@@ -56,4 +56,19 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn project_rejects_invite_secret_when_hash_does_not_match_secret() {
+        let event = InviteSecretEvent {
+            bootstrap_hash: [9; 32],
+            bootstrap_secret: [7; 32],
+            addr: None,
+            workspace_id: None,
+            invite_event_id: None,
+        };
+
+        let err = project(&codec::encode(&event)).expect_err("mismatched hash must fail");
+
+        assert_eq!(err, "invite secret hash does not match secret");
+    }
 }

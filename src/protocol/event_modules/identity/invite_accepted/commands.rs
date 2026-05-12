@@ -1,22 +1,23 @@
 //! Commands for accepting an identity invite locally.
 //!
-//! This helper is the only accept-side constructor for scoped invite bootstrap
+//! This helper is the only accept-side constructor for scoped invite acceptance
 //! state. It creates two local canonical events together:
 //!
-//! - `invite_secret`: the raw secret material needed to decrypt invite-key
-//!   transit for the named workspace/invite.
+//! - `invite_secret`: the raw secret material learned from the invite link for
+//!   the named workspace/invite.
 //! - `invite_accepted`: the replayable provenance fact that this endpoint
 //!   accepted that scoped invite secret.
 //!
 //! The command does not validate the shared invite event, create users/devices,
-//! open sockets, or admit remote ancestry. Callers still send shared join facts
-//! through invite-key transit and validate the received shared invite row before
-//! admitting membership locally.
+//! open sockets, or admit remote ancestry. Callers admit local proposed join
+//! facts separately; missing remote ancestry converges later through ordinary
+//! connection sync.
 
 use crate::core::crypto::Ed25519PrivateKey;
 use crate::protocol::event_modules::identity::{endpoint::types::EndpointId, invite};
 use crate::protocol::event_modules::types::{event_id, EventId};
 use crate::protocol::event_modules::worker::CommandOutput;
+use std::net::SocketAddr;
 
 use super::{codec, types::InviteAcceptedEvent};
 
@@ -24,6 +25,7 @@ use super::{codec, types::InviteAcceptedEvent};
 pub struct AcceptInvite {
     pub accepted_endpoint_id: EndpointId,
     pub bootstrap_secret: Ed25519PrivateKey,
+    pub addr: SocketAddr,
     pub workspace_id: EventId,
     pub invite_event_id: EventId,
 }
@@ -40,10 +42,11 @@ pub fn accept(input: AcceptInvite) -> Result<CommandOutput<AcceptInviteOutput>, 
     validate_id("workspace_id", &input.workspace_id)?;
     validate_id("invite_event_id", &input.invite_event_id)?;
 
-    let secret = invite::types::InviteSecretEvent::scoped(
+    let secret = invite::types::InviteSecretEvent::scoped_with_addr(
         input.bootstrap_secret,
         input.workspace_id,
         input.invite_event_id,
+        input.addr,
     );
     let secret_bytes = invite::codec::encode(&secret);
     let invite_secret_event_id = event_id(&secret_bytes);
@@ -90,6 +93,7 @@ mod tests {
         let output = accept(AcceptInvite {
             accepted_endpoint_id: [5; 32],
             bootstrap_secret: [7; 32],
+            addr: "127.0.0.1:41000".parse().expect("addr"),
             workspace_id: [1; 32],
             invite_event_id: [2; 32],
         })
@@ -113,6 +117,7 @@ mod tests {
             .expect("decode secret");
         assert_eq!(secret.workspace_id, Some([1; 32]));
         assert_eq!(secret.invite_event_id, Some([2; 32]));
+        assert_eq!(secret.addr, Some("127.0.0.1:41000".parse().expect("addr")));
 
         let accepted =
             codec::decode(&output.events[1].record().canonical_bytes).expect("decode accepted");
@@ -128,6 +133,7 @@ mod tests {
         let err = accept(AcceptInvite {
             accepted_endpoint_id: [0; 32],
             bootstrap_secret: [7; 32],
+            addr: "127.0.0.1:41000".parse().expect("addr"),
             workspace_id: [1; 32],
             invite_event_id: [2; 32],
         })

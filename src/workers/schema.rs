@@ -17,6 +17,9 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 
 use crate::core::store::{Schema, Store, TableName, TableRow};
+pub use crate::protocol::event_modules::connection::transit::projector::{
+    TransitEventType, TransitProvenance,
+};
 use crate::protocol::event_modules::connection::types::ConnectionId;
 use crate::protocol::event_modules::types::{
     EventId, EventIndexEntry, EventRecord, ReceiveAuthorization, ReceiveMetadata,
@@ -65,34 +68,6 @@ pub struct CanonicalIn {
 }
 
 pub(crate) type DecodedCanonicalIn = (Vec<u8>, Option<ReceiveMetadata>, Option<TransitProvenance>);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TransitProvenance {
-    /// Socket address that delivered the outer frame.
-    pub origin: SocketAddr,
-    /// Local endpoint key used to unwrap the frame.
-    pub local_endpoint: EventId,
-    /// Remote endpoint proven by the outer frame.
-    pub sender_endpoint: EventId,
-    /// Whether projection may remember `origin` as a usable route.
-    pub remember_route: bool,
-    /// Which transit envelope type produced the inner canonical bytes.
-    pub unwrapped_with: TransitUnwrap,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransitUnwrap {
-    /// Bootstrap envelope addressed directly to the local endpoint key.
-    Bootstrap,
-    /// Invite-secret envelope scoped to one workspace invite.
-    InviteBootstrap {
-        bootstrap_hash: EventId,
-        workspace_id: EventId,
-        invite_event_id: EventId,
-    },
-    /// Established connection envelope addressed through a connection id.
-    Connection { connection_id: ConnectionId },
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecentlyValidEvent {
@@ -425,25 +400,19 @@ fn encode_transit_provenance(writer: &mut Writer, provenance: Option<TransitProv
         return;
     };
     writer.u8(1);
-    writer.sized_bytes(provenance.origin.to_string().as_bytes());
-    writer.id(&provenance.local_endpoint);
-    writer.id(&provenance.sender_endpoint);
-    writer.u8(u8::from(provenance.remember_route));
-    match provenance.unwrapped_with {
-        TransitUnwrap::Bootstrap => writer.u8(0),
-        TransitUnwrap::Connection { connection_id } => {
+    writer.sized_bytes(provenance.origin().to_string().as_bytes());
+    writer.id(&provenance.local_endpoint());
+    writer.id(&provenance.sender_endpoint());
+    writer.u8(u8::from(provenance.remember_route()));
+    match provenance.event_type() {
+        TransitEventType::Bootstrap => writer.u8(0),
+        TransitEventType::Connection { connection_id } => {
             writer.u8(1);
             writer.id(&connection_id);
         }
-        TransitUnwrap::InviteBootstrap {
-            bootstrap_hash,
-            workspace_id,
-            invite_event_id,
-        } => {
-            writer.u8(2);
-            writer.id(&bootstrap_hash);
-            writer.id(&workspace_id);
-            writer.id(&invite_event_id);
+        TransitEventType::ConnectionHandshake { request_id } => {
+            writer.u8(3);
+            writer.id(&request_id);
         }
     }
 }
@@ -469,25 +438,23 @@ fn decode_transit_provenance(reader: &mut Reader<'_>) -> Result<Option<TransitPr
                     ))
                 }
             };
-            let unwrapped_with = match reader.u8()? {
-                0 => TransitUnwrap::Bootstrap,
-                1 => TransitUnwrap::Connection {
+            let event_type = match reader.u8()? {
+                0 => TransitEventType::Bootstrap,
+                1 => TransitEventType::Connection {
                     connection_id: reader.id()?,
                 },
-                2 => TransitUnwrap::InviteBootstrap {
-                    bootstrap_hash: reader.id()?,
-                    workspace_id: reader.id()?,
-                    invite_event_id: reader.id()?,
+                3 => TransitEventType::ConnectionHandshake {
+                    request_id: reader.id()?,
                 },
                 other => return Err(format!("unknown canonical in transit unwrap tag {other}")),
             };
-            Ok(Some(TransitProvenance {
+            Ok(Some(TransitProvenance::with_event_type(
                 origin,
                 local_endpoint,
                 sender_endpoint,
                 remember_route,
-                unwrapped_with,
-            }))
+                event_type,
+            )))
         }
         other => Err(format!(
             "unknown canonical in transit provenance flag {other}"

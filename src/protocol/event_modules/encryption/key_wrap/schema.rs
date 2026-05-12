@@ -4,18 +4,20 @@
 //! recipient_key_id`, making "can this recipient open this frontier?" an exact
 //! lookup. `KEY_SECRET_COMMITMENTS` records the local key-secret id committed by
 //! a frontier so command-side wrap construction cannot substitute different
-//! secret bytes. This file defines rows and row queries only; derivation and
-//! scheduling belong to workers.
+//! secret bytes. `PENDING_KEY_UNWRAPS` is the projected worker queue: the
+//! projector writes it when a valid shared wrap appears, and the encryption
+//! worker drains it to create the local-only key-secret event.
 
 use crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES;
 use crate::core::store::{Schema, Store, TableName, TableRow};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::wire::{Reader, Writer};
 
-use super::types::{KeyWrapEvent, KeyWrapRow, KEY_WRAP_CIPHERTEXT_BYTES};
+use super::types::{KeyWrapEvent, KeyWrapRow, PendingKeyUnwrapRow, KEY_WRAP_CIPHERTEXT_BYTES};
 
 pub const KEY_WRAPS: TableName = TableName::new("encryption.key_wraps");
 pub const KEY_SECRET_COMMITMENTS: TableName = TableName::new("encryption.key_secret_commitments");
+pub const PENDING_KEY_UNWRAPS: TableName = TableName::new("encryption.pending_key_unwraps");
 
 pub const SCHEMAS: &[Schema] = &[
     Schema::durable_row_table("encryption.key_wraps.v1", KEY_WRAPS),
@@ -23,6 +25,7 @@ pub const SCHEMAS: &[Schema] = &[
         "encryption.key_secret_commitments.v1",
         KEY_SECRET_COMMITMENTS,
     ),
+    Schema::durable_row_table("encryption.pending_key_unwraps.v1", PENDING_KEY_UNWRAPS),
 ];
 
 pub fn key_wrap_row(
@@ -52,6 +55,18 @@ pub fn key_secret_commitment_row(event: &KeyWrapEvent) -> TableRow {
         table: KEY_SECRET_COMMITMENTS,
         key: key_secret_commitment_key(event.workspace_id, event.removal_frontier_id),
         value: event.local_key_secret_id.to_vec(),
+    }
+}
+
+pub fn pending_key_unwrap_row(key_wrap_id: EventId, event: &KeyWrapEvent) -> TableRow {
+    TableRow {
+        table: PENDING_KEY_UNWRAPS,
+        key: key_wrap_key(
+            event.workspace_id,
+            event.removal_frontier_id,
+            event.recipient_key_id,
+        ),
+        value: key_wrap_id.to_vec(),
     }
 }
 
@@ -90,6 +105,38 @@ pub fn list_for_workspace(store: &Store, workspace_id: EventId) -> Result<Vec<Ke
         .into_iter()
         .map(|(key, value)| decode_key_wrap_row(&key, &value))
         .collect()
+}
+
+pub fn list_pending_unwraps(
+    store: &Store,
+    limit: usize,
+) -> Result<Vec<PendingKeyUnwrapRow>, String> {
+    store
+        .table_rows_with_key_prefix(PENDING_KEY_UNWRAPS, &[], limit)
+        .map_err(|err| format!("load pending key unwraps: {err}"))?
+        .into_iter()
+        .map(|(key, value)| decode_pending_key_unwrap_row(key, &value))
+        .collect()
+}
+
+pub fn key_wrap_for_pending(
+    store: &Store,
+    pending: &PendingKeyUnwrapRow,
+) -> Result<Option<KeyWrapRow>, String> {
+    store
+        .table_row(KEY_WRAPS, &pending.key)
+        .map_err(|err| format!("load pending key wrap: {err}"))?
+        .map(|value| decode_key_wrap_row(&pending.key, &value))
+        .transpose()
+}
+
+pub fn delete_pending_unwraps(store: &Store, pending_keys: Vec<Vec<u8>>) -> Result<usize, String> {
+    if pending_keys.is_empty() {
+        return Ok(0);
+    }
+    store
+        .delete_table_rows(PENDING_KEY_UNWRAPS, pending_keys)
+        .map_err(|err| format!("delete pending key unwraps: {err}"))
 }
 
 pub fn decode_key_wrap_row(key: &[u8], value: &[u8]) -> Result<KeyWrapRow, String> {
@@ -131,6 +178,33 @@ pub fn decode_key_wrap_row(key: &[u8], value: &[u8]) -> Result<KeyWrapRow, Strin
         sender_wrap_public_key,
         nonce,
         ciphertext,
+    })
+}
+
+pub fn decode_pending_key_unwrap_row(
+    key: Vec<u8>,
+    value: &[u8],
+) -> Result<PendingKeyUnwrapRow, String> {
+    if key.len() != 96 {
+        return Err("pending key unwrap row key is malformed".to_string());
+    }
+    if value.len() != 32 {
+        return Err("pending key unwrap row value is malformed".to_string());
+    }
+    let mut workspace_id = [0; 32];
+    workspace_id.copy_from_slice(&key[..32]);
+    let mut removal_frontier_id = [0; 32];
+    removal_frontier_id.copy_from_slice(&key[32..64]);
+    let mut recipient_key_id = [0; 32];
+    recipient_key_id.copy_from_slice(&key[64..96]);
+    let mut key_wrap_id = [0; 32];
+    key_wrap_id.copy_from_slice(value);
+    Ok(PendingKeyUnwrapRow {
+        key,
+        workspace_id,
+        removal_frontier_id,
+        recipient_key_id,
+        key_wrap_id,
     })
 }
 

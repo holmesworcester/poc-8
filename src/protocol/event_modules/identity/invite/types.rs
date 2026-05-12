@@ -1,8 +1,9 @@
 //! Invite value types.
 //!
 //! `Invite` is the parsed link used by commands. `InviteSecretEvent` is the
-//! local event projected into authorization state. Keeping them separate makes
-//! it clear which fields travel in a link and which fields enter the store.
+//! local event projected into authorization state and connection-attempt state.
+//! Keeping them separate makes it clear which fields travel in a link and which
+//! fields enter the store.
 
 use std::net::SocketAddr;
 
@@ -26,6 +27,7 @@ pub struct Invite {
 pub struct InviteSecretEvent {
     pub bootstrap_hash: [u8; 32],
     pub bootstrap_secret: [u8; 32],
+    pub addr: Option<SocketAddr>,
     pub workspace_id: Option<EventId>,
     pub invite_event_id: Option<EventId>,
 }
@@ -35,8 +37,16 @@ impl InviteSecretEvent {
         Self {
             bootstrap_hash: bootstrap_secret_hash(&bootstrap_secret),
             bootstrap_secret,
+            addr: None,
             workspace_id: None,
             invite_event_id: None,
+        }
+    }
+
+    pub fn new_with_addr(bootstrap_secret: [u8; 32], addr: SocketAddr) -> Self {
+        Self {
+            addr: Some(addr),
+            ..Self::new(bootstrap_secret)
         }
     }
 
@@ -48,8 +58,21 @@ impl InviteSecretEvent {
         Self {
             bootstrap_hash: bootstrap_secret_hash(&bootstrap_secret),
             bootstrap_secret,
+            addr: None,
             workspace_id: Some(workspace_id),
             invite_event_id: Some(invite_event_id),
+        }
+    }
+
+    pub fn scoped_with_addr(
+        bootstrap_secret: [u8; 32],
+        workspace_id: EventId,
+        invite_event_id: EventId,
+        addr: SocketAddr,
+    ) -> Self {
+        Self {
+            addr: Some(addr),
+            ..Self::scoped(bootstrap_secret, workspace_id, invite_event_id)
         }
     }
 

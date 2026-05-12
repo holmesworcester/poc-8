@@ -9,7 +9,7 @@
 //! corresponding outbound network rows were sent.
 //! Failure: a failed route can be reported or ignored according to the caller's
 //! `fail_on_route_error` policy; unsent transit out rows remain queued.
-//! Fairness: one exchange pass is route-bounded and each route batches at a
+//! Fairness: one route-sync pass is route-bounded and each route batches at a
 //! fixed plaintext-size cap.
 
 use std::{cell::RefCell, collections::HashMap, net::SocketAddr, str::FromStr};
@@ -20,7 +20,9 @@ use crate::core::store::Store;
 use crate::core::tcp;
 use crate::protocol::event_modules::connection::{schema, transit, types};
 use crate::protocol::event_modules::identity::endpoint;
+use crate::protocol::event_modules::identity::endpoint::types::EndpointId;
 use crate::protocol::event_modules::schema as event_schema;
+use crate::protocol::event_modules::sync::SyncIndex;
 use crate::workers::schema as worker_schema;
 use crate::workers::DaemonWorkerContext;
 
@@ -70,66 +72,40 @@ struct TransitOutDrain {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct SendReport {
-    sent_events: usize,
-    received_events: usize,
+pub(crate) struct SendReport {
+    pub(crate) sent_events: usize,
+    pub(crate) received_events: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteSyncReport {
+    pub routes_synced: usize,
+    pub failed_routes: usize,
+    pub sent_events: usize,
+    pub received_events: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Work {
-    SendConnectionRequest {
-        connection_id: types::ConnectionId,
-        addr: SocketAddr,
-        bytes: Vec<u8>,
-    },
-    ExchangeRoutes {
-        fail_on_route_error: bool,
-    },
-    MarkSent {
-        transit_out_keys: Vec<Vec<u8>>,
-    },
+    SyncRoutes { fail_on_route_error: bool },
+    MarkSent { transit_out_keys: Vec<Vec<u8>> },
 }
 
-pub fn run(store: &Store, work: Work) -> Result<types::RouteExchangeReport, String> {
+pub fn run<R>(
+    store: &Store,
+    _registry: &R,
+    sync_index: Option<&SyncIndex>,
+    work: Work,
+) -> Result<RouteSyncReport, String> {
     match work {
-        Work::SendConnectionRequest {
-            connection_id,
-            addr,
-            bytes,
-        } => send_connection_request(store, connection_id, addr, bytes),
-        Work::ExchangeRoutes {
+        Work::SyncRoutes {
             fail_on_route_error,
-        } => exchange_outbound_routes(store, fail_on_route_error),
+        } => sync_outbound_routes(store, sync_index, fail_on_route_error),
         Work::MarkSent { transit_out_keys } => {
             mark_transit_out_sent(store, transit_out_keys)?;
-            Ok(types::RouteExchangeReport::default())
+            Ok(RouteSyncReport::default())
         }
     }
-}
-
-fn send_connection_request(
-    store: &Store,
-    connection_id: types::ConnectionId,
-    addr: SocketAddr,
-    bytes: Vec<u8>,
-) -> Result<types::RouteExchangeReport, String> {
-    store
-        .insert_table_rows(vec![schema::transport_target_row(connection_id, addr)])
-        .map_err(|err| format!("remember connection route: {err}"))?;
-
-    let target = NetworkTarget::new(addr);
-    tcp::send_once(
-        store,
-        target,
-        vec![OutboundNetworkRow::new(target, bytes)],
-        (),
-        |_, _| Ok(()),
-    )?;
-    Ok(types::RouteExchangeReport {
-        routes_synced: 1,
-        sent_events: 1,
-        ..types::RouteExchangeReport::default()
-    })
 }
 
 pub(crate) fn daemon_worker<C>() -> Worker<C>
@@ -149,7 +125,9 @@ where
     let app = &*ctx.app;
     let report = run(
         app.store(),
-        Work::ExchangeRoutes {
+        app,
+        Some(app.sync_index()),
+        Work::SyncRoutes {
             fail_on_route_error: false,
         },
     )?;
@@ -160,22 +138,23 @@ where
     Ok(())
 }
 
-fn exchange_outbound_routes(
+fn sync_outbound_routes(
     store: &Store,
+    sync_index: Option<&SyncIndex>,
     fail_on_route_error: bool,
-) -> Result<types::RouteExchangeReport, String> {
-    let mut summary = types::RouteExchangeReport::default();
+) -> Result<RouteSyncReport, String> {
+    let mut summary = RouteSyncReport::default();
     for outbound in drain_transit_out_routes(store).map_err(|err| format!("drain out: {err}"))? {
         let outbound = outbound_sync(outbound);
         let target = outbound.target;
-        match exchange_outbound_route(store, outbound) {
+        match sync_outbound_route(store, sync_index, outbound) {
             Ok(stream_summary) => {
                 summary.routes_synced += 1;
                 summary.sent_events += stream_summary.sent_events;
                 summary.received_events += stream_summary.received_events;
             }
             Err(err) if fail_on_route_error => {
-                return Err(format!("exchange outbound route {target:?}: {err}"));
+                return Err(format!("sync outbound route {target:?}: {err}"));
             }
             Err(_) => {
                 summary.failed_routes += 1;
@@ -185,7 +164,11 @@ fn exchange_outbound_routes(
     Ok(summary)
 }
 
-fn exchange_outbound_route(store: &Store, outbound: OutboundSync) -> Result<SendReport, String> {
+fn sync_outbound_route(
+    store: &Store,
+    _sync_index: Option<&SyncIndex>,
+    outbound: OutboundSync,
+) -> Result<SendReport, String> {
     let sent_transit_out = RefCell::new(HashMap::new());
     let sent_events = outbound
         .sent_transit_out
@@ -197,9 +180,10 @@ fn exchange_outbound_route(store: &Store, outbound: OutboundSync) -> Result<Send
         &outbound.outgoing,
         &outbound.sent_transit_out,
     )?;
+    let target = outbound.target;
     tcp::send_once(
         store,
-        outbound.target,
+        target,
         outbound.outgoing,
         SendReport::default(),
         |rows, _| mark_sent_network_rows(store, rows, &sent_transit_out),
@@ -208,6 +192,48 @@ fn exchange_outbound_route(store: &Store, outbound: OutboundSync) -> Result<Send
         report.sent_events += sent_events;
         report
     })
+}
+
+pub(crate) fn send_frames(
+    store: &Store,
+    target_addr: SocketAddr,
+    frames: Vec<Vec<u8>>,
+) -> Result<SendReport, String> {
+    let target = NetworkTarget::new(target_addr);
+    let rows = network_queues::outbound_rows(target, frames);
+    tcp::send_once(
+        store,
+        target,
+        rows,
+        SendReport::default(),
+        |rows, report| {
+            report.sent_events += rows.len();
+            Ok(())
+        },
+    )
+}
+
+fn connection_event_bytes(store: &Store, event_id: [u8; 32]) -> Result<Vec<u8>, String> {
+    store
+        .table_row(schema::CONNECTION_EVENTS, &event_id)
+        .map_err(|err| format!("load connection event: {err}"))?
+        .ok_or_else(|| "unknown connection event".to_string())
+}
+
+fn remote_endpoint(
+    store: &Store,
+    connection_id: types::ConnectionId,
+) -> Result<EndpointId, String> {
+    let bytes = store
+        .table_row(schema::CONNECTIONS, &connection_id)
+        .map_err(|err| format!("load connection: {err}"))?
+        .ok_or_else(|| "unknown connection".to_string())?;
+    endpoint_id_from_bytes(&bytes)
+}
+
+fn endpoint_id_from_bytes(bytes: &[u8]) -> Result<EndpointId, String> {
+    types::connection_id_from_bytes(bytes)
+        .map_err(|_| "stored endpoint id is malformed".to_string())
 }
 
 fn outbound_sync(outbound: OutboundTransit) -> OutboundSync {
@@ -220,8 +246,9 @@ fn outbound_sync(outbound: OutboundTransit) -> OutboundSync {
 }
 
 fn drain_transit_out_routes(store: &Store) -> Result<Vec<OutboundTransit>, String> {
-    // Route draining is deliberately route-based, not global "send everything".
-    // Slow or absent targets should only starve their own route.
+    // Drain by connection so each route keeps its own authorization context,
+    // then coalesce frames by socket target. A peer with multiple workspace
+    // routes should still cost one accepted TCP stream per outbound pass.
     let routes = routes(store)?;
     if routes.is_empty() {
         return Ok(Vec::new());
@@ -233,16 +260,35 @@ fn drain_transit_out_routes(store: &Store) -> Result<Vec<OutboundTransit>, Strin
         if drained.outgoing.is_empty() {
             continue;
         }
-        outbound.push(OutboundTransit {
-            target: route.addr,
-            outgoing: drained.outgoing,
-            sent_transit_out: drained.sent_transit_out,
-        });
+        push_outbound_transit(
+            &mut outbound,
+            route.addr,
+            drained.outgoing,
+            drained.sent_transit_out,
+        );
     }
     Ok(outbound)
 }
 
-fn drain_and_wrap_transit_out_for_connection(
+fn push_outbound_transit(
+    outbound: &mut Vec<OutboundTransit>,
+    target: SocketAddr,
+    mut outgoing: Vec<Vec<u8>>,
+    mut sent_transit_out: Vec<Vec<Vec<u8>>>,
+) {
+    if let Some(existing) = outbound.iter_mut().find(|item| item.target == target) {
+        existing.outgoing.append(&mut outgoing);
+        existing.sent_transit_out.append(&mut sent_transit_out);
+        return;
+    }
+    outbound.push(OutboundTransit {
+        target,
+        outgoing,
+        sent_transit_out,
+    });
+}
+
+pub(crate) fn drain_and_wrap_transit_out_for_connection(
     store: &Store,
     local: endpoint::types::EndpointKeypair,
     connection_id: types::ConnectionId,
@@ -257,7 +303,13 @@ fn drain_and_wrap_transit_out_for_connection(
     if items.is_empty() {
         return Ok(DrainedTransitOut::default());
     }
-    let remote = schema::remote_endpoint(store, connection_id)?;
+    let remote = remote_endpoint(store, connection_id)?;
+    let connection_event = connection_event_bytes(store, connection_id)?;
+    let connection =
+        crate::protocol::event_modules::connection::connection_response::codec::decode(
+            &connection_event,
+        )
+        .map_err(|_| "connection transit dependency is not a connection event".to_string())?;
     let batches = transit::commands::batch_inner_events(items, |item| {
         transit::commands::PER_EVENT_PLAINTEXT_OVERHEAD.saturating_add(item.event_bytes.len())
     });
@@ -274,9 +326,10 @@ fn drain_and_wrap_transit_out_for_connection(
             batch_transit_out.push(item.key.to_bytes());
         }
         outgoing.push(transit::commands::create_connection_batch(
-            &local,
+            local.endpoint,
             remote,
             connection_id,
+            &connection.connection_secret,
             inner_events,
         )?);
         sent_transit_out.push(batch_transit_out);
@@ -414,7 +467,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exchange_routes_removes_rows_whose_bytes_are_gone() {
+    fn sync_routes_removes_rows_whose_bytes_are_gone() {
         let store = Protocol::open_memory_store().expect("open store");
         let local = endpoint::commands::create_local_keypair().value;
         let connection_id = [3; 32];
@@ -433,18 +486,52 @@ mod tests {
 
         let output = run(
             &store,
-            Work::ExchangeRoutes {
+            &Protocol::new(),
+            None,
+            Work::SyncRoutes {
                 fail_on_route_error: true,
             },
         )
         .expect("drain out");
 
-        assert_eq!(output, types::RouteExchangeReport::default());
+        assert_eq!(output, RouteSyncReport::default());
         assert_eq!(
             store
                 .table_row_count(worker_schema::TRANSIT_OUT)
                 .expect("count out rows"),
             0
+        );
+    }
+
+    #[test]
+    fn outbound_transit_for_same_socket_is_coalesced() {
+        let addr = "127.0.0.1:41000"
+            .parse::<SocketAddr>()
+            .expect("test socket addr");
+        let mut outbound = Vec::new();
+
+        push_outbound_transit(
+            &mut outbound,
+            addr,
+            vec![b"first".to_vec()],
+            vec![vec![vec![1]]],
+        );
+        push_outbound_transit(
+            &mut outbound,
+            addr,
+            vec![b"second".to_vec()],
+            vec![vec![vec![2]]],
+        );
+
+        assert_eq!(outbound.len(), 1);
+        assert_eq!(outbound[0].target, addr);
+        assert_eq!(
+            outbound[0].outgoing,
+            vec![b"first".to_vec(), b"second".to_vec()]
+        );
+        assert_eq!(
+            outbound[0].sent_transit_out,
+            vec![vec![vec![1]], vec![vec![2]]]
         );
     }
 }

@@ -1,12 +1,12 @@
 //! Schema for local invite-secret rows.
 //!
 //! The table is intentionally private to the invite module: it records local
-//! authority to encrypt/decrypt invite-key bootstrap traffic, not shared
-//! membership state. Invite creators record this row when they create a link;
-//! invite acceptors record it together with `invite_accepted` provenance when
-//! they consume a link.
+//! authority derived from an out-of-band invite link, not shared membership
+//! state. Invite creators record this row when they create a link; invite
+//! acceptors record it together with `invite_accepted` provenance when they
+//! consume a link.
 
-use crate::core::store::{Schema, Store, TableName};
+use crate::core::store::{Schema, TableName};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::wire::{Reader, Writer};
 
@@ -58,17 +58,6 @@ pub fn decode_invite_secret_row(value: &[u8]) -> Result<InviteSecretRow, String>
         return Err("invite secret row scope is incomplete".to_string());
     }
     Ok(row)
-}
-
-pub(crate) fn invite_secret_by_hash(
-    store: &Store,
-    bootstrap_hash: &EventId,
-) -> Result<InviteSecretRow, String> {
-    let value = store
-        .table_row(INVITE_SECRETS, bootstrap_hash)
-        .map_err(|err| format!("load invite secret: {err}"))?
-        .ok_or_else(|| "unknown invite bootstrap key".to_string())?;
-    decode_invite_secret_row(&value)
 }
 
 fn optional_id(id: EventId) -> Option<EventId> {

@@ -1,54 +1,47 @@
 //! Commands for initiating connection requests.
 //!
 //! This module is the active boundary that turns a human-copyable invite link
-//! into two local facts and one opaque bootstrap frame:
+//! into local facts:
 //!
 //! ```text
 //! invite link + local endpoint
 //!   -> local invite-secret fact
 //!   -> local connection-request fact depending on that secret
-//!   -> bootstrap transit bytes carrying the request fact
 //! ```
 //!
 //! The command deliberately does not write rows, open sockets, run projectors,
 //! or decide whether the remote side should accept the request. Those decisions
 //! belong to the common event pipeline and the request projector. This command
-//! only creates the facts and returns the route/bytes a caller can hand to
-//! `transit_out`.
+//! only creates the facts and returns the request id and invite route a caller
+//! can hand to `transit_out`.
 //!
 //! Invariants:
 //!
 //! - The request's `invite_secret_event_id` is the deterministic id of the
 //!   local invite-secret fact proposed immediately before it.
-//! - Bootstrap authorization is carried by the request dependency edge, not by
-//!   transit code reconstructing secret state from projected rows.
-//! - The returned connection id is derived from `(request_id, invite endpoint)`
-//!   so the local requester can name the same connection fact before any later
-//!   traffic arrives.
-//! - The returned bytes are transport bytes only. They are not stored as the
-//!   semantic fact; the inner request event is.
+//! - Bootstrap authorization is carried by the request dependency edge plus a
+//!   transcript-bound signature by the invite private key. The secret itself
+//!   never appears in the request or transit frame.
+//! - The returned request id lets the caller correlate the later encrypted
+//!   connection response. That response event id becomes the connection id.
 
 use std::net::SocketAddr;
 
 use crate::core::crypto;
+use crate::protocol::event_modules::connection::connection_ephemeral_secret;
 use crate::protocol::event_modules::identity::{endpoint, invite};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker::CommandOutput;
+use crate::protocol::wire::Writer;
 
-use super::super::transit;
 use super::super::types;
 use super::codec;
 use super::types::RequestEvent;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundRequest {
-    /// Bootstrap transit envelope carrying the connection request event.
-    pub bytes: Vec<u8>,
     /// Deterministic id of the connection request event.
     pub request_id: EventId,
-    /// Local view of the connection id derived from the request and invite
-    /// endpoint.
-    pub connection_id: types::ConnectionId,
     /// Socket address advertised by the invite link.
     pub addr: std::net::SocketAddr,
 }
@@ -57,9 +50,8 @@ pub struct OutboundRequest {
 ///
 /// This function is intentionally pure with respect to storage. It parses the
 /// invite, builds the local invite-secret event and the dependent request
-/// event, wraps the request in a bootstrap transit envelope, and returns all of
-/// that as `CommandOutput`. The caller must admit the proposed events before
-/// treating the request as local fact graph state.
+/// event, and returns them as `CommandOutput`. The caller must admit the
+/// proposed events before treating the request as local fact graph state.
 pub fn create(
     local: endpoint::types::EndpointKeypair,
     invite_link: &str,
@@ -69,37 +61,57 @@ pub fn create(
     // that local fact first, then make the request depend on it explicitly.
     let invite = invite::commands::parse(invite_link)?;
     let invite_secret = if invite.identity_scope {
-        invite::types::InviteSecretEvent::scoped(
+        invite::types::InviteSecretEvent::scoped_with_addr(
             invite.bootstrap_secret,
             invite.workspace_id,
             invite.invite_event_id,
+            invite.addr,
         )
     } else {
-        invite::types::InviteSecretEvent::new(invite.bootstrap_secret)
+        invite::types::InviteSecretEvent::new_with_addr(invite.bootstrap_secret, invite.addr)
     };
     let invite_secret_bytes = invite::codec::encode(&invite_secret);
     let invite_secret_event_id = types::event_id(&invite_secret_bytes);
     let invite_secret_record = invite::codec::record_from_bytes(invite_secret_bytes)?;
-    let event = RequestEvent {
-        from_endpoint: local.endpoint,
-        to_endpoint: invite.endpoint,
-        nonce: nonce32(),
-        bootstrap_hash: invite_secret.bootstrap_hash,
-        invite_secret_event_id,
-        from_listen_addr,
-    };
+    let ephemeral = connection_ephemeral_secret::commands::create(
+        connection_ephemeral_secret::commands::CreateEphemeral {
+            owner_endpoint: local.endpoint,
+            created_at_ms: 0,
+        },
+    )?;
+    let ephemeral_event_id = ephemeral.events[0].event_id();
+    let event = sign_with_invite(
+        RequestEvent {
+            from_endpoint: local.endpoint,
+            to_endpoint: invite.endpoint,
+            nonce: nonce32(),
+            invite_event_id: invite.invite_event_id,
+            bootstrap_hash: invite_secret.bootstrap_hash,
+            invite_signature: [0; crypto::ED25519_SIGNATURE_BYTES],
+            invite_secret_event_id,
+            initiator_ephemeral_secret_event_id: ephemeral_event_id,
+            initiator_ephemeral_public_key: ephemeral.value.ephemeral_public_key,
+            from_listen_addr,
+        },
+        &invite_secret,
+    )?;
     let inner = codec::encode(&event);
     let request_id = types::event_id(&inner);
-    let connection_id = types::connection_id(&request_id, &invite.endpoint);
     let record = codec::record_from_bytes(inner.clone())?;
+    let mut events = vec![invite_secret_record];
+    events.extend(
+        ephemeral
+            .events
+            .into_iter()
+            .map(|event| event.into_record()),
+    );
+    events.push(record);
     Ok(CommandOutput::with_events(
         OutboundRequest {
-            bytes: transit::commands::create_bootstrap(&local, invite.endpoint, &inner)?,
             request_id,
-            connection_id,
             addr: invite.addr,
         },
-        vec![invite_secret_record, record],
+        events,
     ))
 }
 
@@ -128,6 +140,90 @@ fn nonce32() -> [u8; 32] {
     crypto::random_bytes_32()
 }
 
+pub(crate) fn sign_with_invite(
+    mut event: RequestEvent,
+    invite_secret: &invite::types::InviteSecretEvent,
+) -> Result<RequestEvent, String> {
+    validate_invite_context(&event, invite_secret)?;
+    event.invite_signature = crypto::ed25519_sign(
+        &invite_secret.bootstrap_secret,
+        &invite_signing_transcript(&event),
+    );
+    Ok(event)
+}
+
+pub(crate) fn validate_invite_signature(
+    event: &RequestEvent,
+    invite_secret: &invite::types::InviteSecretEvent,
+) -> Result<(), String> {
+    validate_invite_context(event, invite_secret)?;
+    let public_key = crypto::ed25519_public_key(&invite_secret.bootstrap_secret);
+    if !crypto::ed25519_verify(
+        &public_key,
+        &invite_signing_transcript(event),
+        &event.invite_signature,
+    ) {
+        return Err("connection request invite signature is not authorized".to_string());
+    }
+    Ok(())
+}
+
+fn validate_invite_context(
+    event: &RequestEvent,
+    invite_secret: &invite::types::InviteSecretEvent,
+) -> Result<(), String> {
+    if invite_secret.bootstrap_hash != event.bootstrap_hash {
+        return Err("connection request bootstrap hash is not authorized".to_string());
+    }
+    if let Some(invite_event_id) = invite_secret.invite_event_id {
+        if invite_event_id != event.invite_event_id {
+            return Err("connection request invite id is not authorized".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn invite_signing_transcript(event: &RequestEvent) -> Vec<u8> {
+    let mut out = Writer::new();
+    out.raw(b"topo-connection-request-invite-signing-transcript-v1");
+    out.id(&event.from_endpoint);
+    out.id(&event.to_endpoint);
+    out.id(&event.nonce);
+    out.id(&event.invite_event_id);
+    out.id(&event.bootstrap_hash);
+    out.id(&event.invite_secret_event_id);
+    out.id(&event.initiator_ephemeral_secret_event_id);
+    out.id(&event.initiator_ephemeral_public_key);
+    match event.from_listen_addr {
+        None => {
+            out.u8(0);
+            out.raw(&[0u8; 16]);
+            out.u16(0);
+        }
+        Some(addr) => {
+            encode_socket_addr(&mut out, addr);
+        }
+    }
+    out.finish()
+}
+
+fn encode_socket_addr(out: &mut Writer, addr: SocketAddr) {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => {
+            out.u8(4);
+            let mut padded = [0u8; 16];
+            padded[..4].copy_from_slice(&ip.octets());
+            out.raw(&padded);
+            out.u16(addr.port());
+        }
+        std::net::IpAddr::V6(ip) => {
+            out.u8(6);
+            out.raw(&ip.octets());
+            out.u16(addr.port());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
@@ -143,14 +239,24 @@ mod tests {
 
         let output = create(connector, &invite_link, None).expect("create request");
 
-        assert_eq!(output.events.len(), 2);
+        assert_eq!(output.events.len(), 3);
         let invite_secret_event_id = output.events[0].event_id();
+        let ephemeral_event_id = output.events[1].event_id();
         let request =
-            codec::decode(&output.events[1].record().canonical_bytes).expect("decode request");
+            codec::decode(&output.events[2].record().canonical_bytes).expect("decode request");
+        let invite_secret =
+            invite::codec::decode(&output.events[0].record().canonical_bytes).expect("invite");
+        assert_eq!(invite_secret.addr, Some(addr));
+        assert_eq!(output.value.addr, addr);
         assert_eq!(request.invite_secret_event_id, invite_secret_event_id);
         assert_eq!(
-            output.events[1].record().dependencies,
-            vec![invite_secret_event_id]
+            request.initiator_ephemeral_secret_event_id,
+            ephemeral_event_id
+        );
+        validate_invite_signature(&request, &invite_secret).expect("invite signature");
+        assert_eq!(
+            output.events[2].record().dependencies,
+            vec![invite_secret_event_id, ephemeral_event_id]
         );
         assert!(request.from_listen_addr.is_none());
     }
@@ -163,10 +269,9 @@ mod tests {
         let invite_link = invite::commands::create(inviter, invite_addr).value;
         let local_listen = "127.0.0.1:50000".parse::<SocketAddr>().expect("listen");
 
-        let output =
-            create(connector, &invite_link, Some(local_listen)).expect("create request");
+        let output = create(connector, &invite_link, Some(local_listen)).expect("create request");
         let request =
-            codec::decode(&output.events[1].record().canonical_bytes).expect("decode request");
+            codec::decode(&output.events[2].record().canonical_bytes).expect("decode request");
 
         assert_eq!(request.from_listen_addr, Some(local_listen));
     }

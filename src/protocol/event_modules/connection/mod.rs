@@ -8,22 +8,27 @@
 //! bytes without owning connection semantics.
 
 pub mod cli;
+pub mod connection_ephemeral_secret;
 pub mod connection_request;
 pub mod connection_response;
 pub mod queries;
 pub mod schema;
 pub mod transit;
 pub mod types;
-pub use crate::workers::bootstrap_exchange as worker;
 
 use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput};
 
 pub fn is_projection_record(bytes: &[u8]) -> bool {
-    connection_request::codec::is_request(bytes) || connection_response::codec::is_response(bytes)
+    connection_ephemeral_secret::codec::is_ephemeral_secret(bytes)
+        || connection_request::codec::is_request(bytes)
+        || connection_response::codec::is_response(bytes)
 }
 
 pub fn project_record(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String> {
     let bytes = &event.record.canonical_bytes;
+    if connection_ephemeral_secret::codec::is_ephemeral_secret(bytes) {
+        return Ok(ProjectionOutput::default());
+    }
     if connection_request::codec::is_request(bytes) {
         return connection_request::projector::project(event);
     }

@@ -198,14 +198,24 @@ fn derive_key_secrets<R: EventRegistry>(
     batch_size: usize,
 ) -> Result<DeriveReport, String> {
     let mut report = DeriveReport::default();
-    for row in key_wrap::schema::list_all(store)? {
+    let mut consumed_pending = Vec::new();
+    for pending in key_wrap::schema::list_pending_unwraps(store, batch_size.max(1))? {
         if report.scanned_key_wraps >= batch_size {
             break;
+        }
+        let Some(row) = key_wrap::schema::key_wrap_for_pending(store, &pending)? else {
+            consumed_pending.push(pending.key);
+            continue;
+        };
+        if row.key_wrap_id != pending.key_wrap_id {
+            report.failed_key_wraps += 1;
+            continue;
         }
         report.scanned_key_wraps += 1;
         if local_key_secret::schema::get(store, row.workspace_id, row.removal_frontier_id)?
             .is_some()
         {
+            consumed_pending.push(pending.key);
             continue;
         }
         let Some(recipient) = recipient_key_row(store, row.workspace_id, row.recipient_key_id)?
@@ -265,7 +275,9 @@ fn derive_key_secrets<R: EventRegistry>(
             report.derived_key_secrets += 1;
         }
         report.admitted_events += admitted.admitted.inserted_events;
+        consumed_pending.push(pending.key);
     }
+    key_wrap::schema::delete_pending_unwraps(store, consumed_pending)?;
     Ok(report)
 }
 
@@ -1692,14 +1704,18 @@ where
     {
         let app = &*ctx.app;
         let store = app.store();
-        let report = drain_pending_message_leaves(store, app, ctx.options.work_limit)
+        let key_report = derive_key_secrets(store, app, ctx.options.work_limit)
+            .map_err(|err| format!("derive key secrets: {err}"))?;
+        let leaf_report = drain_pending_message_leaves(store, app, ctx.options.work_limit)
             .map_err(|err| format!("drain pending message leaves: {err}"))?;
         ctx.report
-            .add("derived_message_leaves", report.derived_leaves);
+            .add("derived_key_secrets", key_report.derived_key_secrets);
+        ctx.report
+            .add("derived_message_leaves", leaf_report.derived_leaves);
         Ok(())
     }
     Worker {
-        name: "encryption_message_leaves",
+        name: "encryption",
         run: step::<C>,
     }
 }
@@ -1799,6 +1815,7 @@ fn purge_retired_recipient_material(
             )
         })
         .collect();
+    let pending_key_unwrap_row_keys = key_wrap_row_keys.clone();
     let event_ids_to_purge: Vec<EventId> = retired
         .iter()
         .flat_map(|key| [key.recipient_key_id, key.local_recipient_key_id])
@@ -1812,6 +1829,10 @@ fn purge_retired_recipient_material(
                 local_recipient_keys,
             )?;
             store.delete_table_rows_in_tx(key_wrap::schema::KEY_WRAPS, key_wrap_row_keys)?;
+            store.delete_table_rows_in_tx(
+                key_wrap::schema::PENDING_KEY_UNWRAPS,
+                pending_key_unwrap_row_keys,
+            )?;
             for event_id in &event_ids_to_purge {
                 purging::purge_event_storage_in_tx(store, event_id)?;
             }
@@ -1892,6 +1913,133 @@ mod tests {
             })
             .expect("seed local key secret");
         (frontier_id, local_key_secret_id)
+    }
+
+    #[test]
+    fn derive_key_secrets_drains_projected_pending_unwrap_queue() {
+        let store = Protocol::open_memory_store().expect("store");
+        let protocol = Protocol::new();
+        let signer_private_key: Ed25519PrivateKey = [9; 32];
+        let signer_endpoint_shared_id = [8; 32];
+        let frontier_record = build_signed_frontier_record(&signer_private_key);
+        let frontier_id = event_id(&frontier_record.canonical_bytes);
+
+        let local_recipient_output =
+            local_recipient_key::commands::create(WORKSPACE).expect("local recipient");
+        let local_recipient_id = local_recipient_output.events[0].event_id();
+        let local_recipient_event = local_recipient_output.value.clone();
+        let local_recipient_record = local_recipient_output.events[0].record().clone();
+
+        let recipient_output =
+            recipient_key::commands::publish(recipient_key::commands::PublishRecipientKey {
+                workspace_id: WORKSPACE,
+                created_at_ms: 2,
+                endpoint_shared_id: signer_endpoint_shared_id,
+                signer_private_key,
+                recipient_key: local_recipient_event.recipient_key,
+            })
+            .expect("recipient key");
+        let recipient_record = recipient_output.events[0].record().clone();
+        let recipient_envelope =
+            recipient_key::codec::decode_signed(&recipient_record.canonical_bytes)
+                .expect("recipient envelope");
+        let recipient_event =
+            recipient_key::codec::decode(&recipient_envelope.payload).expect("recipient event");
+
+        let sender_local_secret =
+            local_key_secret::commands::from_key_secret(WORKSPACE, frontier_id, KEY_SECRET)
+                .expect("sender local key secret")
+                .value;
+        let key_wrap_output = key_wrap::commands::create(key_wrap::commands::CreateKeyWrap {
+            workspace_id: WORKSPACE,
+            created_at_ms: 3,
+            signer_endpoint_shared_id,
+            signer_private_key,
+            removal_frontier_id: frontier_id,
+            local_key_secret_id: sender_local_secret.local_key_secret_id,
+            key_secret: sender_local_secret.event.key_secret,
+            recipient_key_id: recipient_output.value.recipient_key_id,
+            recipient_key: local_recipient_event.recipient_key,
+        })
+        .expect("key wrap");
+        let key_wrap_record = key_wrap_output.events[0].record().clone();
+        let key_wrap_id = key_wrap_output.value.key_wrap_id;
+        let key_wrap_envelope = key_wrap::codec::decode_signed(&key_wrap_record.canonical_bytes)
+            .expect("key wrap envelope");
+        let key_wrap_event =
+            key_wrap::codec::decode(&key_wrap_envelope.payload).expect("key wrap event");
+        let local_recipient_row = local_recipient_key::schema::local_recipient_key_row(
+            local_recipient_id,
+            &local_recipient_event,
+        );
+        let recipient_row = recipient_key::schema::recipient_key_row(
+            recipient_output.value.recipient_key_id,
+            &recipient_event,
+        )
+        .expect("recipient row");
+        let key_wrap_row = key_wrap::schema::key_wrap_row(
+            key_wrap_id,
+            key_wrap_envelope.signer_endpoint_shared_id,
+            key_wrap_envelope.signer_public_key,
+            &key_wrap_event,
+        );
+        let pending_key_unwrap_row =
+            key_wrap::schema::pending_key_unwrap_row(key_wrap_id, &key_wrap_event);
+
+        store
+            .write_transaction(|store| {
+                event_lifecycle::insert_event(store, &frontier_record, EventStatus::Applied)?;
+                event_lifecycle::insert_event(
+                    store,
+                    &local_recipient_record,
+                    EventStatus::Applied,
+                )?;
+                store.insert_table_rows_in_tx(vec![
+                    local_recipient_row,
+                    recipient_row,
+                    key_wrap_row,
+                    pending_key_unwrap_row,
+                ])?;
+                Ok(())
+            })
+            .expect("seed projected wrap");
+
+        let pending = key_wrap::schema::list_pending_unwraps(&store, usize::MAX)
+            .expect("pending before derive");
+        assert_eq!(pending.len(), 1);
+
+        let output = run(&store, &protocol, Work::DeriveKeySecrets { batch_size: 16 })
+            .expect("derive key secret");
+        let Output::DerivedKeySecrets(report) = output else {
+            panic!("unexpected output");
+        };
+        assert_eq!(report.scanned_key_wraps, 1);
+        assert_eq!(report.derived_key_secrets, 1);
+        assert_eq!(report.failed_key_wraps, 0);
+        assert_eq!(report.admitted_events, 1);
+
+        let local = local_key_secret::schema::get(&store, WORKSPACE, frontier_id)
+            .expect("local key secret")
+            .expect("local key secret row");
+        assert_eq!(
+            local.local_key_secret_id,
+            sender_local_secret.local_key_secret_id
+        );
+        assert_eq!(local.key_secret, KEY_SECRET);
+        assert!(
+            key_wrap::schema::list_pending_unwraps(&store, usize::MAX)
+                .expect("pending after derive")
+                .is_empty(),
+            "successful unwrap must consume its queue row"
+        );
+
+        let second = run(&store, &protocol, Work::DeriveKeySecrets { batch_size: 16 })
+            .expect("derive is idempotent after queue drain");
+        let Output::DerivedKeySecrets(second) = second else {
+            panic!("unexpected output");
+        };
+        assert_eq!(second.scanned_key_wraps, 0);
+        assert_eq!(second.derived_key_secrets, 0);
     }
 
     #[test]
@@ -2032,7 +2180,11 @@ mod tests {
         }
         let pre_rows = local_history_node_secret::schema::list_for_workspace(&store, WORKSPACE)
             .expect("pre rows");
-        assert_eq!(pre_rows.len(), N, "every fresh send admits exactly one leaf row");
+        assert_eq!(
+            pre_rows.len(),
+            N,
+            "every fresh send admits exactly one leaf row"
+        );
         for row in &pre_rows {
             assert!(
                 local_history_node_secret::types::is_leaf_row(row),
@@ -2137,8 +2289,8 @@ mod tests {
         )
         .expect("retire");
 
-        let rows = local_history_node_secret::schema::list_for_workspace(&store, WORKSPACE)
-            .expect("rows");
+        let rows =
+            local_history_node_secret::schema::list_for_workspace(&store, WORKSPACE).expect("rows");
         // Adjacent minute_nodes (range_width=1, bit_depth=0) at minute 99 or 101
         // must not exist.
         for adjacent in [99u64, 101u64] {

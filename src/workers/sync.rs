@@ -59,7 +59,7 @@ use std::sync::Mutex;
 use crate::core::daemon::{StepContext, Worker};
 use crate::core::store::Store;
 use crate::protocol::event_modules::connection;
-use crate::protocol::event_modules::identity::{endpoint, endpoint_shared};
+use crate::protocol::event_modules::identity::{endpoint, endpoint_shared, invite_accepted};
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::sync::commands;
 pub use crate::protocol::event_modules::sync::commands::{
@@ -181,7 +181,7 @@ impl SyncIndex {
 /// Work accepted by the sync worker.
 ///
 /// `DrainIndex` processes the shared-event feed. `Start` creates initial
-/// compare events for route exchange. `DrainIn` handles work already projected
+/// compare events for route sync. `DrainIn` handles work already projected
 /// from transient inbound sync events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Work {
@@ -396,14 +396,19 @@ fn start(
     let mut sent_events = 0;
     let local = local_endpoint(store)?;
     for connection_id in connections {
+        let remote = connection_remote_endpoint(store, connection_id)?;
+        let invite_workspace = connection_invite_workspace(store, connection_id)?;
+        if invite_workspace.is_none() && local.endpoint > remote {
+            continue;
+        }
         let context =
             StoreSyncContext::for_connection(store, index, local.endpoint, connection_id)?;
         if context.workspace_ids.is_empty() {
             continue;
         }
-        let Some(summary) =
-            index.start_summary_if_changed(connection_id, range, || context.summary(range))?
-        else {
+        let summary =
+            index.start_summary_if_changed(connection_id, range, || context.summary(range))?;
+        let Some(summary) = summary else {
             continue;
         };
         let output = commands::start_for_connection_with_summary(connection_id, range, summary)?;
@@ -500,9 +505,23 @@ impl<'a> StoreSyncContext<'a> {
         local_endpoint: EventId,
         connection_id: connection::types::ConnectionId,
     ) -> Result<Self, String> {
-        let remote = connection::schema::remote_endpoint(store, connection_id)?;
-        let workspace_ids =
-            endpoint_shared::schema::mutual_workspace_ids(store, local_endpoint, remote)?;
+        let mut workspace_ids = Vec::new();
+        if let Some(workspace_id) = connection_invite_workspace(store, connection_id)? {
+            workspace_ids.push(workspace_id);
+        } else {
+            workspace_ids.extend(invite_accepted::schema::accepted_workspace_ids(
+                store,
+                local_endpoint,
+            )?);
+            let remote = connection_remote_endpoint(store, connection_id)?;
+            workspace_ids.extend(endpoint_shared::schema::mutual_workspace_ids(
+                store,
+                local_endpoint,
+                remote,
+            )?);
+        }
+        workspace_ids.sort();
+        workspace_ids.dedup();
         Ok(Self {
             store,
             index,
@@ -601,14 +620,63 @@ fn response_connection_id(
     store: &Store,
     inbound_connection_id: connection::types::ConnectionId,
 ) -> Result<connection::types::ConnectionId, String> {
-    let remote = connection::schema::remote_endpoint(store, inbound_connection_id)?;
+    if connection_has_route(store, inbound_connection_id)? {
+        return Ok(inbound_connection_id);
+    }
+    let remote = connection_remote_endpoint(store, inbound_connection_id)?;
     for connection_id in connection_ids_with_routes(store)? {
-        if connection::schema::remote_endpoint(store, connection_id)? != remote {
+        if connection_remote_endpoint(store, connection_id)? != remote {
             continue;
         }
         return Ok(connection_id);
     }
     Ok(inbound_connection_id)
+}
+
+fn connection_remote_endpoint(
+    store: &Store,
+    connection_id: connection::types::ConnectionId,
+) -> Result<EventId, String> {
+    let bytes = store
+        .table_row(connection::schema::CONNECTIONS, &connection_id)
+        .map_err(|err| format!("load connection: {err}"))?
+        .ok_or_else(|| "unknown connection".to_string())?;
+    event_id_from_bytes(&bytes).map_err(|_| "stored endpoint id is malformed".to_string())
+}
+
+fn connection_invite_workspace(
+    store: &Store,
+    connection_id: connection::types::ConnectionId,
+) -> Result<Option<EventId>, String> {
+    let Some(bytes) = store
+        .table_row(
+            connection::schema::CONNECTION_INVITE_WORKSPACES,
+            &connection_id,
+        )
+        .map_err(|err| format!("load connection invite workspace: {err}"))?
+    else {
+        return Ok(None);
+    };
+    event_id_from_bytes(&bytes).map(Some)
+}
+
+fn connection_has_route(
+    store: &Store,
+    connection_id: connection::types::ConnectionId,
+) -> Result<bool, String> {
+    store
+        .table_row(connection::schema::TRANSPORT_TARGETS, &connection_id)
+        .map(|row| row.is_some())
+        .map_err(|err| format!("load transport target: {err}"))
+}
+
+fn event_id_from_bytes(bytes: &[u8]) -> Result<EventId, String> {
+    if bytes.len() != 32 {
+        return Err("stored id is malformed".to_string());
+    }
+    let mut out = [0; 32];
+    out.copy_from_slice(bytes);
+    Ok(out)
 }
 
 fn summarize_entries(entries: &[EventIndexEntry]) -> RangeSummary {
@@ -729,7 +797,9 @@ fn xor_into(target: &mut [u8; 32], value: &[u8; 32]) {
 
 #[cfg(test)]
 mod tests {
-    use crate::protocol::event_modules::identity::{endpoint, endpoint_shared, workspace};
+    use crate::protocol::event_modules::identity::{
+        endpoint, endpoint_shared, invite_accepted, workspace,
+    };
     use crate::protocol::event_modules::sync::{compare, have_id};
     use crate::protocol::event_modules::types::{event_id, ConnectionScope, EventId, EventScope};
     use crate::protocol::event_modules::worker as event_worker;
@@ -738,7 +808,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn start_rounds_from_either_routed_endpoint_peer() {
+    fn non_invite_route_starts_from_deterministic_endpoint_peer() {
         let first = endpoint::commands::create_local_keypair().value;
         let second = endpoint::commands::create_local_keypair().value;
         let (lower, higher) = if first.endpoint < second.endpoint {
@@ -773,18 +843,23 @@ mod tests {
                 selection: SyncSelection::All,
             },
         )
-        .expect("higher endpoint also starts idempotent sync");
+        .expect("higher endpoint skips duplicated sync start");
         let Output::Started(higher_output) = higher_output else {
             panic!("expected start output");
         };
-        assert_eq!(higher_output.value.sent_events, 1);
-        assert_eq!(higher_output.events.len(), 1);
+        assert_eq!(higher_output.value.sent_events, 0);
+        assert_eq!(higher_output.events.len(), 0);
     }
 
     #[test]
     fn repeated_large_start_ticks_skip_until_visible_summary_changes() {
-        let local = endpoint::commands::create_local_keypair().value;
-        let remote = endpoint::commands::create_local_keypair().value;
+        let first = endpoint::commands::create_local_keypair().value;
+        let second = endpoint::commands::create_local_keypair().value;
+        let (local, remote) = if first.endpoint < second.endpoint {
+            (first, second)
+        } else {
+            (second, first)
+        };
         let store = routed_sync_store(local, remote);
         let index = SyncIndex::default();
 
@@ -835,6 +910,58 @@ mod tests {
         assert_eq!(changed.value.started_rounds, 1);
         assert_eq!(changed.value.sent_events, 1);
         assert_eq!(changed.events.len(), 1);
+    }
+
+    #[test]
+    fn invite_scoped_routes_start_once_when_local_summary_is_unchanged() {
+        let local = endpoint::commands::create_local_keypair().value;
+        let remote = endpoint::commands::create_local_keypair().value;
+        let store = routed_sync_store(local, remote);
+        let index = SyncIndex::default();
+        store
+            .insert_table_rows(vec![
+                connection::schema::connection_invite_workspace_row([3; 32], [5; 32]),
+                invite_accepted::schema::invite_accepted_row(
+                    [9; 32],
+                    &invite_accepted::types::InviteAcceptedEvent {
+                        workspace_id: [5; 32],
+                        invite_event_id: [6; 32],
+                        invite_secret_event_id: [7; 32],
+                        bootstrap_hash: [8; 32],
+                        accepted_endpoint_id: local.endpoint,
+                    },
+                ),
+            ])
+            .expect("insert invite workspace");
+
+        let first = tick_output(&store, &index);
+        assert_eq!(first.value.started_rounds, 1);
+        assert_eq!(first.value.sent_events, 1);
+        assert_eq!(first.events.len(), 1);
+
+        let repeated = tick_output(&store, &index);
+        assert_eq!(repeated.value.started_rounds, 0);
+        assert_eq!(repeated.value.sent_events, 0);
+        assert!(repeated.events.is_empty());
+    }
+
+    #[test]
+    fn invite_scoped_routes_start_on_inviter_without_local_acceptance() {
+        let local = endpoint::commands::create_local_keypair().value;
+        let remote = endpoint::commands::create_local_keypair().value;
+        let store = routed_sync_store(local, remote);
+        let index = SyncIndex::default();
+        store
+            .insert_table_rows(vec![connection::schema::connection_invite_workspace_row(
+                [3; 32], [5; 32],
+            )])
+            .expect("insert invite workspace");
+
+        let output = tick_output(&store, &index);
+
+        assert_eq!(output.value.started_rounds, 1);
+        assert_eq!(output.value.sent_events, 1);
+        assert_eq!(output.events.len(), 1);
     }
 
     #[test]
@@ -924,6 +1051,141 @@ mod tests {
                 .expect("count sync in"),
             0
         );
+    }
+
+    #[test]
+    fn drain_in_prefers_inbound_route_over_alternate_route_to_same_endpoint() {
+        let store = Protocol::open_memory_store().expect("open store");
+        let protocol = Protocol::new();
+        let local = endpoint::commands::create_local_keypair().value;
+        let remote = endpoint::commands::create_local_keypair().value;
+        let inbound_connection_id = [1; 32];
+        let alternate_connection_id = [2; 32];
+
+        let workspace = workspace::commands::create(workspace::commands::CreateWorkspace {
+            created_at_ms: 1,
+            public_key: [9; 32],
+            name: "sync-route-prefer-inbound".to_string(),
+        })
+        .expect("create workspace");
+        let workspace_id = workspace.value.workspace_id;
+        event_worker::run(&store, &protocol, workspace).expect("admit workspace");
+
+        let mut rows = endpoint::projector::local_endpoint(local);
+        rows.extend([
+            connection::schema::connection_row(inbound_connection_id, remote.endpoint),
+            connection::schema::connection_row(alternate_connection_id, remote.endpoint),
+            connection::schema::transport_target_row(
+                inbound_connection_id,
+                "127.0.0.1:41001".parse().expect("inbound route addr"),
+            ),
+            connection::schema::transport_target_row(
+                alternate_connection_id,
+                "127.0.0.1:41000".parse().expect("alternate route addr"),
+            ),
+            endpoint_membership_row(workspace_id, local.endpoint, local.signing_public_key, 10),
+            endpoint_membership_row(workspace_id, remote.endpoint, remote.signing_public_key, 11),
+        ]);
+        store.insert_table_rows(rows).expect("insert sync context");
+
+        let compare = compare::types::CompareEvent {
+            connection_id: inbound_connection_id,
+            range: compare::types::TimestampRange::ROOT,
+            summary: compare::types::RangeSummary::default(),
+            response_requested: true,
+        };
+        let bytes = compare::codec::encode(&compare);
+        let record = compare::codec::inbound_record_from_wire(bytes).expect("inbound compare");
+        store
+            .insert_table_rows(vec![worker_schema::sync_in_event_row(
+                inbound_connection_id,
+                event_id(&record.canonical_bytes),
+                record.canonical_bytes,
+            )])
+            .expect("insert sync in");
+
+        let index = SyncIndex::default();
+        let output = run(
+            &store,
+            &index,
+            Work::DrainIn {
+                limit: DEFAULT_INBOUND_BATCH,
+            },
+        )
+        .expect("drain sync in");
+        let Output::DrainedIn(output) = output else {
+            panic!("expected sync drain output");
+        };
+
+        assert_eq!(output.processed_work, 1);
+        assert!(
+            !output.events.is_empty(),
+            "local summary should produce response events"
+        );
+        for event in output.events {
+            assert_eq!(
+                event.scope,
+                EventScope::Connection(ConnectionScope::Outgoing {
+                    connection_id: inbound_connection_id,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn invite_scoped_sync_context_uses_only_invite_workspace() {
+        let store = Protocol::open_memory_store().expect("open store");
+        let index = SyncIndex::default();
+        let local = endpoint::commands::create_local_keypair().value;
+        let remote = endpoint::commands::create_local_keypair().value;
+        let connection_id = [3; 32];
+        let invite_workspace_id = [7; 32];
+        let other_workspace_id = [8; 32];
+        let mut rows = endpoint::projector::local_endpoint(local);
+        rows.extend([
+            connection::schema::connection_row(connection_id, remote.endpoint),
+            connection::schema::connection_invite_workspace_row(connection_id, invite_workspace_id),
+            endpoint_membership_row(
+                invite_workspace_id,
+                local.endpoint,
+                local.signing_public_key,
+                20,
+            ),
+            endpoint_membership_row(
+                invite_workspace_id,
+                remote.endpoint,
+                remote.signing_public_key,
+                21,
+            ),
+            endpoint_membership_row(
+                other_workspace_id,
+                local.endpoint,
+                local.signing_public_key,
+                22,
+            ),
+            endpoint_membership_row(
+                other_workspace_id,
+                remote.endpoint,
+                remote.signing_public_key,
+                23,
+            ),
+        ]);
+        store.insert_table_rows(rows).expect("insert sync context");
+
+        let context =
+            StoreSyncContext::for_connection(&store, &index, local.endpoint, connection_id)
+                .expect("sync context");
+
+        assert!(context.entry_is_allowed(&EventIndexEntry {
+            event_id: test_event_id(b"invite-workspace", 1),
+            timestamp: 1,
+            workspace_id: Some(invite_workspace_id),
+        }));
+        assert!(!context.entry_is_allowed(&EventIndexEntry {
+            event_id: test_event_id(b"other-workspace", 1),
+            timestamp: 1,
+            workspace_id: Some(other_workspace_id),
+        }));
     }
 
     fn routed_sync_store(
