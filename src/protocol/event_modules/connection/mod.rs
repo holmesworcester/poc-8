@@ -4,7 +4,7 @@
 //! They are distinct from transport targets, which are merely addresses where
 //! bytes might be sent right now. The domain owns request/response event
 //! syntax, route facts, and transit wrapping helpers. Scheduled transit workers
-//! live under `src/workers` and bridge opaque network frames to canonical event
+//! live under `src/protocol/workers` and bridge opaque network frames to canonical event
 //! bytes without owning connection semantics.
 
 pub mod cli;

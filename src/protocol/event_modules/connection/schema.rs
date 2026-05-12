@@ -17,7 +17,7 @@
 //! connection worker creates and sends a response.
 //! `TRANSPORT_TARGETS` is local route state: invite accept/connect paths write
 //! the invite address for the resulting connection, but the address is not a
-//! separate semantic event. Worker-owned send queues live in `src/workers/schema.rs`.
+//! separate semantic event. Worker-owned send queues live in `src/protocol/workers/schema.rs`.
 
 use std::net::SocketAddr;
 

@@ -25,10 +25,10 @@ use crate::core::daemon::{StepContext, Worker};
 use crate::core::store::Store;
 use crate::core::tcp;
 use crate::protocol::event_modules::sync::SyncIndex;
-use crate::workers::pipeline_helpers::event_pipeline::{
+use crate::protocol::workers::pipeline_helpers::event_pipeline::{
     self as pipeline, EventRegistry, TransitInReport,
 };
-use crate::workers::DaemonWorkerContext;
+use crate::protocol::workers::DaemonWorkerContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Work {
@@ -140,8 +140,8 @@ mod tests {
     };
     use crate::protocol::event_modules::identity::{endpoint, invite};
     use crate::protocol::Protocol;
-    use crate::workers::pipeline_helpers::event_pipeline as pipeline;
-    use crate::workers::schema as worker_schema;
+    use crate::protocol::workers::pipeline_helpers::event_pipeline as pipeline;
+    use crate::protocol::workers::schema as worker_schema;
 
     use super::*;
 

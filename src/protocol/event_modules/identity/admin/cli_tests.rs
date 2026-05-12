@@ -14,6 +14,7 @@ fn receipt_replays_bootstrap_then_admin_authorized_grant_without_daemon() {
     let workspace = workspace::commands::create(workspace::commands::CreateWorkspace {
         created_at_ms: 10,
         public_key: workspace_public_key,
+        disappearing_ttl_minutes: 0,
         name: "Root".to_string(),
     })
     .expect("create workspace");

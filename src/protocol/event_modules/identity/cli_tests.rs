@@ -139,6 +139,7 @@ fn bootstrap_two_users_and_two_endpoints_replay_without_daemon() {
     let workspace = workspace::commands::create(workspace::commands::CreateWorkspace {
         created_at_ms: 1,
         public_key: workspace_public_key,
+        disappearing_ttl_minutes: 0,
         name: "Workspace".to_string(),
     })
     .expect("create workspace");
@@ -334,6 +335,7 @@ fn same_user_client_can_link_multiple_workspaces_but_authority_does_not_cross() 
     let workspace_a = workspace::commands::create(workspace::commands::CreateWorkspace {
         created_at_ms: 1,
         public_key: crypto::ed25519_public_key(&workspace_a_private_key),
+        disappearing_ttl_minutes: 0,
         name: "Workspace A".to_string(),
     })
     .expect("create workspace A");
@@ -343,6 +345,7 @@ fn same_user_client_can_link_multiple_workspaces_but_authority_does_not_cross() 
     let workspace_b = workspace::commands::create(workspace::commands::CreateWorkspace {
         created_at_ms: 2,
         public_key: crypto::ed25519_public_key(&workspace_b_private_key),
+        disappearing_ttl_minutes: 0,
         name: "Workspace B".to_string(),
     })
     .expect("create workspace B");
@@ -750,6 +753,7 @@ fn create_workspace_with_bootstrap_admin(
     let workspace = workspace::commands::create(workspace::commands::CreateWorkspace {
         created_at_ms: timestamp,
         public_key: workspace_public_key,
+        disappearing_ttl_minutes: 0,
         name: name.to_string(),
     })
     .expect("create workspace");

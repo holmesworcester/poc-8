@@ -41,7 +41,6 @@ pub const FILE_SLICE_DATA_BYTES: usize = FILE_SLICE_CIPHERTEXT_BYTES - XCHACHA20
 /// fails any multi-slice send with `"file slice proof exceeds slot capacity"`.
 pub const BAO_ENCODING_BUDGET_BYTES: usize = 25 * 1024;
 
-/// BAO encoding overhead budget. The slice proof = ciphertext + tree nodes
 /// embedded at the front of the BAO encoding. Full slices stay aligned at
 /// `FILE_SLICE_CIPHERTEXT_BYTES`, which is the invariant that keeps this
 /// fixed canonical slot large enough for multi-slice files.

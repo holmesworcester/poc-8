@@ -10,8 +10,8 @@ use topo::protocol::event_modules::worker::{
 };
 use topo::protocol::event_modules::Modules;
 use topo::protocol::Protocol;
-use topo::workers::schema as worker_schema;
-use topo::workers::{dependency_unblock, event_admission, event_projection, sync};
+use topo::protocol::workers::schema as worker_schema;
+use topo::protocol::workers::{dependency_unblock, event_admission, event_projection, sync};
 
 #[test]
 fn command_admission_returns_event_ids_for_chaining() {
@@ -272,6 +272,7 @@ fn sync_worker_consumes_applied_shared_event_queue() {
     let output = workspace::commands::create(workspace::commands::CreateWorkspace {
         created_at_ms: 1,
         public_key: [9; 32],
+        disappearing_ttl_minutes: 0,
         name: "queue-index".to_string(),
     })
     .unwrap();

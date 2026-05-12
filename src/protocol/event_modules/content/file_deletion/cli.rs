@@ -12,7 +12,7 @@ use crate::protocol::event_modules::content::message;
 use crate::protocol::event_modules::identity::endpoint;
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker;
-use crate::workers::content_purge;
+use crate::protocol::workers::content_purge;
 
 use super::commands;
 

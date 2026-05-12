@@ -2,7 +2,7 @@
 //!
 //! This file is the user-facing adapter for connection commands. It parses argv,
 //! sends a connection request, and formats the report. Ongoing daemon
-//! scheduling uses the core daemon runner and the `src/workers` catalog.
+//! scheduling uses the core daemon runner and the `src/protocol/workers` catalog.
 
 use std::time::Duration;
 
@@ -10,7 +10,7 @@ use super::connection_request;
 use crate::core::cli::{CliArgs, CliCommand, CliOutput};
 use crate::protocol::cli::Context;
 use crate::protocol::event_modules::worker;
-use crate::workers::connection as connection_worker;
+use crate::protocol::workers::connection as connection_worker;
 
 const CONNECT_USAGE: &str = "connect INVITE_LINK";
 const CONNECT_WAIT: Duration = Duration::from_secs(2);

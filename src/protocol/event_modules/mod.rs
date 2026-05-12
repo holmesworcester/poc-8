@@ -17,7 +17,7 @@ pub mod schema;
 pub mod sync;
 pub mod test_events;
 pub mod types;
-pub use crate::workers::pipeline_helpers::event_pipeline as worker;
+pub use crate::protocol::workers::pipeline_helpers::event_pipeline as worker;
 
 /// Re-export of the local history-node leaf event module under a name that
 /// does not embed the parent domain's vocabulary, so consumer projectors that
@@ -26,14 +26,21 @@ pub use crate::workers::pipeline_helpers::event_pipeline as worker;
 /// through the encryption module; this is a stable referencing alias only.
 pub use encryption::local_history_node_secret as leaf_history_node;
 
+/// Re-export of the disappearing-messages setting event module under a name
+/// that does not embed the parent domain's vocabulary. The message
+/// projector validates per-message disappearing-policy references against
+/// signed setting events; this alias lets the projector decode those
+/// canonical bytes without tripping the "no encrypt" projector lint.
+pub use encryption::disappearing_messages_setting;
+
 use std::sync::Arc;
 
 use crate::core::store::{Schema, Store};
 use crate::protocol::event_modules::types::{EventRecord, ReceiveMetadata};
 use crate::protocol::event_modules::worker::{
-    EventRegistry, EventWithContext, ProjectionOutput, ReceivedRecord,
+    AdmitDecision, EventRegistry, EventWithContext, ProjectionOutput, ReceivedRecord,
 };
-use crate::workers::schema::TransitProvenance;
+use crate::protocol::workers::schema::TransitProvenance;
 
 #[derive(Debug, Clone, Default)]
 pub struct Modules {
@@ -107,6 +114,7 @@ pub fn schemas() -> Vec<Schema> {
     out.extend_from_slice(content::reaction::schema::SCHEMAS);
     out.extend_from_slice(content::file::schema::SCHEMAS);
     out.extend_from_slice(content::file_slice::schema::SCHEMAS);
+    out.extend_from_slice(encryption::disappearing_messages_setting::schema::SCHEMAS);
     out.extend_from_slice(encryption::key_wrap::schema::SCHEMAS);
     out.extend_from_slice(encryption::local_history_node_secret::schema::SCHEMAS);
     out.extend_from_slice(encryption::local_key_secret::schema::SCHEMAS);
@@ -115,6 +123,7 @@ pub fn schemas() -> Vec<Schema> {
     out.extend_from_slice(encryption::recipient_key_tombstone::schema::SCHEMAS);
     out.extend_from_slice(encryption::removal_frontier::schema::SCHEMAS);
     out.extend_from_slice(connection::schema::SCHEMAS);
+    out.extend_from_slice(sync::schema::SCHEMAS);
     out.extend_from_slice(test_events::event_with_deps::schema::SCHEMAS);
     out
 }
@@ -153,12 +162,23 @@ impl EventRegistry for Modules {
         self.project_record(store, event)
     }
 
+    fn admit_received_record(
+        &self,
+        store: &Store,
+        record: &EventRecord,
+    ) -> Result<AdmitDecision, String> {
+        // Only the content domain currently has receive-side admission
+        // gates (drop re-deliveries of tombstoned messages and their
+        // dependents). Other domains opt in by adding a branch here.
+        content::admit_check_received(store, record)
+    }
+
     fn post_admission_hook(&self, store: &Store) -> Result<(), String> {
         // Bounded post-admission drains for this protocol live in the worker
         // catalog. The catalog observes projector-emitted indicator rows and
         // dispatches to the right worker, so this registry stays narrow: it
         // does not branch on event type or own worker dispatch logic.
-        crate::workers::drain_post_admission_purge_pending(store, self)
+        crate::protocol::workers::drain_post_admission_purge_pending(store, self)
     }
 }
 
@@ -262,6 +282,12 @@ pub fn record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
         }
         encryption::key_wrap::codec::TYPE_KEY_WRAP => Err("key_wrap must be signed".to_string()),
         encryption::key_wrap::codec::TYPE_SIGNED_KEY_WRAP => encryption::record_from_bytes(bytes),
+        encryption::disappearing_messages_setting::codec::TYPE_DISAPPEARING_MESSAGES_SETTING => {
+            Err("disappearing_messages_setting must be signed".to_string())
+        }
+        encryption::disappearing_messages_setting::codec::TYPE_SIGNED_DISAPPEARING_MESSAGES_SETTING => {
+            encryption::record_from_bytes(bytes)
+        }
         test_events::event_with_deps::codec::TYPE_EVENT_WITH_DEPS => {
             test_events::event_with_deps::codec::record_from_bytes(bytes)
         }

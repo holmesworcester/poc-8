@@ -210,6 +210,7 @@ mod tests {
                 dependencies,
                 labels: Vec::new(),
                 receive: None,
+                now_unix_minute: None,
             },
         }
     }

@@ -38,7 +38,7 @@ use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::sync;
 use crate::protocol::event_modules::types::{EventId, ReceiveMetadata};
 use crate::protocol::event_modules::worker::{ProjectionOutput, ReceivedRecord};
-use crate::workers::schema as worker_schema;
+use crate::protocol::workers::schema as worker_schema;
 use std::net::SocketAddr;
 
 use super::super::schema as connection_schema;
@@ -519,7 +519,7 @@ mod tests {
     use crate::protocol::event_modules::connection::transit;
     use crate::protocol::event_modules::identity::endpoint;
     use crate::protocol::Protocol;
-    use crate::workers::schema as worker_schema;
+    use crate::protocol::workers::schema as worker_schema;
 
     use super::*;
 

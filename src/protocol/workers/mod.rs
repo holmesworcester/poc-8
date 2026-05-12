@@ -10,7 +10,7 @@
 //! schemas, commands, and projectors; workers own bounded movement between
 //! explicit inputs and outputs.
 //!
-//! See `src/workers/README.md` for the universal worker contract, queue list,
+//! See `src/protocol/workers/README.md` for the universal worker contract, queue list,
 //! and caller-owned scheduling rules.
 
 use crate::core::daemon::Worker;
@@ -20,9 +20,12 @@ use crate::protocol::event_modules::content::message_deletion;
 pub mod connection;
 pub mod content_purge;
 pub mod dependency_unblock;
+pub mod disappearing_floor_dispatcher;
+pub mod disappearing_minute_expiry;
 pub mod encryption;
 pub mod event_admission;
 pub mod event_projection;
+pub mod negentropy_purge_drainer;
 pub(crate) mod pipeline_helpers;
 pub mod schema;
 pub mod sync;
@@ -73,6 +76,16 @@ where
         dependency_unblock::daemon_worker(),
         encryption::daemon_worker(),
         content_purge::daemon_worker(),
+        // Per-message TTL retirements first; the cover-horizon chop in the
+        // next worker subsumes any per-leaf tombstones whose minutes fall
+        // under the new floor, so running expiry first minimizes transient
+        // state.
+        disappearing_minute_expiry::daemon_worker(),
+        disappearing_floor_dispatcher::daemon_worker(),
+        // Drain the negentropy purge queue before sync runs so the
+        // response-producing comparisons in the same tick read an index
+        // that no longer references purged ids.
+        negentropy_purge_drainer::daemon_worker(),
         connection::daemon_worker(),
         sync::daemon_worker(),
         transit_out::daemon_worker(),
@@ -94,14 +107,43 @@ mod tests {
         assert!(names.contains(&"encryption"));
         assert!(names.contains(&"sync_tick"));
         assert!(names.contains(&"transit_out"));
+        assert!(names.contains(&"negentropy_purge_drainer"));
         assert!(!names.contains(&"peer_supervisor"));
+    }
+
+    #[test]
+    fn negentropy_purge_drainer_runs_after_disappearing_floor_dispatcher_and_before_sync() {
+        let names: Vec<&'static str> = daemon_workers::<TestContext>()
+            .iter()
+            .map(|w| w.name)
+            .collect();
+        let floor = names
+            .iter()
+            .position(|n| *n == "disappearing_floor_dispatcher")
+            .expect("disappearing_floor_dispatcher in catalog");
+        let drainer = names
+            .iter()
+            .position(|n| *n == "negentropy_purge_drainer")
+            .expect("negentropy_purge_drainer in catalog");
+        let sync = names
+            .iter()
+            .position(|n| *n == "sync_tick")
+            .expect("sync_tick in catalog");
+        assert!(
+            floor < drainer,
+            "drainer must run after the chop dispatcher so chop-emitted purge rows are visible"
+        );
+        assert!(
+            drainer < sync,
+            "drainer must run before sync_tick so the response-producing summary reads a clean index"
+        );
     }
 
     /// Test-only DaemonWorkerContext. Workers are never actually invoked here;
     /// the list is built only to surface their `name` field.
     struct TestContext;
 
-    impl crate::workers::pipeline_helpers::event_pipeline::EventRegistry for TestContext {
+    impl crate::protocol::workers::pipeline_helpers::event_pipeline::EventRegistry for TestContext {
         fn record_from_bytes(
             &self,
             _bytes: Vec<u8>,
@@ -113,7 +155,7 @@ mod tests {
             &self,
             _store: &Store,
             _inbound: &crate::core::network_queues::InboundNetworkRow,
-        ) -> Result<crate::workers::pipeline_helpers::event_pipeline::ProjectionOutput, String>
+        ) -> Result<crate::protocol::workers::pipeline_helpers::event_pipeline::ProjectionOutput, String>
         {
             Err("not implemented".to_string())
         }
@@ -123,8 +165,8 @@ mod tests {
             _store: &Store,
             _bytes: Vec<u8>,
             _receive: Option<crate::protocol::event_modules::types::ReceiveMetadata>,
-            _provenance: Option<crate::workers::schema::TransitProvenance>,
-        ) -> Result<crate::workers::pipeline_helpers::event_pipeline::ReceivedRecord, String>
+            _provenance: Option<crate::protocol::workers::schema::TransitProvenance>,
+        ) -> Result<crate::protocol::workers::pipeline_helpers::event_pipeline::ReceivedRecord, String>
         {
             Err("not implemented".to_string())
         }
@@ -132,8 +174,8 @@ mod tests {
         fn project_record(
             &self,
             _store: &Store,
-            _event: &crate::workers::pipeline_helpers::event_pipeline::EventWithContext<'_>,
-        ) -> Result<crate::workers::pipeline_helpers::event_pipeline::ProjectionOutput, String>
+            _event: &crate::protocol::workers::pipeline_helpers::event_pipeline::EventWithContext<'_>,
+        ) -> Result<crate::protocol::workers::pipeline_helpers::event_pipeline::ProjectionOutput, String>
         {
             Err("not implemented".to_string())
         }

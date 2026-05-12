@@ -23,8 +23,8 @@ use crate::protocol::event_modules::identity::endpoint;
 use crate::protocol::event_modules::identity::endpoint::types::EndpointId;
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::sync::SyncIndex;
-use crate::workers::schema as worker_schema;
-use crate::workers::DaemonWorkerContext;
+use crate::protocol::workers::schema as worker_schema;
+use crate::protocol::workers::DaemonWorkerContext;
 
 /// Opaque bytes prepared for one route after draining protocol out rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
