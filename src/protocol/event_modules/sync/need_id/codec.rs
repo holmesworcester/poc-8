@@ -4,36 +4,32 @@
 //! response path dedupes in transit out by `(connection_id, event_id)`.
 
 use crate::protocol::event_modules::types::{ConnectionScope, EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::NeedIdEvent;
 
 pub const TYPE_SYNC_NEED_ID: u8 = 142;
-pub const ENCODED_BYTES: usize = 1 + 32 + 32;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "sync.need_id",
+    TYPE_SYNC_NEED_ID,
+    &[Field::id("connection_id"), Field::id("id")],
+);
 
 pub fn encode(event: &NeedIdEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(ENCODED_BYTES);
-    out.u8(TYPE_SYNC_NEED_ID);
-    out.id(&event.connection_id);
-    out.id(&event.id);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .id(&event.connection_id)
+        .id(&event.id)
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<NeedIdEvent, String> {
-    if bytes.len() != ENCODED_BYTES {
-        return Err("sync need-id length mismatch".to_string());
-    }
-    let mut reader = Reader::new(bytes, "sync need-id");
-    let tag = reader.u8()?;
-    if tag != TYPE_SYNC_NEED_ID {
-        return Err("unknown sync need-id event".to_string());
-    }
-    let event = NeedIdEvent {
-        connection_id: reader.id()?,
-        id: reader.id()?,
-    };
-    reader.finish()?;
-    Ok(event)
+    let v = SCHEMA.parse(bytes)?;
+    Ok(NeedIdEvent {
+        connection_id: v.id("connection_id")?,
+        id: v.id("id")?,
+    })
 }
 
 pub fn is_event(bytes: &[u8]) -> bool {

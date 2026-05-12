@@ -5,38 +5,38 @@
 //! wrapping.
 
 use crate::protocol::event_modules::types::{ConnectionScope, EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::HaveIdEvent;
 
 pub const TYPE_SYNC_HAVE_ID: u8 = 141;
-pub const ENCODED_BYTES: usize = 1 + 32 + 8 + 32;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "sync.have_id",
+    TYPE_SYNC_HAVE_ID,
+    &[
+        Field::id("connection_id"),
+        Field::u64("timestamp"),
+        Field::id("id"),
+    ],
+);
 
 pub fn encode(event: &HaveIdEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(ENCODED_BYTES);
-    out.u8(TYPE_SYNC_HAVE_ID);
-    out.id(&event.connection_id);
-    out.u64(event.timestamp);
-    out.id(&event.id);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .id(&event.connection_id)
+        .u64(event.timestamp)
+        .id(&event.id)
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<HaveIdEvent, String> {
-    if bytes.len() != ENCODED_BYTES {
-        return Err("sync have-id length mismatch".to_string());
-    }
-    let mut reader = Reader::new(bytes, "sync have-id");
-    let tag = reader.u8()?;
-    if tag != TYPE_SYNC_HAVE_ID {
-        return Err("unknown sync have-id event".to_string());
-    }
-    let event = HaveIdEvent {
-        connection_id: reader.id()?,
-        timestamp: reader.u64()?,
-        id: reader.id()?,
-    };
-    reader.finish()?;
-    Ok(event)
+    let v = SCHEMA.parse(bytes)?;
+    Ok(HaveIdEvent {
+        connection_id: v.id("connection_id")?,
+        timestamp: v.u64("timestamp")?,
+        id: v.id("id")?,
+    })
 }
 
 pub fn is_event(bytes: &[u8]) -> bool {

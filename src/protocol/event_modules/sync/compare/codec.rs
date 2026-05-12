@@ -5,54 +5,57 @@
 //! transient event, not a nested packet item.
 
 use crate::protocol::event_modules::types::{ConnectionScope, EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::{CompareEvent, RangeSummary, TimestampRange};
 
 pub const TYPE_SYNC_COMPARE: u8 = 140;
-pub const ENCODED_BYTES: usize = 1 + 32 + 8 + 8 + 8 + 32 + 1;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "sync.compare",
+    TYPE_SYNC_COMPARE,
+    &[
+        Field::id("connection_id"),
+        Field::u64("range_start"),
+        Field::u64("range_end"),
+        Field::u64("summary_count"),
+        Field::id("summary_fingerprint"),
+        Field::u8("response_requested"),
+    ],
+);
 
 pub fn encode(event: &CompareEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(ENCODED_BYTES);
-    out.u8(TYPE_SYNC_COMPARE);
-    out.id(&event.connection_id);
-    out.u64(event.range.start);
-    out.u64(event.range.end);
-    out.u64(event.summary.count);
-    out.id(&event.summary.fingerprint);
-    out.u8(u8::from(event.response_requested));
-    out.finish()
+    SCHEMA
+        .encoder()
+        .id(&event.connection_id)
+        .u64(event.range.start)
+        .u64(event.range.end)
+        .u64(event.summary.count)
+        .id(&event.summary.fingerprint)
+        .u8(u8::from(event.response_requested))
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<CompareEvent, String> {
-    if bytes.len() != ENCODED_BYTES {
-        return Err("sync compare length mismatch".to_string());
-    }
-    let mut reader = Reader::new(bytes, "sync compare");
-    let tag = reader.u8()?;
-    if tag != TYPE_SYNC_COMPARE {
-        return Err("unknown sync compare event".to_string());
-    }
-    let connection_id = reader.id()?;
+    let v = SCHEMA.parse(bytes)?;
     let range = TimestampRange {
-        start: reader.u64()?,
-        end: reader.u64()?,
+        start: v.u64("range_start")?,
+        end: v.u64("range_end")?,
     };
     if range.start > range.end {
         return Err("sync compare range is inverted".to_string());
     }
     let summary = RangeSummary {
-        count: reader.u64()?,
-        fingerprint: reader.id()?,
+        count: v.u64("summary_count")?,
+        fingerprint: v.id("summary_fingerprint")?,
     };
-    let response_requested = match reader.u8()? {
+    let response_requested = match v.u8("response_requested")? {
         0 => false,
         1 => true,
         _ => return Err("sync compare response flag is invalid".to_string()),
     };
-    reader.finish()?;
     Ok(CompareEvent {
-        connection_id,
+        connection_id: v.id("connection_id")?,
         range,
         summary,
         response_requested,
