@@ -13,63 +13,62 @@
 
 use crate::core::crypto::XCHACHA20_POLY1305_KEY_BYTES;
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::{mask_prefix_to_depth, LocalHistoryNodeSecret, TRIE_LEAF_BIT_DEPTH};
 
 pub const TYPE_LOCAL_HISTORY_NODE_SECRET: u8 = 145;
-pub const LOCAL_HISTORY_NODE_SECRET_WIRE_SIZE: usize =
-    1 + 32 + 32 + 32 + 8 + 8 + 2 + 32 + 32 + XCHACHA20_POLY1305_KEY_BYTES;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "local_history_node_secret",
+    TYPE_LOCAL_HISTORY_NODE_SECRET,
+    &[
+        Field::id("workspace_id"),
+        Field::id("removal_frontier_id"),
+        Field::id("source_secret_id"),
+        Field::u64("range_start"),
+        Field::u64("range_width"),
+        Field::u16("bit_depth"),
+        Field::id("event_id_prefix"),
+        Field::id("tombstone_node_id_or_zero"),
+        Field::bytes("node_secret", XCHACHA20_POLY1305_KEY_BYTES),
+    ],
+);
+
+pub const LOCAL_HISTORY_NODE_SECRET_WIRE_SIZE: usize = SCHEMA.wire_size();
 
 pub fn encode(event: &LocalHistoryNodeSecret) -> Vec<u8> {
-    let mut out = Writer::with_capacity(LOCAL_HISTORY_NODE_SECRET_WIRE_SIZE);
-    out.u8(TYPE_LOCAL_HISTORY_NODE_SECRET);
-    out.id(&event.workspace_id);
-    out.id(&event.removal_frontier_id);
-    out.id(&event.source_secret_id);
-    out.u64(event.range_start);
-    out.u64(event.range_width);
-    out.raw(&event.bit_depth.to_be_bytes());
-    out.id(&mask_prefix_to_depth(
-        event.event_id_prefix,
-        event.bit_depth,
-    ));
-    out.id(&event.tombstone_node_id.unwrap_or([0; 32]));
-    out.id(&event.node_secret);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .id(&event.workspace_id)
+        .id(&event.removal_frontier_id)
+        .id(&event.source_secret_id)
+        .u64(event.range_start)
+        .u64(event.range_width)
+        .u16(event.bit_depth)
+        .id(&mask_prefix_to_depth(event.event_id_prefix, event.bit_depth))
+        .id(&event.tombstone_node_id.unwrap_or([0; 32]))
+        .bytes(&event.node_secret)
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<LocalHistoryNodeSecret, String> {
-    let mut reader = Reader::new(bytes, "local history node secret");
-    let tag = reader.u8()?;
-    if tag != TYPE_LOCAL_HISTORY_NODE_SECRET {
-        return Err("expected local history node secret".to_string());
-    }
-    let workspace_id = reader.id()?;
-    let removal_frontier_id = reader.id()?;
-    let source_secret_id = reader.id()?;
-    let range_start = reader.u64()?;
-    let range_width = reader.u64()?;
-    let bit_depth_bytes = reader.bytes(2)?;
-    let bit_depth = u16::from_be_bytes(
-        bit_depth_bytes
-            .try_into()
-            .map_err(|_| "local history node bit_depth malformed".to_string())?,
-    );
-    let event_id_prefix = reader.id()?;
-    let tombstone_node_id = reader.id()?;
+    let v = SCHEMA.parse(bytes)?;
+    let tombstone_node_id = v.id("tombstone_node_id_or_zero")?;
     let event = LocalHistoryNodeSecret {
-        workspace_id,
-        removal_frontier_id,
-        source_secret_id,
-        range_start,
-        range_width,
-        bit_depth,
-        event_id_prefix,
+        workspace_id: v.id("workspace_id")?,
+        removal_frontier_id: v.id("removal_frontier_id")?,
+        source_secret_id: v.id("source_secret_id")?,
+        range_start: v.u64("range_start")?,
+        range_width: v.u64("range_width")?,
+        bit_depth: v.u16("bit_depth")?,
+        event_id_prefix: v.id("event_id_prefix")?,
         tombstone_node_id: (!is_zero(&tombstone_node_id)).then_some(tombstone_node_id),
-        node_secret: reader.id()?,
+        node_secret: v
+            .raw("node_secret")?
+            .try_into()
+            .map_err(|_| "node_secret length".to_string())?,
     };
-    reader.finish()?;
     validate(&event)?;
     Ok(event)
 }
@@ -149,7 +148,7 @@ fn push_unique(out: &mut Vec<EventId>, id: EventId) {
     }
 }
 
-fn is_zero(bytes: &[u8; 32]) -> bool {
+fn is_zero<const N: usize>(bytes: &[u8; N]) -> bool {
     bytes.iter().all(|byte| *byte == 0)
 }
 

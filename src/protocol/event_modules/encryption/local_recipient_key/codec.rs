@@ -6,33 +6,38 @@
 
 use crate::core::crypto;
 use crate::protocol::event_modules::types::{EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::LocalRecipientKey;
 
 pub const TYPE_LOCAL_RECIPIENT_KEY: u8 = 143;
 
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "local_recipient_key",
+    TYPE_LOCAL_RECIPIENT_KEY,
+    &[
+        Field::id("workspace_id"),
+        Field::id("recipient_key"),
+        Field::id("recipient_secret"),
+    ],
+);
+
 pub fn encode(event: &LocalRecipientKey) -> Vec<u8> {
-    let mut out = Writer::with_capacity(1 + 32 + 32 + 32);
-    out.u8(TYPE_LOCAL_RECIPIENT_KEY);
-    out.id(&event.workspace_id);
-    out.id(&event.recipient_key);
-    out.id(&event.recipient_secret);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .id(&event.workspace_id)
+        .id(&event.recipient_key)
+        .id(&event.recipient_secret)
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<LocalRecipientKey, String> {
-    let mut reader = Reader::new(bytes, "local recipient key");
-    let tag = reader.u8()?;
-    if tag != TYPE_LOCAL_RECIPIENT_KEY {
-        return Err("expected local recipient key".to_string());
-    }
+    let v = SCHEMA.parse(bytes)?;
     let event = LocalRecipientKey {
-        workspace_id: reader.id()?,
-        recipient_key: reader.id()?,
-        recipient_secret: reader.id()?,
+        workspace_id: v.id("workspace_id")?,
+        recipient_key: v.id("recipient_key")?,
+        recipient_secret: v.id("recipient_secret")?,
     };
-    reader.finish()?;
     validate(&event)?;
     Ok(event)
 }
@@ -126,7 +131,7 @@ mod tests {
 
         let err = decode(&bytes).expect_err("trailing byte must fail");
 
-        assert!(err.starts_with("trailing "), "{err}");
+        assert!(err.contains("expected"), "{err}");
     }
 
     #[test]

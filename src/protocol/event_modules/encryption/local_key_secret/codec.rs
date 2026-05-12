@@ -7,34 +7,43 @@
 
 use crate::core::crypto::XCHACHA20_POLY1305_KEY_BYTES;
 use crate::protocol::event_modules::types::{EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::LocalKeySecret;
 
 pub const TYPE_LOCAL_KEY_SECRET: u8 = 144;
-pub const LOCAL_KEY_SECRET_WIRE_SIZE: usize = 1 + 32 + 32 + XCHACHA20_POLY1305_KEY_BYTES;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "local_key_secret",
+    TYPE_LOCAL_KEY_SECRET,
+    &[
+        Field::id("workspace_id"),
+        Field::id("removal_frontier_id"),
+        Field::bytes("key_secret", XCHACHA20_POLY1305_KEY_BYTES),
+    ],
+);
+
+pub const LOCAL_KEY_SECRET_WIRE_SIZE: usize = SCHEMA.wire_size();
 
 pub fn encode(event: &LocalKeySecret) -> Vec<u8> {
-    let mut out = Writer::with_capacity(LOCAL_KEY_SECRET_WIRE_SIZE);
-    out.u8(TYPE_LOCAL_KEY_SECRET);
-    out.id(&event.workspace_id);
-    out.id(&event.removal_frontier_id);
-    out.id(&event.key_secret);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .id(&event.workspace_id)
+        .id(&event.removal_frontier_id)
+        .bytes(&event.key_secret)
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<LocalKeySecret, String> {
-    let mut reader = Reader::new(bytes, "local key secret");
-    let tag = reader.u8()?;
-    if tag != TYPE_LOCAL_KEY_SECRET {
-        return Err("expected local key secret".to_string());
-    }
+    let v = SCHEMA.parse(bytes)?;
     let event = LocalKeySecret {
-        workspace_id: reader.id()?,
-        removal_frontier_id: reader.id()?,
-        key_secret: reader.id()?,
+        workspace_id: v.id("workspace_id")?,
+        removal_frontier_id: v.id("removal_frontier_id")?,
+        key_secret: v
+            .raw("key_secret")?
+            .try_into()
+            .map_err(|_| "key_secret length".to_string())?,
     };
-    reader.finish()?;
     validate(&event)?;
     Ok(event)
 }
@@ -64,7 +73,7 @@ fn validate(event: &LocalKeySecret) -> Result<(), String> {
     Ok(())
 }
 
-fn is_zero(bytes: &[u8; 32]) -> bool {
+fn is_zero(bytes: &[u8; XCHACHA20_POLY1305_KEY_BYTES]) -> bool {
     bytes.iter().all(|byte| *byte == 0)
 }
 
