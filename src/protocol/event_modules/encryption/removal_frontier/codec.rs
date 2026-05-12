@@ -118,7 +118,7 @@ pub fn decode_signed(bytes: &[u8]) -> Result<SignedRemovalFrontierEnvelope, Stri
     }
     let signer_endpoint_shared_id = reader.id()?;
     let signer_public_key = reader.id()?;
-    let payload = reader.sized_bytes()?;
+    let payload = reader.bytes(REMOVAL_FRONTIER_WIRE_SIZE)?;
     let signature_bytes = reader.bytes(ED25519_SIGNATURE_BYTES)?;
     reader.finish()?;
 
@@ -214,11 +214,11 @@ fn write_signing_fields(out: &mut Writer, event: &SignedRemovalFrontierEnvelope)
     out.u8(TYPE_SIGNED_REMOVAL_FRONTIER);
     out.id(&event.signer_endpoint_shared_id);
     out.id(&event.signer_public_key);
-    out.sized_bytes(&event.payload);
+    out.raw(&event.payload);
 }
 
 fn signing_len(payload_len: usize) -> usize {
-    1 + 32 + 32 + 4 + payload_len
+    1 + 32 + 32 + payload_len
 }
 
 fn fixed_signature(bytes: Vec<u8>) -> Result<[u8; ED25519_SIGNATURE_BYTES], String> {
