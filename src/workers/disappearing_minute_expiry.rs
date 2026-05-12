@@ -20,6 +20,7 @@
 use crate::core::daemon::{StepContext, Worker};
 use crate::core::logical_clock;
 use crate::core::store::Store;
+use crate::protocol::event_modules::content::message::queries as message_queries;
 use crate::protocol::event_modules::content::message::schema as message_schema;
 use crate::protocol::event_modules::content::message::types::{
     message_event_id_in_minute, UNIX_MINUTE_MS,
