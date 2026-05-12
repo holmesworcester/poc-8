@@ -161,4 +161,14 @@ impl<'a> Reader<'a> {
             Err(format!("trailing {} bytes", self.label))
         }
     }
+
+    /// Return whatever bytes remain in the reader and advance to the end.
+    /// Used by codecs whose trailing field is "rest of frame" — typically the
+    /// transit envelope's ciphertext, where the outer transport layer supplies
+    /// the frame boundary so no inner length prefix is needed.
+    pub fn rest(&mut self) -> &'a [u8] {
+        let out = self.rest;
+        self.rest = &[];
+        out
+    }
 }

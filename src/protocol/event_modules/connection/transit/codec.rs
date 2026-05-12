@@ -10,8 +10,12 @@ use crate::protocol::wire::{Reader, Writer};
 
 use super::types::{TransitEnvelope, TransitNonce};
 
+/// Outermost protocol probe. Lives in front of every TCP frame so the byte
+/// stream can be rejected as non-TOPO without entering the AEAD path. The
+/// trailing `1` is a version digit; bumping it forces old peers to reject
+/// rather than misparse a future wire shape.
 const MAGIC: &[u8; 10] = b"TOPOTRANS1";
-const INNER_EVENTS_MAGIC: &[u8; 10] = b"TOPOINNER1";
+
 const TAG_BOOTSTRAP: u8 = 1;
 const TAG_CONNECTION: u8 = 2;
 const TAG_CONNECTION_HANDSHAKE_RESPONSE: u8 = 4;
@@ -139,7 +143,7 @@ pub fn encode(envelope: &TransitEnvelope) -> Vec<u8> {
             out.id(sender_endpoint);
             out.id(recipient_endpoint);
             out.raw(nonce);
-            out.sized_bytes(ciphertext);
+            out.raw(ciphertext);
         }
         TransitEnvelope::ConnectionHandshakeResponse {
             request_id,
@@ -155,7 +159,7 @@ pub fn encode(envelope: &TransitEnvelope) -> Vec<u8> {
             out.id(recipient_endpoint);
             out.id(responder_ephemeral_public_key);
             out.raw(nonce);
-            out.sized_bytes(ciphertext);
+            out.raw(ciphertext);
         }
         TransitEnvelope::Connection {
             connection_id,
@@ -169,19 +173,24 @@ pub fn encode(envelope: &TransitEnvelope) -> Vec<u8> {
             out.id(sender_endpoint);
             out.id(recipient_endpoint);
             out.raw(nonce);
-            out.sized_bytes(ciphertext);
+            out.raw(ciphertext);
         }
     }
     out.finish()
 }
 
+/// Inner-events batch wire format: `count(u32) || (sized_bytes(inner))*`.
+///
+/// The leading TOPOINNER1 magic was removed: this batch only ever appears as
+/// the plaintext inside an authenticated transit ciphertext, so the AEAD tag
+/// already proves the bytes came from this protocol — the extra magic was
+/// just defense-in-depth that didn't earn its 10 bytes.
 pub fn encode_inner_events(inners: &[Vec<u8>]) -> Result<Vec<u8>, String> {
     let count = inners.len();
     if count > u32::MAX as usize {
         return Err("too many inner events in transit".to_string());
     }
     let mut out = Writer::new();
-    out.raw(INNER_EVENTS_MAGIC);
     out.u32(count);
     for inner in inners {
         out.sized_bytes(inner);
@@ -190,10 +199,7 @@ pub fn encode_inner_events(inners: &[Vec<u8>]) -> Result<Vec<u8>, String> {
 }
 
 pub fn decode_inner_events(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
-    if !bytes.starts_with(INNER_EVENTS_MAGIC) {
-        return Err("not a transit inner-event batch".to_string());
-    }
-    let mut reader = Reader::new(&bytes[INNER_EVENTS_MAGIC.len()..], "transit inner events");
+    let mut reader = Reader::new(bytes, "transit inner events");
     let count = reader.u32()? as usize;
     let mut inners = Vec::with_capacity(count);
     for _ in 0..count {
@@ -249,7 +255,9 @@ pub fn decode(bytes: &[u8]) -> Result<TransitEnvelope, String> {
 
 pub(crate) fn decode_ref(bytes: &[u8]) -> Result<TransitEnvelopeRef<'_>, String> {
     // Borrow the ciphertext slice during decoding so unwrap can decrypt without
-    // first allocating a second copy.
+    // first allocating a second copy. Ciphertext is the rest of the frame —
+    // the transport layer (TCP frame prefix) supplies the outer length, so
+    // there is no `sized_bytes(ciphertext)` inside this envelope.
     if !bytes.starts_with(MAGIC) {
         return Err("not a transit envelope".to_string());
     }
@@ -259,7 +267,7 @@ pub(crate) fn decode_ref(bytes: &[u8]) -> Result<TransitEnvelopeRef<'_>, String>
             sender_endpoint: reader.id()?,
             recipient_endpoint: reader.id()?,
             nonce: nonce24(&mut reader)?,
-            ciphertext: reader.sized_slice()?,
+            ciphertext: reader.rest(),
         },
         TAG_CONNECTION_HANDSHAKE_RESPONSE => TransitEnvelopeRef::ConnectionHandshakeResponse {
             request_id: reader.id()?,
@@ -267,18 +275,17 @@ pub(crate) fn decode_ref(bytes: &[u8]) -> Result<TransitEnvelopeRef<'_>, String>
             recipient_endpoint: reader.id()?,
             responder_ephemeral_public_key: reader.id()?,
             nonce: nonce24(&mut reader)?,
-            ciphertext: reader.sized_slice()?,
+            ciphertext: reader.rest(),
         },
         TAG_CONNECTION => TransitEnvelopeRef::Connection {
             connection_id: reader.id()?,
             sender_endpoint: reader.id()?,
             recipient_endpoint: reader.id()?,
             nonce: nonce24(&mut reader)?,
-            ciphertext: reader.sized_slice()?,
+            ciphertext: reader.rest(),
         },
         other => return Err(format!("unknown transit envelope tag {other}")),
     };
-    reader.finish()?;
     Ok(envelope)
 }
 
