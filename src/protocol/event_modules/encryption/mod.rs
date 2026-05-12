@@ -5,6 +5,7 @@
 //! commands, projection rows, and tests.
 
 pub mod cli;
+pub mod disappearing_messages_setting;
 pub mod key_wrap;
 pub mod local_history_node_secret;
 pub mod local_key_secret;
@@ -41,6 +42,9 @@ pub fn project_record(event: &EventWithContext<'_>) -> Result<Option<ProjectionO
         Some(key_wrap::codec::TYPE_SIGNED_KEY_WRAP) => {
             Ok(Some(key_wrap::projector::project(event)?))
         }
+        Some(disappearing_messages_setting::codec::TYPE_SIGNED_DISAPPEARING_MESSAGES_SETTING) => {
+            Ok(Some(disappearing_messages_setting::projector::project(event)?))
+        }
         _ => Ok(None),
     }
 }
@@ -69,6 +73,9 @@ pub fn record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
             removal_frontier::codec::signed_record_from_bytes(bytes)
         }
         key_wrap::codec::TYPE_SIGNED_KEY_WRAP => key_wrap::codec::signed_record_from_bytes(bytes),
+        disappearing_messages_setting::codec::TYPE_SIGNED_DISAPPEARING_MESSAGES_SETTING => {
+            disappearing_messages_setting::codec::signed_record_from_bytes(bytes)
+        }
         other => Err(format!("unknown encryption event type {other}")),
     }
 }

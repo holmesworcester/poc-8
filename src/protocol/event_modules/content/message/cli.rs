@@ -120,6 +120,8 @@ fn run_send_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
         timestamp,
         event_id_in_minute,
     )?;
+    let (expires_at_minute, disappearing_setting_id) =
+        workspace_expires_at_minute(&context.store, workspace_id, timestamp)?;
     let send = commands::send(commands::SendMessage {
         workspace_id,
         created_at_ms: timestamp,
@@ -129,6 +131,8 @@ fn run_send_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
         removal_frontier_id,
         local_history_node_secret_id: leaf.local_history_node_secret_id,
         leaf_node_secret: leaf.leaf_node_secret,
+        expires_at_minute,
+        disappearing_setting_id,
         text,
     })?;
     let report = worker::run(
@@ -307,6 +311,8 @@ fn open_sealed_message_row(
         author_user_id: row.author_user_id,
         removal_frontier_id: row.removal_frontier_id,
         local_history_node_secret_id: row.local_history_node_secret_id,
+        expires_at_minute: row.expires_at_minute,
+        disappearing_setting_id: row.disappearing_setting_id,
         nonce: row.nonce,
         ciphertext: row.ciphertext,
     };
@@ -508,25 +514,38 @@ pub(crate) struct MessageLeafKey {
 ///
 /// Senders need a frontier id to author messages; receivers do not call this
 /// because they trust the message body to name the frontier id.
+///
+/// A frontier is considered active when EITHER its F root row
+/// (`local_key_secret`) is on disk, OR at least one history-node sibling
+/// row survives under it. The latter case arises after
+/// `retire_deleted_event_leaf` wipes F: the materialized time-tree
+/// siblings still cover authoring for every non-retired coordinate, so
+/// `derive_event_leaf` can keep working without forcing a
+/// `key-frontier` rotation. See `closest_retained_ancestor` in
+/// `src/workers/encryption.rs` for the matching primitive.
 pub(crate) fn require_active_frontier_id(
     store: &Store,
     workspace_id: EventId,
 ) -> Result<EventId, String> {
     let mut candidates = Vec::new();
     for frontier in removal_frontier::schema::list_for_workspace(store, workspace_id)? {
-        let Some(secret) =
+        let root_present =
             local_key_secret::schema::get(store, workspace_id, frontier.removal_frontier_id)?
-        else {
+                .is_some();
+        let has_siblings = !root_present
+            && !local_history_node_secret::schema::list_for_frontier(
+                store,
+                workspace_id,
+                frontier.removal_frontier_id,
+            )?
+            .is_empty();
+        if !root_present && !has_siblings {
             continue;
-        };
-        candidates.push((
-            frontier.created_at_ms,
-            frontier.removal_frontier_id,
-            secret.local_key_secret_id,
-        ));
+        }
+        candidates.push((frontier.created_at_ms, frontier.removal_frontier_id));
     }
     candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    let Some((_, removal_frontier_id, _)) = candidates.pop() else {
+    let Some((_, removal_frontier_id)) = candidates.pop() else {
         return Err(
             "local content key is missing for workspace; run key-frontier or key-derive"
                 .to_string(),
@@ -598,6 +617,48 @@ fn max_timestamp_for_messages(store: &Store, workspace_id: EventId) -> Result<u6
         }
     }
     Ok(max)
+}
+
+/// Compute the authoring-time `expires_at_minute` and the
+/// `disappearing_setting_id` reference that produced it. Sources the TTL
+/// in this order:
+///   1. Active `disappearing_messages_setting` event for the workspace,
+///      if any has been admitted. The setting's event id is returned
+///      as the reference. Uses the latest setting under
+///      `(created_at_ms, event_id)` ordering — slice 2.
+///   2. The workspace event's `disappearing_ttl_minutes` field. The
+///      `workspace_id` is returned as the reference — slice 1 fallback.
+/// Returns `(EXPIRES_NEVER, reference)` when the resulting TTL is zero.
+pub(crate) fn workspace_expires_at_minute(
+    store: &Store,
+    workspace_id: EventId,
+    created_at_ms: u64,
+) -> Result<(u64, EventId), String> {
+    use crate::protocol::event_modules::content::message::types::{EXPIRES_NEVER, UNIX_MINUTE_MS};
+    use crate::protocol::event_modules::encryption::disappearing_messages_setting::schema as setting_schema;
+    use crate::protocol::event_modules::identity::workspace::schema as workspace_schema;
+
+    let (ttl_minutes, reference) =
+        if let Some(active) = setting_schema::active_for_workspace(store, workspace_id)? {
+            (active.ttl_minutes, active.setting_event_id)
+        } else {
+            let key = workspace_id;
+            let value = store
+                .table_row(workspace_schema::WORKSPACES, &key)
+                .map_err(|err| format!("load workspace row: {err}"))?
+                .ok_or_else(|| "workspace row is missing".to_string())?;
+            let row = workspace_schema::decode_workspace_row(&key, &value)?;
+            (row.disappearing_ttl_minutes, workspace_id)
+        };
+
+    if ttl_minutes == 0 {
+        return Ok((EXPIRES_NEVER, reference));
+    }
+    let authored_minute = created_at_ms / UNIX_MINUTE_MS;
+    Ok((
+        authored_minute.saturating_add(ttl_minutes as u64),
+        reference,
+    ))
 }
 
 fn user_name(store: &Store, workspace_id: EventId, user_id: EventId) -> Result<String, String> {

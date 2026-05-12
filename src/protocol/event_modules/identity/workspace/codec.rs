@@ -3,8 +3,13 @@
 //! The workspace format is fixed-width:
 //!
 //! ```text
-//! type(1) || created_at_ms(8) || public_key(32) || name_utf8_zero_padded(64)
+//! type(1) || created_at_ms(8) || public_key(32) || disappearing_ttl_minutes(4)
+//!   || name_utf8_zero_padded(64)
 //! ```
+//!
+//! `disappearing_ttl_minutes` is the workspace-wide TTL stamped onto every
+//! authored content event. `0` means disappearing messages are disabled
+//! for the workspace; non-zero values fix expiry at authoring time.
 //!
 //! The event id of these canonical bytes is the workspace id.
 
@@ -21,6 +26,7 @@ pub const SCHEMA: WireSchema = WireSchema::new(
     &[
         Field::u64("created_at_ms"),
         Field::id("public_key"),
+        Field::u32("disappearing_ttl_minutes"),
         Field::bytes("name", WORKSPACE_NAME_BYTES),
     ],
 );
@@ -33,6 +39,7 @@ pub fn encode(event: &WorkspaceEvent) -> Result<Vec<u8>, String> {
         .encoder()
         .u64(event.created_at_ms)
         .id(&event.public_key)
+        .u32(event.disappearing_ttl_minutes)
         .bytes(&name)
         .finish())
 }
@@ -42,6 +49,7 @@ pub fn decode(bytes: &[u8]) -> Result<WorkspaceEvent, String> {
     Ok(WorkspaceEvent {
         created_at_ms: v.u64("created_at_ms")?,
         public_key: v.id("public_key")?,
+        disappearing_ttl_minutes: v.u32("disappearing_ttl_minutes")?,
         name: decode_name(v.raw("name")?)?,
     })
 }
@@ -94,6 +102,7 @@ mod tests {
         WorkspaceEvent {
             created_at_ms: 42,
             public_key: [7; 32],
+            disappearing_ttl_minutes: 0,
             name: "Engineering".to_string(),
         }
     }
@@ -115,9 +124,22 @@ mod tests {
     #[test]
     fn rejects_non_canonical_name_padding() {
         let mut encoded = encode(&event()).expect("encode workspace");
-        let name_start = 1 + 8 + 32;
+        let name_start = 1 + 8 + 32 + 4;
         encoded[name_start + "Engineering".len() + 1] = b'x';
         assert!(decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn carries_disappearing_ttl_minutes() {
+        let event = WorkspaceEvent {
+            created_at_ms: 42,
+            public_key: [7; 32],
+            disappearing_ttl_minutes: 5,
+            name: "Ops".to_string(),
+        };
+        let encoded = encode(&event).expect("encode workspace");
+        let decoded = decode(&encoded).expect("decode workspace");
+        assert_eq!(decoded.disappearing_ttl_minutes, 5);
     }
 
     #[test]

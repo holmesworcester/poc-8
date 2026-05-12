@@ -99,7 +99,68 @@ impl SyncIndex {
         Ok(true)
     }
 
-    fn catch_up(&self, store: &Store) -> Result<(), String> {
+    /// Remove an event id from the in-memory negentropy index.
+    ///
+    /// This is the negentropy-side of the purge contract: the worker-owned
+    /// `purge_event_storage_in_tx` helper enqueues a row in the local-only
+    /// `negentropy_pending_purges` table whenever it drops the canonical
+    /// bytes of a workspace-scoped shared event; the negentropy purge
+    /// drainer worker picks up those rows and calls this method for each.
+    ///
+    /// Returns `true` if the id was present and was removed, `false` if
+    /// the id was not in the index. The latter is intentionally not an
+    /// error: a daemon that crashes between "remove from index" and
+    /// "delete queue row" replays this call on its next tick, and the
+    /// re-application has to be idempotent.
+    pub fn remove_event(&self, event_id: &EventId) -> Result<bool, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "sync index mutex poisoned".to_string())?;
+        Ok(state.remove(event_id))
+    }
+
+    /// Read the deterministic root summary over the entire admitted set.
+    ///
+    /// Two peers that have admitted (and possibly purged) the same set of
+    /// shared event ids reach byte-identical root summaries; tests use
+    /// this method to prove deterministic restructure after a drained
+    /// purge. The summary is stable under index permutations because it
+    /// is built by XOR'ing per-id fingerprints — the operation is
+    /// commutative and self-inverse.
+    pub fn root_summary(&self) -> Result<RangeSummary, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "sync index mutex poisoned".to_string())?;
+        Ok(summarize_entries(
+            &state.ids_in_range(TimestampRange::ROOT),
+        ))
+    }
+
+    /// Number of admitted event ids currently in the in-memory index.
+    pub fn indexed_event_count(&self) -> Result<usize, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "sync index mutex poisoned".to_string())?;
+        Ok(state.indexed.len())
+    }
+
+    /// Test/observability hook: returns true if the index currently
+    /// contains the id. Used by the negentropy purge drainer's tests.
+    pub fn contains_event(&self, event_id: &EventId) -> Result<bool, String> {
+        self.has_event(event_id)
+    }
+
+    /// Catch the in-memory index up from durable timestamp-index rows.
+    ///
+    /// This is the same scan `prepare_index_for_response` runs at the
+    /// start of every sync tick. Exposing it publicly lets the
+    /// `sync-status` CLI command fold an out-of-band query through the
+    /// same path the daemon uses, so a CLI inspection that runs while
+    /// no daemon is up reflects the durable state of the workspace.
+    pub fn catch_up(&self, store: &Store) -> Result<(), String> {
         let entries = event_schema::event_index_entries_in_timestamp_range(store, 0, u64::MAX)
             .map_err(|err| format!("load sync index feed: {err}"))?;
         for entry in entries {
@@ -713,6 +774,28 @@ impl IndexState {
         self.entries_by_id.insert(entry.event_id, entry);
     }
 
+    /// Remove an event id from every secondary structure.
+    ///
+    /// Returns true when the id was present. The drainer treats the
+    /// false return as a benign "already removed by an earlier tick"
+    /// signal so a daemon restart between removal and queue-row delete
+    /// is harmless. The dependency cache is also evicted because a
+    /// purged event id can no longer be a dep target.
+    fn remove(&mut self, event_id: &EventId) -> bool {
+        if !self.indexed.remove(event_id) {
+            return false;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        if let Some(entry) = self.entries_by_id.remove(event_id) {
+            self.ids_by_time.remove(&(entry.timestamp, entry.event_id));
+        }
+        self.deps_by_event.remove(event_id);
+        // Range-summary snapshots referenced this id transitively. Drop
+        // them so the next start-summary recomputes from the new set.
+        self.start_snapshots.clear();
+        true
+    }
+
     fn ids_in_range(&self, range: TimestampRange) -> Vec<EventIndexEntry> {
         let lower = (range.start, [0; 32]);
         let upper = (range.end, [0xff; 32]);
@@ -976,6 +1059,7 @@ mod tests {
         let workspace = workspace::commands::create(workspace::commands::CreateWorkspace {
             created_at_ms: 1,
             public_key: [9; 32],
+            disappearing_ttl_minutes: 0,
             name: "sync-in-route".to_string(),
         })
         .expect("create workspace");
@@ -1065,6 +1149,7 @@ mod tests {
         let workspace = workspace::commands::create(workspace::commands::CreateWorkspace {
             created_at_ms: 1,
             public_key: [9; 32],
+            disappearing_ttl_minutes: 0,
             name: "sync-route-prefer-inbound".to_string(),
         })
         .expect("create workspace");

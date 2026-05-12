@@ -16,6 +16,7 @@
 
 use crate::core::store::Store;
 use crate::protocol::event_modules::schema;
+use crate::protocol::event_modules::sync::schema as negentropy_purges;
 use crate::protocol::event_modules::types::{EventId, EventStatus};
 
 /// Remove one event's locally retained bytes and generic event-store indexes.
@@ -24,6 +25,15 @@ use crate::protocol::event_modules::types::{EventId, EventStatus};
 /// does not create or remove semantic deletion facts, and must be called only
 /// after a domain worker has verified that the protocol-visible state no longer
 /// needs the canonical bytes.
+///
+/// As part of the same transaction this also enqueues a row in the local-only
+/// `negentropy_pending_purges` table when the purged event was a workspace-
+/// scoped shared event. The negentropy purge drainer worker drains that
+/// table on the next daemon tick to remove the id from the in-memory
+/// `SyncIndex`. Hooking it here is the single place every purge site
+/// (per-leaf retire walks, chop walks, content-purge cascades, retired
+/// recipient material) goes through, so adding a new purge caller in the
+/// future does not have to know about the negentropy bookkeeping.
 pub(crate) fn purge_event_storage_in_tx(
     store: &Store,
     event_id: &EventId,
@@ -32,6 +42,8 @@ pub(crate) fn purge_event_storage_in_tx(
         return Ok(false);
     };
     let event = schema::decode_stored_event_index(&value)?;
+    let was_shared = event.scope.is_shared();
+    let workspace_id = event.workspace_id;
 
     let mut deleted_any = false;
     if event.status == EventStatus::Ready {
@@ -64,12 +76,23 @@ pub(crate) fn purge_event_storage_in_tx(
     deleted_any |=
         store.delete_table_rows_in_tx(schema::BLOCKED_EVENTS_BY_MISSING_DEP, forward_keys)? > 0;
     deleted_any |= store.delete_table_rows_in_tx(schema::EVENTS, vec![event_id.to_vec()])? > 0;
+
+    // Negentropy bookkeeping: only shared events are admitted to the
+    // workspace-scoped sync index, so non-shared / workspace-less purges
+    // skip the queue. The `enqueue_purge_in_tx` helper itself enforces the
+    // workspace-id requirement, but checking `was_shared` here keeps the
+    // intent legible at the call site.
+    if was_shared && workspace_id.is_some() {
+        let _ = negentropy_purges::enqueue_purge_in_tx(store, workspace_id, event_id)?;
+    }
+
     Ok(deleted_any)
 }
 
 #[cfg(test)]
 mod tests {
     use crate::protocol::event_modules::schema::{self as event_schema, EventLabel};
+    use crate::protocol::event_modules::sync::schema as negentropy_purges;
     use crate::protocol::event_modules::types::{event_id, EventRecord, EventScope};
     use crate::protocol::Protocol;
     use crate::workers::pipeline_helpers::event_lifecycle;
@@ -140,5 +163,65 @@ mod tests {
             .expect("purge missing event");
 
         assert!(!purged);
+        assert_eq!(
+            negentropy_purges::pending_purge_count(&store).expect("count"),
+            0,
+            "missing-event purge must not enqueue a negentropy purge row"
+        );
+    }
+
+    #[test]
+    fn purge_event_storage_enqueues_negentropy_purge_for_workspace_scoped_shared_event() {
+        let store = Protocol::open_memory_store().expect("store");
+        let workspace_id = [42; 32];
+        let record = EventRecord {
+            timestamp: 7,
+            body_len: 4,
+            canonical_bytes: b"hook".to_vec(),
+            dependencies: Vec::new(),
+            workspace_id: Some(workspace_id),
+            scope: EventScope::Shared,
+        };
+        let target_id = event_id(&record.canonical_bytes);
+
+        event_lifecycle::insert_event(&store, &record, EventStatus::Ready)
+            .expect("insert event");
+
+        let purged = store
+            .write_transaction(|store| purge_event_storage_in_tx(store, &target_id))
+            .expect("purge");
+        assert!(purged);
+
+        let queued = negentropy_purges::drain_pending_purges(&store, 16).expect("drain");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].workspace_id, workspace_id);
+        assert_eq!(queued[0].event_id, target_id);
+    }
+
+    #[test]
+    fn purge_event_storage_does_not_enqueue_for_local_scope_event() {
+        let store = Protocol::open_memory_store().expect("store");
+        let record = EventRecord {
+            timestamp: 7,
+            body_len: 4,
+            canonical_bytes: b"local-hook".to_vec(),
+            dependencies: Vec::new(),
+            workspace_id: None,
+            scope: EventScope::Local,
+        };
+        let target_id = event_id(&record.canonical_bytes);
+
+        event_lifecycle::insert_event(&store, &record, EventStatus::Applied)
+            .expect("insert event");
+
+        store
+            .write_transaction(|store| purge_event_storage_in_tx(store, &target_id))
+            .expect("purge");
+
+        assert_eq!(
+            negentropy_purges::pending_purge_count(&store).expect("count"),
+            0,
+            "local-scope events are not in the negentropy index, so no queue row needed"
+        );
     }
 }

@@ -73,6 +73,7 @@ mod tests {
                 dependencies: Vec::new(),
                 labels: Vec::new(),
                 receive: None,
+                now_unix_minute: None,
             },
         }
     }

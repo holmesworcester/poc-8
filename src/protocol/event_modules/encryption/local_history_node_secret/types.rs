@@ -80,6 +80,13 @@ pub struct LocalHistoryNodeTombstoneRow {
     pub removal_frontier_id: EventId,
     pub tombstone_node_id: EventId,
     pub replacement_node_id: EventId,
+    /// Time-axis range start of the tombstoned node (unix minute when
+    /// `range_width = 1`). Used by the chop GC to decide subsumption:
+    /// a tombstone is subsumed by a chop with floor `f` when
+    /// `range_start + range_width <= f`.
+    pub range_start: u64,
+    /// Time-axis range width of the tombstoned node (power of two).
+    pub range_width: u64,
 }
 
 /// True if this row's coordinate names a trie leaf (an event's AEAD key

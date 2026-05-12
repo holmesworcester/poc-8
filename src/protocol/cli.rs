@@ -19,7 +19,7 @@ use crate::core::store::Store;
 use crate::protocol::event_modules::schema as event_schema;
 use crate::protocol::event_modules::types::{EventRecord, ReceiveMetadata};
 use crate::protocol::event_modules::worker::{
-    EventRegistry, EventWithContext, ProjectionOutput, ReceivedRecord,
+    AdmitDecision, EventRegistry, EventWithContext, ProjectionOutput, ReceivedRecord,
 };
 use crate::protocol::{event_modules, Protocol};
 use crate::workers::DaemonWorkerContext;
@@ -27,6 +27,8 @@ use crate::workers::DaemonWorkerContext;
 const CLOCK_USAGE: &str = "clock [set TIMESTAMP|advance DELTA|clear]";
 const COUNT_USAGE: &str = "count";
 const STATUS_USAGE: &str = "status";
+const SYNC_STATUS_USAGE: &str = "sync-status";
+const NEGENTROPY_DRAIN_USAGE: &str = "negentropy-drain [LIMIT]";
 
 pub struct Context {
     pub db_path: std::path::PathBuf,
@@ -78,6 +80,14 @@ impl EventRegistry for Context {
     ) -> Result<ProjectionOutput, String> {
         self.protocol.project_record(store, event)
     }
+
+    fn admit_received_record(
+        &self,
+        store: &Store,
+        record: &EventRecord,
+    ) -> Result<AdmitDecision, String> {
+        self.protocol.admit_received_record(store, record)
+    }
 }
 
 impl DaemonWorkerContext for Context {
@@ -111,6 +121,8 @@ pub fn commands() -> Vec<CliCommand<Context>> {
         clock_command(),
         count_command("count", COUNT_USAGE),
         count_command("status", STATUS_USAGE),
+        sync_status_command(),
+        negentropy_drain_command(),
     ]);
     out
 }
@@ -230,4 +242,133 @@ fn clock_output(store: &Store) -> Result<CliOutput, String> {
 
 fn parse_u64(value: &str) -> Result<u64, String> {
     value.parse::<u64>().map_err(|_| CLOCK_USAGE.to_string())
+}
+
+/// Inspect the in-memory negentropy `SyncIndex` and the durable
+/// pending-purge queue.
+///
+/// Returned lines:
+///   * `indexed_events: <usize>` — number of admitted ids in the index
+///   * `root_count: <u64>` — total ids contributing to the root summary
+///   * `root_fingerprint: <hex>` — XOR-fold of per-id fingerprints
+///   * `pending_purges: <usize>` — queued rows the drainer has not run on
+///
+/// Tests for the negentropy purge drainer assert root_fingerprint
+/// equality across two peers and zero pending_purges after a daemon
+/// tick. The catch-up call mirrors `prepare_index_for_response` so a
+/// CLI invocation outside the daemon sees the same index state the
+/// daemon would.
+fn sync_status_command() -> CliCommand<Context> {
+    CliCommand {
+        name: "sync-status",
+        usage: SYNC_STATUS_USAGE,
+        help: "Print the in-memory negentropy index size, root summary, and pending-purge queue size.",
+        run: run_sync_status_command,
+    }
+}
+
+fn run_sync_status_command(
+    context: &mut Context,
+    args: CliArgs<'_>,
+) -> Result<CliOutput, String> {
+    args.require_len(0, SYNC_STATUS_USAGE)?;
+    let index = context.protocol.sync_index();
+    // Catch the in-memory index up from durable rows so a fresh CLI
+    // invocation (no running daemon) sees the same state the daemon
+    // would after one `sync_tick` step. Then run the negentropy purge
+    // drainer so pending purge rows are applied to the index — that
+    // way `root_fingerprint` reflects the post-purge state on a
+    // CLI-only inspection, not just the post-purge state on a
+    // running daemon.
+    index
+        .catch_up(&context.store)
+        .map_err(|err| format!("catch up sync index: {err}"))?;
+    let _ = crate::workers::negentropy_purge_drainer::run(
+        &context.store,
+        index,
+        crate::workers::negentropy_purge_drainer::Work::Drain {
+            limit: usize::MAX,
+        },
+    )
+    .map_err(|err| format!("drain negentropy purges: {err}"))?;
+    let summary = index.root_summary()?;
+    let count = index.indexed_event_count()?;
+    let pending = event_modules::sync::schema::pending_purge_count(&context.store)
+        .map_err(|err| format!("count pending purges: {err}"))?;
+    Ok(CliOutput::lines(vec![
+        format!("indexed_events: {count}"),
+        format!("root_count: {}", summary.count),
+        format!("root_fingerprint: {}", hex_bytes(&summary.fingerprint)),
+        format!("pending_purges: {pending}"),
+    ]))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// Manually invoke one tick of the `negentropy_purge_drainer` worker.
+///
+/// Useful for tests and operators who want to force a drain without
+/// waiting for the daemon's sync_tick. Output mirrors `sync-status`'s
+/// post-drain shape so test callers can assert on the same fields:
+///
+///   * `drained: <count>` — rows pulled from `negentropy_pending_purges`
+///   * `remaining_pending: <count>` — queue rows still waiting after this tick
+///   * `new_root_count: <count>` — admitted ids contributing to the index
+///   * `new_root_fingerprint: <hex>` — XOR-fold of per-id fingerprints
+fn negentropy_drain_command() -> CliCommand<Context> {
+    CliCommand {
+        name: "negentropy-drain",
+        usage: NEGENTROPY_DRAIN_USAGE,
+        help: "Manually run one tick of the negentropy purge drainer; \
+               useful for forcing a drain in tests or after operator \
+               intervention without waiting for the daemon.",
+        run: run_negentropy_drain_command,
+    }
+}
+
+fn run_negentropy_drain_command(
+    context: &mut Context,
+    args: CliArgs<'_>,
+) -> Result<CliOutput, String> {
+    if args.values().len() > 1 {
+        return Err(NEGENTROPY_DRAIN_USAGE.to_string());
+    }
+    let limit = match args.get(0) {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| NEGENTROPY_DRAIN_USAGE.to_string())?,
+        None => crate::workers::negentropy_purge_drainer::DEFAULT_DRAIN_LIMIT,
+    };
+    let index = context.protocol.sync_index();
+    // Same sequencing as `sync-status`: catch the in-memory index up
+    // from durable rows so a CLI invocation outside the daemon sees
+    // the same starting state the daemon would.
+    index
+        .catch_up(&context.store)
+        .map_err(|err| format!("catch up sync index: {err}"))?;
+    let report = crate::workers::negentropy_purge_drainer::run(
+        &context.store,
+        index,
+        crate::workers::negentropy_purge_drainer::Work::Drain { limit },
+    )
+    .map_err(|err| format!("drain negentropy purges: {err}"))?;
+    let summary = index.root_summary()?;
+    let remaining = event_modules::sync::schema::pending_purge_count(&context.store)
+        .map_err(|err| format!("count pending purges: {err}"))?;
+    Ok(CliOutput::lines(vec![
+        format!("drained: {}", report.drained_rows),
+        format!("removed_from_index: {}", report.removed_from_index),
+        format!("remaining_pending: {remaining}"),
+        format!("new_root_count: {}", summary.count),
+        format!(
+            "new_root_fingerprint: {}",
+            hex_bytes(&summary.fingerprint)
+        ),
+    ]))
 }

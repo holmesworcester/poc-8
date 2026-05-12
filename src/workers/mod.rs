@@ -20,9 +20,12 @@ use crate::protocol::event_modules::content::message_deletion;
 pub mod connection;
 pub mod content_purge;
 pub mod dependency_unblock;
+pub mod disappearing_floor_dispatcher;
+pub mod disappearing_minute_expiry;
 pub mod encryption;
 pub mod event_admission;
 pub mod event_projection;
+pub mod negentropy_purge_drainer;
 pub(crate) mod pipeline_helpers;
 pub mod schema;
 pub mod sync;
@@ -73,6 +76,16 @@ where
         dependency_unblock::daemon_worker(),
         encryption::daemon_worker(),
         content_purge::daemon_worker(),
+        // Per-message TTL retirements first; the cover-horizon chop in the
+        // next worker subsumes any per-leaf tombstones whose minutes fall
+        // under the new floor, so running expiry first minimizes transient
+        // state.
+        disappearing_minute_expiry::daemon_worker(),
+        disappearing_floor_dispatcher::daemon_worker(),
+        // Drain the negentropy purge queue before sync runs so the
+        // response-producing comparisons in the same tick read an index
+        // that no longer references purged ids.
+        negentropy_purge_drainer::daemon_worker(),
         connection::daemon_worker(),
         sync::daemon_worker(),
         transit_out::daemon_worker(),
@@ -94,7 +107,36 @@ mod tests {
         assert!(names.contains(&"encryption"));
         assert!(names.contains(&"sync_tick"));
         assert!(names.contains(&"transit_out"));
+        assert!(names.contains(&"negentropy_purge_drainer"));
         assert!(!names.contains(&"peer_supervisor"));
+    }
+
+    #[test]
+    fn negentropy_purge_drainer_runs_after_disappearing_floor_dispatcher_and_before_sync() {
+        let names: Vec<&'static str> = daemon_workers::<TestContext>()
+            .iter()
+            .map(|w| w.name)
+            .collect();
+        let floor = names
+            .iter()
+            .position(|n| *n == "disappearing_floor_dispatcher")
+            .expect("disappearing_floor_dispatcher in catalog");
+        let drainer = names
+            .iter()
+            .position(|n| *n == "negentropy_purge_drainer")
+            .expect("negentropy_purge_drainer in catalog");
+        let sync = names
+            .iter()
+            .position(|n| *n == "sync_tick")
+            .expect("sync_tick in catalog");
+        assert!(
+            floor < drainer,
+            "drainer must run after the chop dispatcher so chop-emitted purge rows are visible"
+        );
+        assert!(
+            drainer < sync,
+            "drainer must run before sync_tick so the response-producing summary reads a clean index"
+        );
     }
 
     /// Test-only DaemonWorkerContext. Workers are never actually invoked here;

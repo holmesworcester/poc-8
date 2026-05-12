@@ -986,3 +986,53 @@ Never create `event.rs`.
 Functional proof for this rewrite means black-box CLI tests that spawn the real
 `topo` binary, use real TCP sockets, start `sync`, wait through the CLI-observed
 event count, and report both events/s and MiB/s for perf cases.
+
+## In-Line Documentation Describes Current Code, Not History
+
+Every doc comment, module-level comment, and inline comment must describe the
+code as it currently stands. It must not reference:
+
+- Development plans, phases, or slices (e.g. "slice 2 will introduce…",
+  "the slice-1 fallback", "phase 2 spec").
+- Commit hashes, PR numbers, or task ids (e.g. "fixed in commit abc123",
+  "see task #21", "after the master merge").
+- Removed or pre-merge code (e.g. "the old `is_expired_at_receive` branch",
+  "before the connection refactor").
+- Future work conditioned on a development plan (e.g.
+  `TODO(disappearing-messages): whole-minute retirement will land in slice 7`).
+  Future-work TODOs are allowed only when they name a concrete, code-level
+  concern (e.g. `TODO: cap walk depth at trie_root_bit_depth - 1`).
+
+The text "slice N", "task #N", and commit-hash references in `src/` source
+text are forbidden by lint.
+
+Rewrite stale references in terms of what the code currently does and what
+modules it interacts with. For example:
+
+```text
+// Bad
+//! The setting carries the slice-1 fallback `disappearing_ttl_minutes`.
+// Good
+//! When no `disappearing_messages_setting` event has been admitted, the
+//! workspace's `disappearing_ttl_minutes` field is the effective TTL.
+```
+
+```text
+// Bad
+// Past-TTL re-deliveries are caught earlier by the receive-side admission
+// gate, so by the time projection runs the only remaining tombstone trigger
+// is the author-driven deletion label.
+// Good
+// The only tombstone path that reaches this projector branch is the
+// author-driven deletion label. The receive-side admission gate
+// (`projector::admit_check_received`) drops past-TTL re-deliveries before
+// they reach projection.
+```
+
+The standard for "current code" is: a reader who has never seen the plan
+documents, the commit history, or any prior architecture should be able to
+read a doc comment and understand what the code does and why, by name only.
+
+Plan documents (`plan.md`, `disappearing_messages_plan.md`, etc.) are the
+right home for slice numbers, sequencing, and historical decisions. They
+must not leak into `src/`.

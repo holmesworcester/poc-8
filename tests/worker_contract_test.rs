@@ -272,6 +272,7 @@ fn sync_worker_consumes_applied_shared_event_queue() {
     let output = workspace::commands::create(workspace::commands::CreateWorkspace {
         created_at_ms: 1,
         public_key: [9; 32],
+        disappearing_ttl_minutes: 0,
         name: "queue-index".to_string(),
     })
     .unwrap();

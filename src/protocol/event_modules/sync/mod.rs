@@ -15,6 +15,7 @@ pub mod commands;
 pub mod compare;
 pub mod have_id;
 pub mod need_id;
+pub mod schema;
 pub use crate::workers::sync as worker;
 pub use crate::workers::sync::SyncIndex;
 

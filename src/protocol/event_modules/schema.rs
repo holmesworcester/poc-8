@@ -70,6 +70,7 @@ pub(crate) struct StoredEventIndex {
     pub timestamp: u64,
     pub scope: EventScope,
     pub status: EventStatus,
+    pub workspace_id: Option<EventId>,
 }
 
 pub fn max_timestamp(store: &Store) -> rusqlite::Result<u64> {
@@ -175,6 +176,7 @@ pub(crate) fn decode_stored_event_index(value: &[u8]) -> rusqlite::Result<Stored
         timestamp: event.timestamp,
         scope: event.scope,
         status: event.status,
+        workspace_id: event.workspace_id,
     })
 }
 

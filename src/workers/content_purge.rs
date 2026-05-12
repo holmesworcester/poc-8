@@ -205,6 +205,7 @@ fn purge_deleted_message(
             event.workspace_id,
             message_id,
             event.author_user_id,
+            event.created_at_ms / message::types::UNIX_MINUTE_MS,
         )])
         .map_err(|err| format!("write message tombstone: {err}"))?;
     report.tombstones_written += inserted;
@@ -450,6 +451,8 @@ mod tests {
             removal_frontier_id: FRONTIER,
             local_history_node_secret_id: LEAF_NODE_ID,
             leaf_node_secret: KEY_SECRET,
+            expires_at_minute: u64::MAX,
+            disappearing_setting_id: [1; 32],
             text: text.to_string(),
         })
         .expect("message");

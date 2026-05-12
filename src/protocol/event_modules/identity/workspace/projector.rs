@@ -16,6 +16,7 @@ pub fn project(bytes: &[u8]) -> Result<ProjectionOutput, String> {
         workspace_id,
         event.created_at_ms,
         event.public_key,
+        event.disappearing_ttl_minutes,
         &event.name,
     )?]))
 }
@@ -32,6 +33,7 @@ mod tests {
         let event = WorkspaceEvent {
             created_at_ms: 100,
             public_key: [3; 32],
+            disappearing_ttl_minutes: 7,
             name: "Research".to_string(),
         };
         let bytes = codec::encode(&event).expect("encode workspace");

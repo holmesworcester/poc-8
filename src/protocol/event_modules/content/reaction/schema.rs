@@ -8,7 +8,9 @@
 use std::collections::BTreeMap;
 
 use crate::core::store::{Schema, Store, TableName, TableRow};
+use crate::protocol::event_modules::content::message;
 use crate::protocol::event_modules::types::EventId;
+use crate::protocol::event_modules::worker::AdmitDecision;
 use crate::protocol::wire::{Reader, Writer};
 
 use super::codec;
@@ -16,6 +18,25 @@ use super::types::{
     ReactionCiphertext, ReactionEvent, ReactionPlaintext, ReactionRow, REACTION_CIPHERTEXT_BYTES,
     REACTION_EMOJI_BYTES,
 };
+
+/// Receive-side admission gate for signed reactions.
+///
+/// Drops the reaction if its parent message is already tombstoned. Mirrors
+/// the cascade predicate the content_purge worker uses for reactions when
+/// the parent message is later tombstoned, enforced earlier so re-deliveries
+/// of orphaned reactions never get stored.
+pub fn admit_check_received(store: &Store, bytes: &[u8]) -> Result<AdmitDecision, String> {
+    let envelope = codec::decode_signed(bytes)?;
+    let reaction = codec::decode(&envelope.payload)?;
+    if message::schema::message_tombstone_exists(
+        store,
+        reaction.workspace_id,
+        reaction.target_message_id,
+    )? {
+        return Ok(AdmitDecision::Drop);
+    }
+    Ok(AdmitDecision::Admit)
+}
 
 pub const REACTIONS: TableName = TableName::new("content.reactions");
 pub const SEALED_REACTIONS: TableName = TableName::new("content.sealed_reactions");
@@ -223,4 +244,53 @@ fn encode_sealed_value(signer_endpoint_shared_id: EventId, event: &ReactionEvent
     out.raw(&event.nonce);
     out.raw(&event.ciphertext);
     out.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::protocol::Protocol;
+
+    use super::*;
+
+    #[test]
+    fn admit_drops_reaction_with_tombstoned_parent() {
+        let store = Protocol::open_memory_store().expect("store");
+        let workspace_id = [17; 32];
+        let target_message_id = [42; 32];
+        let author_user_id = [3; 32];
+
+        let inner = ReactionEvent {
+            workspace_id,
+            created_at_ms: 1,
+            target_message_id,
+            author_user_id,
+            removal_frontier_id: [30; 32],
+            local_history_node_secret_id: [40; 32],
+            nonce: [0; crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES],
+            ciphertext: [0; REACTION_CIPHERTEXT_BYTES],
+        };
+        let payload = codec::encode(&inner);
+        let envelope = codec::sign([8; 32], &[7; 32], payload);
+        let bytes = codec::encode_signed(&envelope);
+
+        // No tombstone yet -> admit.
+        assert_eq!(
+            admit_check_received(&store, &bytes).expect("admit"),
+            AdmitDecision::Admit
+        );
+
+        // Tombstone the parent message -> reaction must drop.
+        store
+            .insert_table_rows(vec![message::schema::message_tombstone_row(
+                workspace_id,
+                target_message_id,
+                author_user_id,
+                0,
+            )])
+            .expect("insert tombstone");
+        assert_eq!(
+            admit_check_received(&store, &bytes).expect("admit"),
+            AdmitDecision::Drop
+        );
+    }
 }

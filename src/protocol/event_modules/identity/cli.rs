@@ -27,7 +27,7 @@ use super::{
 };
 
 const CREATE_WORKSPACE_USAGE: &str =
-    "create-workspace NAME [--username USER] [--devicename DEVICE]";
+    "create-workspace NAME [--username USER] [--devicename DEVICE] [--ttl-minutes N]";
 const INVITE_USAGE: &str =
     "invite [--workspace WORKSPACE_ID_HEX] (--public-addr ADDR | --listen IP PORT [--accept N])";
 const ACCEPT_USAGE: &str = "accept INVITE_LINK [--username USER] [--devicename DEVICE]";
@@ -111,6 +111,7 @@ fn run_create_workspace_command(
     let workspace = workspace::commands::create(workspace::commands::CreateWorkspace {
         created_at_ms: timestamp,
         public_key: local.signing_public_key,
+        disappearing_ttl_minutes: options.disappearing_ttl_minutes,
         name: options.name,
     })?;
     let workspace_id = workspace.value.workspace_id;
@@ -460,6 +461,7 @@ struct CreateWorkspaceOptions {
     name: String,
     username: String,
     device_name: String,
+    disappearing_ttl_minutes: u32,
 }
 
 impl CreateWorkspaceOptions {
@@ -470,6 +472,7 @@ impl CreateWorkspaceOptions {
             .to_string();
         let mut username = "admin".to_string();
         let mut device_name = "device".to_string();
+        let mut disappearing_ttl_minutes: u32 = 0;
         let mut idx = 1;
         while idx < args.values().len() {
             match args.get(idx).expect("index in bounds") {
@@ -487,6 +490,15 @@ impl CreateWorkspaceOptions {
                         .to_string();
                     idx += 2;
                 }
+                "--ttl-minutes" => {
+                    let raw = args
+                        .get(idx + 1)
+                        .ok_or_else(|| CREATE_WORKSPACE_USAGE.to_string())?;
+                    disappearing_ttl_minutes = raw.parse::<u32>().map_err(|_| {
+                        format!("--ttl-minutes must be a u32: `{raw}`\n{CREATE_WORKSPACE_USAGE}")
+                    })?;
+                    idx += 2;
+                }
                 other => {
                     return Err(format!(
                         "unknown create-workspace option `{other}`\n{CREATE_WORKSPACE_USAGE}"
@@ -498,6 +510,7 @@ impl CreateWorkspaceOptions {
             name,
             username,
             device_name,
+            disappearing_ttl_minutes,
         })
     }
 }

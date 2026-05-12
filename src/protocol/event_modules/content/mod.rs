@@ -14,7 +14,9 @@ pub mod message;
 pub mod message_deletion;
 pub mod reaction;
 
-use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput};
+use crate::core::store::Store;
+use crate::protocol::event_modules::types::EventRecord;
+use crate::protocol::event_modules::worker::{AdmitDecision, EventWithContext, ProjectionOutput};
 
 pub fn project_record(event: &EventWithContext<'_>) -> Result<Option<ProjectionOutput>, String> {
     let bytes = &event.record.canonical_bytes;
@@ -37,5 +39,31 @@ pub fn project_record(event: &EventWithContext<'_>) -> Result<Option<ProjectionO
             Ok(Some(file_deletion::projector::project(event)?))
         }
         _ => Ok(None),
+    }
+}
+
+/// Receive-side admission gate for content events. Dispatches by tag to the
+/// leaf module's schema-owned `admit_check_received`, which decides whether
+/// to admit, drop silently, or drop with a tombstone-row write. Schema is
+/// the right home for the gate because it already owns the storage helpers
+/// (tombstone existence checks, tombstone row construction) the gate
+/// consults.
+pub fn admit_check_received(
+    store: &Store,
+    record: &EventRecord,
+) -> Result<AdmitDecision, String> {
+    let bytes = &record.canonical_bytes;
+    match bytes.first().copied() {
+        Some(message::codec::TYPE_SIGNED_MESSAGE) => {
+            message::schema::admit_check_received(store, bytes)
+        }
+        Some(reaction::codec::TYPE_SIGNED_REACTION) => {
+            reaction::schema::admit_check_received(store, bytes)
+        }
+        Some(file::codec::TYPE_SIGNED_FILE) => file::schema::admit_check_received(store, bytes),
+        Some(file_slice::codec::TYPE_SIGNED_FILE_SLICE) => {
+            file_slice::schema::admit_check_received(store, bytes)
+        }
+        _ => Ok(AdmitDecision::Admit),
     }
 }

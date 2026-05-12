@@ -166,6 +166,7 @@ mod tests {
         let bytes = workspace::codec::encode(&workspace::types::WorkspaceEvent {
             created_at_ms: 10,
             public_key,
+            disappearing_ttl_minutes: 0,
             name: "Root".to_string(),
         })
         .expect("encode workspace");
@@ -222,6 +223,7 @@ mod tests {
                 dependencies,
                 labels: Vec::new(),
                 receive: None,
+                now_unix_minute: None,
             },
         }
     }
