@@ -13,6 +13,7 @@ use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker;
 
 use super::commands;
+use super::types::reaction_event_id_in_minute;
 
 const REACT_USAGE: &str = "react WORKSPACE_ID_HEX MESSAGE_SELECTOR EMOJI";
 
@@ -58,7 +59,23 @@ fn run_react_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutp
         .ok_or_else(|| "local endpoint is missing".to_string())?;
 
     let timestamp = message::cli::next_timestamp(&context.store, workspace_id)?;
-    let content_key = message::cli::require_content_key(&context.store, workspace_id)?;
+    let removal_frontier_id =
+        message::cli::require_active_frontier_id(&context.store, workspace_id)?;
+    let event_id_in_minute = reaction_event_id_in_minute(
+        &workspace_id,
+        &membership.user_authority_event_id,
+        &target,
+        &removal_frontier_id,
+        timestamp,
+    );
+    let leaf = message::cli::derive_message_leaf(
+        &context.store,
+        &context.protocol,
+        workspace_id,
+        removal_frontier_id,
+        timestamp,
+        event_id_in_minute,
+    )?;
     let post = commands::post(commands::PostReaction {
         workspace_id,
         created_at_ms: timestamp,
@@ -66,9 +83,9 @@ fn run_react_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutp
         author_user_id: membership.user_authority_event_id,
         signer_endpoint_shared_id: membership.endpoint_shared_id,
         signer_private_key: local.signing_secret,
-        removal_frontier_id: content_key.removal_frontier_id,
-        local_key_secret_id: content_key.local_key_secret_id,
-        key_secret: content_key.key_secret,
+        removal_frontier_id,
+        local_history_node_secret_id: leaf.local_history_node_secret_id,
+        leaf_node_secret: leaf.leaf_node_secret,
         emoji,
     })?;
     let report = worker::run(

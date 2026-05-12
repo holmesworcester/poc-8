@@ -213,8 +213,18 @@ impl PerfFixture {
             signer_endpoint_shared_id: self.signer_endpoint_shared_id,
             signer_private_key: self.signer_private_key,
             removal_frontier_id: self.removal_frontier_id,
-            local_key_secret_id: self.local_key_secret_id,
-            key_secret: self.key_secret,
+            // Perf fixture points every message at the workspace-frontier
+            // root key secret rather than at a real per-message leaf event
+            // — this perf path exercises only the message admission +
+            // projection cost (not the leaf-derive worker, which is timed
+            // separately by `encryption_cli_test`). Each call advances
+            // `take_timestamp` so messages have distinct identifying
+            // canonical fields and therefore distinct event ids; if two
+            // calls did collide on `(workspace, author, frontier, ms)`
+            // they would be the same message by design (idempotent
+            // re-author), which is correct, not a bug to compensate for.
+            local_history_node_secret_id: self.local_key_secret_id,
+            leaf_node_secret: self.key_secret,
             text: format!("perf message {sequence}"),
         })
         .expect("create encrypted signed message")
@@ -493,7 +503,7 @@ fn build_file_events(
         filename: format!("perf-{file_index}-{blob_bytes}b.bin"),
         mime_type: "application/octet-stream".to_string(),
         removal_frontier_id: fixture.removal_frontier_id,
-        local_key_secret_id: fixture.local_key_secret_id,
+        local_history_node_secret_id: fixture.local_key_secret_id,
         key_secret: fixture.key_secret,
     })
     .expect("create encrypted signed file descriptor");
@@ -524,7 +534,7 @@ fn build_file_events(
                     slice_number,
                     signer_endpoint_shared_id: fixture.signer_endpoint_shared_id,
                     signer_private_key: fixture.signer_private_key,
-                    local_key_secret_id: fixture.local_key_secret_id,
+                    local_history_node_secret_id: fixture.local_key_secret_id,
                     plaintext_len,
                     ciphertext: &ciphertext_total,
                     outboard: &outboard,

@@ -4,15 +4,15 @@
 //! per-slice byte budget, the parent message it is attached to, and the BAO
 //! `root_hash` of the encrypted blob. Filename and mime ride in an
 //! authenticated ciphertext slot keyed by the parent message's content key
-//! (`(removal_frontier_id, local_key_secret_id)`) so canonical bytes never
+//! (`(removal_frontier_id, local_history_node_secret_id)`) so canonical bytes never
 //! leak the plaintext name or mime type. The slot is fixed-width so wire
 //! bytes stay deterministic per event type. Slice events depend on this
-//! descriptor's event id and on the same `local_key_secret_id`, so AEAD
+//! descriptor's event id and on the same `local_history_node_secret_id`, so AEAD
 //! decryption can run at read time without a separate blocking system.
 
 use crate::core::crypto::{
-    self, Ed25519PrivateKey, XChaCha20Poly1305Key, XChaCha20Poly1305Nonce,
-    ED25519_SIGNATURE_BYTES, XCHACHA20_POLY1305_NONCE_BYTES,
+    self, Ed25519PrivateKey, XChaCha20Poly1305Key, XChaCha20Poly1305Nonce, ED25519_SIGNATURE_BYTES,
+    XCHACHA20_POLY1305_NONCE_BYTES,
 };
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
 use crate::protocol::wire::{Reader, Writer};
@@ -26,12 +26,12 @@ use super::types::{
 pub const TYPE_FILE: u8 = 13;
 pub const TYPE_SIGNED_FILE: u8 = 15;
 /// Domain-separated AAD prefix for the descriptor's sealed slot.
-pub const FILE_DESCRIPTOR_ENCRYPTION_PURPOSE: &[u8] = b"topo file descriptor v1";
+pub const FILE_DESCRIPTOR_ENCRYPTION_PURPOSE: &[u8] = b"topo file descriptor v2";
 
 /// Inner wire size: tag(1) + workspace(32) + ts(8) + message_id(32) +
 /// author(32) + file_id(32) + blob_bytes(8) + total_slices(4) + slice_bytes(4)
-/// + root_hash(32) + removal_frontier(32) + local_key_secret(32) + nonce
-/// + sealed slot.
+/// + root_hash(32) + removal_frontier(32) + local_history_node_secret(32)
+/// + nonce + sealed slot.
 pub const FILE_WIRE_SIZE: usize = 1
     + 32
     + 8
@@ -54,7 +54,7 @@ struct FileMetadata {
     message_id: EventId,
     author_user_id: EventId,
     file_id: EventId,
-    local_key_secret_id: EventId,
+    local_history_node_secret_id: EventId,
 }
 
 pub fn encode(event: &FileEvent) -> Result<Vec<u8>, String> {
@@ -71,7 +71,7 @@ pub fn encode(event: &FileEvent) -> Result<Vec<u8>, String> {
     out.u32(event.slice_bytes as usize);
     out.id(&event.root_hash);
     out.id(&event.removal_frontier_id);
-    out.id(&event.local_key_secret_id);
+    out.id(&event.local_history_node_secret_id);
     out.raw(&event.nonce);
     out.raw(&event.ciphertext);
     Ok(out.finish())
@@ -93,7 +93,7 @@ pub fn decode(bytes: &[u8]) -> Result<FileEvent, String> {
     let slice_bytes = reader.u32()?;
     let root_hash = reader.id()?;
     let removal_frontier_id = reader.id()?;
-    let local_key_secret_id = reader.id()?;
+    let local_history_node_secret_id = reader.id()?;
     let nonce = fixed_nonce(reader.bytes(XCHACHA20_POLY1305_NONCE_BYTES)?)?;
     let ciphertext = fixed_ciphertext(reader.bytes(FILE_DESCRIPTOR_CIPHERTEXT_BYTES)?)?;
     reader.finish()?;
@@ -108,7 +108,7 @@ pub fn decode(bytes: &[u8]) -> Result<FileEvent, String> {
         slice_bytes,
         root_hash,
         removal_frontier_id,
-        local_key_secret_id,
+        local_history_node_secret_id,
         nonce,
         ciphertext,
     };
@@ -182,7 +182,7 @@ pub fn signed_record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
     push_unique(&mut dependencies, metadata.workspace_id);
     push_unique(&mut dependencies, metadata.author_user_id);
     push_unique(&mut dependencies, metadata.message_id);
-    push_unique(&mut dependencies, metadata.local_key_secret_id);
+    push_unique(&mut dependencies, metadata.local_history_node_secret_id);
     Ok(EventRecord {
         timestamp: metadata.created_at_ms,
         body_len: FILE_WIRE_SIZE - 1,
@@ -205,7 +205,7 @@ fn metadata(bytes: &[u8]) -> Result<FileMetadata, String> {
         message_id: event.message_id,
         author_user_id: event.author_user_id,
         file_id: event.file_id,
-        local_key_secret_id: event.local_key_secret_id,
+        local_history_node_secret_id: event.local_history_node_secret_id,
     })
 }
 
@@ -218,7 +218,10 @@ fn validate(event: &FileEvent) -> Result<(), String> {
     validate_id("file author_user_id", &event.author_user_id)?;
     validate_id("file file_id", &event.file_id)?;
     validate_id("file removal_frontier_id", &event.removal_frontier_id)?;
-    validate_id("file local_key_secret_id", &event.local_key_secret_id)?;
+    validate_id(
+        "file local_history_node_secret_id",
+        &event.local_history_node_secret_id,
+    )?;
     if event.blob_bytes == 0 {
         if event.total_slices != 0 {
             return Err("zero-byte file must declare zero slices".to_string());
@@ -374,7 +377,7 @@ pub fn descriptor_associated_data(
     out.u32(event.slice_bytes as usize);
     out.id(&event.root_hash);
     out.id(&event.removal_frontier_id);
-    out.id(&event.local_key_secret_id);
+    out.id(&event.local_history_node_secret_id);
     out.raw(&event.nonce);
     out.id(&signer_endpoint_shared_id);
     out.finish()
@@ -461,7 +464,7 @@ mod tests {
             slice_bytes: 1024,
             root_hash: [5; 32],
             removal_frontier_id: [6; 32],
-            local_key_secret_id: [7; 32],
+            local_history_node_secret_id: [7; 32],
             nonce,
             ciphertext: [0; FILE_DESCRIPTOR_CIPHERTEXT_BYTES],
         };
@@ -541,12 +544,12 @@ mod tests {
     }
 
     #[test]
-    fn signed_envelope_dependencies_include_local_key_secret_id() {
+    fn signed_envelope_dependencies_include_local_history_node_secret_id() {
         let payload = encode(&event()).expect("encode");
         let envelope = sign([6; 32], &[7; 32], payload);
         let bytes = encode_signed(&envelope);
         let record = signed_record_from_bytes(bytes).expect("record");
-        // signer, workspace, author, message_id, local_key_secret_id
+        // signer, workspace, author, message_id, local_history_node_secret_id
         assert_eq!(
             record.dependencies,
             vec![[6; 32], [1; 32], [3; 32], [2; 32], [7; 32]]

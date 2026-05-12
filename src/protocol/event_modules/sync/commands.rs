@@ -6,7 +6,7 @@
 
 use crate::protocol::event_modules::connection;
 use crate::protocol::event_modules::sync::compare;
-use crate::protocol::event_modules::sync::compare::types::TimestampRange;
+use crate::protocol::event_modules::sync::compare::types::{RangeSummary, TimestampRange};
 use crate::protocol::event_modules::types::{EventId, EventRecord};
 use crate::protocol::event_modules::worker::CommandOutput;
 
@@ -43,12 +43,12 @@ pub struct SyncTransitOut {
     pub event_id: EventId,
 }
 
-pub(crate) fn start_for_connection(
-    context: &impl compare::commands::ReadContext,
+pub(crate) fn start_for_connection_with_summary(
     connection_id: connection::types::ConnectionId,
     range: TimestampRange,
+    summary: RangeSummary,
 ) -> Result<CommandOutput<SyncStartReport>, String> {
-    let report = compare::commands::start(context, connection_id, range)?;
+    let report = compare::commands::start_with_summary(summary, connection_id, range)?;
     Ok(CommandOutput::with_events(
         SyncStartReport {
             sent_events: report.sent_events,

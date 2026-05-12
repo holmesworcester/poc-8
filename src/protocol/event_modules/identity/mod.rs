@@ -2,8 +2,8 @@
 //!
 //! Identity owns shared workspace roots plus local endpoint material,
 //! invite-secret material, and invite-acceptance provenance. Local facts let this
-//! node create bootstrap traffic and remember why it is allowed to decrypt an
-//! invite-key lane, but they are not shared content history or membership grants.
+//! node create connection bootstrap requests and remember why it accepted an
+//! invite, but they are not shared content history or membership grants.
 
 pub mod admin;
 pub mod cli;

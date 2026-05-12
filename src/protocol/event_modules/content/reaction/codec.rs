@@ -18,7 +18,8 @@ use super::types::{
 
 pub const TYPE_REACTION: u8 = 7;
 pub const TYPE_SIGNED_REACTION: u8 = 8;
-pub const REACTION_ENCRYPTION_PURPOSE: &[u8] = b"topo reaction emoji v1";
+pub const REACTION_ENCRYPTION_PURPOSE: &[u8] = b"topo reaction emoji v2";
+/// Reaction canonical wire size after the deterministic-leaf-coord redesign.
 pub const REACTION_WIRE_SIZE: usize =
     1 + 32 + 8 + 32 + 32 + 32 + 32 + XCHACHA20_POLY1305_NONCE_BYTES + REACTION_CIPHERTEXT_BYTES;
 
@@ -29,7 +30,7 @@ struct ReactionMetadata {
     target_message_id: EventId,
     author_user_id: EventId,
     removal_frontier_id: EventId,
-    local_key_secret_id: EventId,
+    local_history_node_secret_id: EventId,
 }
 
 pub fn encode(event: &ReactionEvent) -> Vec<u8> {
@@ -40,7 +41,7 @@ pub fn encode(event: &ReactionEvent) -> Vec<u8> {
     out.id(&event.target_message_id);
     out.id(&event.author_user_id);
     out.id(&event.removal_frontier_id);
-    out.id(&event.local_key_secret_id);
+    out.id(&event.local_history_node_secret_id);
     out.raw(&event.nonce);
     out.raw(&event.ciphertext);
     out.finish()
@@ -57,7 +58,7 @@ pub fn decode(bytes: &[u8]) -> Result<ReactionEvent, String> {
     let target_message_id = reader.id()?;
     let author_user_id = reader.id()?;
     let removal_frontier_id = reader.id()?;
-    let local_key_secret_id = reader.id()?;
+    let local_history_node_secret_id = reader.id()?;
     let nonce = fixed_nonce(reader.bytes(XCHACHA20_POLY1305_NONCE_BYTES)?)?;
     let ciphertext = fixed_ciphertext(reader.bytes(REACTION_CIPHERTEXT_BYTES)?)?;
     reader.finish()?;
@@ -67,7 +68,7 @@ pub fn decode(bytes: &[u8]) -> Result<ReactionEvent, String> {
         target_message_id,
         author_user_id,
         removal_frontier_id,
-        local_key_secret_id,
+        local_history_node_secret_id,
         nonce,
         ciphertext,
     };
@@ -142,7 +143,7 @@ pub fn signed_record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
     push_unique(&mut dependencies, metadata.author_user_id);
     push_unique(&mut dependencies, metadata.target_message_id);
     push_unique(&mut dependencies, metadata.removal_frontier_id);
-    push_unique(&mut dependencies, metadata.local_key_secret_id);
+    push_unique(&mut dependencies, metadata.local_history_node_secret_id);
     Ok(EventRecord {
         timestamp: metadata.created_at_ms,
         body_len: REACTION_WIRE_SIZE - 1,
@@ -164,7 +165,7 @@ fn metadata(bytes: &[u8]) -> Result<ReactionMetadata, String> {
     let target_message_id = reader.id()?;
     let author_user_id = reader.id()?;
     let removal_frontier_id = reader.id()?;
-    let local_key_secret_id = reader.id()?;
+    let local_history_node_secret_id = reader.id()?;
     let _nonce = reader.bytes(XCHACHA20_POLY1305_NONCE_BYTES)?;
     let _ciphertext = reader.bytes(REACTION_CIPHERTEXT_BYTES)?;
     reader.finish()?;
@@ -174,7 +175,7 @@ fn metadata(bytes: &[u8]) -> Result<ReactionMetadata, String> {
         target_message_id,
         author_user_id,
         removal_frontier_id,
-        local_key_secret_id,
+        local_history_node_secret_id,
     };
     validate_id("reaction workspace", &metadata.workspace_id)?;
     validate_id("reaction target_message_id", &metadata.target_message_id)?;
@@ -184,8 +185,8 @@ fn metadata(bytes: &[u8]) -> Result<ReactionMetadata, String> {
         &metadata.removal_frontier_id,
     )?;
     validate_id(
-        "reaction local_key_secret_id",
-        &metadata.local_key_secret_id,
+        "reaction local_history_node_secret_id",
+        &metadata.local_history_node_secret_id,
     )?;
     Ok(metadata)
 }
@@ -198,7 +199,7 @@ pub fn associated_data(event: &ReactionEvent, signer_endpoint_shared_id: EventId
     out.id(&event.target_message_id);
     out.id(&event.author_user_id);
     out.id(&event.removal_frontier_id);
-    out.id(&event.local_key_secret_id);
+    out.id(&event.local_history_node_secret_id);
     out.raw(&event.nonce);
     out.id(&signer_endpoint_shared_id);
     out.finish()
@@ -248,7 +249,10 @@ fn validate_event(event: &ReactionEvent) -> Result<(), String> {
     validate_id("reaction target_message_id", &event.target_message_id)?;
     validate_id("reaction author_user_id", &event.author_user_id)?;
     validate_id("reaction removal_frontier_id", &event.removal_frontier_id)?;
-    validate_id("reaction local_key_secret_id", &event.local_key_secret_id)?;
+    validate_id(
+        "reaction local_history_node_secret_id",
+        &event.local_history_node_secret_id,
+    )?;
     Ok(())
 }
 
@@ -308,7 +312,7 @@ mod tests {
             target_message_id: [2; 32],
             author_user_id: [3; 32],
             removal_frontier_id: [4; 32],
-            local_key_secret_id: [5; 32],
+            local_history_node_secret_id: [5; 32],
             nonce: [6; XCHACHA20_POLY1305_NONCE_BYTES],
             ciphertext: [7; REACTION_CIPHERTEXT_BYTES],
         }

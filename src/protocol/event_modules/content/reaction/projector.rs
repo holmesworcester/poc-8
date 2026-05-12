@@ -7,6 +7,7 @@
 
 use crate::protocol::event_modules::content::message;
 use crate::protocol::event_modules::identity::{endpoint_shared, signed, user};
+use crate::protocol::event_modules::leaf_history_node;
 use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput};
 
 use super::{codec, schema};
@@ -68,6 +69,35 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
         return Err("reaction target message workspace does not match reaction".to_string());
     }
 
+    // Validate the binding to the per-reaction leaf event named in canonical
+    // bytes. The leaf must live in the reaction's `unix_minute` and carry
+    // `event_id_in_minute = Some(reaction.event_id_in_minute_derived())`. The
+    // projector recomputes the deterministic leaf coord from canonical
+    // fields rather than trusting any wire-side nonce.
+    let leaf_record = event
+        .context
+        .dependency(&reaction.local_history_node_secret_id)
+        .ok_or_else(|| "reaction leaf history node dependency is missing".to_string())?;
+    let leaf = leaf_history_node::codec::decode(&leaf_record.canonical_bytes)
+        .map_err(|_| "reaction leaf dependency is not a local_history_node_secret".to_string())?;
+    if leaf.workspace_id != reaction.workspace_id
+        || leaf.removal_frontier_id != reaction.removal_frontier_id
+    {
+        return Err("reaction leaf workspace or frontier does not match reaction".to_string());
+    }
+    let expected_minute = message::types::unix_minute_for(reaction.created_at_ms);
+    if leaf.range_start != expected_minute || leaf.range_width != message::types::LEAF_RANGE_WIDTH {
+        return Err("reaction leaf coordinate does not match reaction minute".to_string());
+    }
+    if leaf.bit_depth != leaf_history_node::types::TRIE_LEAF_BIT_DEPTH
+        || leaf.event_id_prefix != reaction.event_id_in_minute_derived()
+    {
+        return Err(
+            "reaction leaf event_id_in_minute does not match deterministic reaction coord"
+                .to_string(),
+        );
+    }
+
     Ok(ProjectionOutput::rows(vec![schema::sealed_reaction_row(
         event.context.event_id,
         envelope.signer_endpoint_shared_id,
@@ -78,7 +108,9 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
 #[cfg(test)]
 mod tests {
     use crate::protocol::event_modules::content::message;
-    use crate::protocol::event_modules::encryption::{local_key_secret, removal_frontier};
+    use crate::protocol::event_modules::encryption::{
+        local_history_node_secret as leaf_module, removal_frontier,
+    };
     use crate::protocol::event_modules::identity::{endpoint_shared, signed, user};
     use crate::protocol::event_modules::types::{event_id, EventScope};
     use crate::protocol::event_modules::worker::{
@@ -96,8 +128,8 @@ mod tests {
         reaction_id: [u8; 32],
         frontier_id: [u8; 32],
         frontier_record: Record,
-        key_secret_id: [u8; 32],
-        key_secret_record: Record,
+        leaf_id: [u8; 32],
+        leaf_record: Record,
     }
 
     fn signing_public_key_for(private_key: &[u8; 32]) -> [u8; 32] {
@@ -145,7 +177,7 @@ mod tests {
             created_at_ms: 1,
             author_user_id,
             removal_frontier_id: [30; 32],
-            local_key_secret_id: [31; 32],
+            local_history_node_secret_id: [31; 32],
             nonce: [32; crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES],
             ciphertext: [33; message::types::MESSAGE_CIPHERTEXT_BYTES],
         });
@@ -175,23 +207,41 @@ mod tests {
                 .record()
                 .clone();
         let frontier_id = event_id(&frontier_record.canonical_bytes);
-        let key_secret =
-            local_key_secret::commands::from_key_secret(workspace_id, frontier_id, KEY_SECRET)
-                .expect("local key")
-                .events[0]
-                .record()
-                .clone();
-        let key_secret_id = event_id(&key_secret.canonical_bytes);
+        let created_at_ms = 5u64;
+        let event_id_in_minute = super::super::types::reaction_event_id_in_minute(
+            &workspace_id,
+            &author_id,
+            &target_id,
+            &frontier_id,
+            created_at_ms,
+        );
+        let leaf_output =
+            leaf_module::commands::derive_trie_split(leaf_module::commands::DeriveTrieSplit {
+                workspace_id,
+                removal_frontier_id: frontier_id,
+                parent_secret_id: [200; 32],
+                parent_secret: [201; 32],
+                range_start: super::super::super::message::types::unix_minute_for(created_at_ms),
+                parent_bit_depth: 0,
+                parent_event_id_prefix: [0; 32],
+                child_side: leaf_module::types::bit_at(&event_id_in_minute, 0),
+                child_bit_depth: leaf_module::types::TRIE_LEAF_BIT_DEPTH,
+                child_event_id_prefix: event_id_in_minute,
+                tombstone_node_id: None,
+            })
+            .expect("derive leaf");
+        let leaf_record = leaf_output.events[0].record().clone();
+        let leaf_id = leaf_output.value.local_history_node_secret_id;
         let output = super::super::commands::post(super::super::commands::PostReaction {
             workspace_id,
-            created_at_ms: 5,
+            created_at_ms,
             target_message_id: target_id,
             author_user_id: author_id,
             signer_endpoint_shared_id: signer_id,
             signer_private_key,
             removal_frontier_id: frontier_id,
-            local_key_secret_id: key_secret_id,
-            key_secret: KEY_SECRET,
+            local_history_node_secret_id: leaf_id,
+            leaf_node_secret: KEY_SECRET,
             emoji: "🔥".to_string(),
         })
         .expect("post reaction");
@@ -200,8 +250,8 @@ mod tests {
             reaction_id: output.value.reaction_id,
             frontier_id,
             frontier_record,
-            key_secret_id,
-            key_secret_record: key_secret,
+            leaf_id,
+            leaf_record,
         }
     }
 
@@ -236,8 +286,8 @@ mod tests {
                         record: built.frontier_record.clone(),
                     },
                     DependencyContext {
-                        event_id: built.key_secret_id,
-                        record: built.key_secret_record.clone(),
+                        event_id: built.leaf_id,
+                        record: built.leaf_record.clone(),
                     },
                 ],
                 labels: Vec::new(),
@@ -286,7 +336,7 @@ mod tests {
         assert_eq!(row.author_user_id, author_id);
         assert_eq!(row.signer_endpoint_shared_id, signer_id);
         assert_eq!(row.removal_frontier_id, built.frontier_id);
-        assert_eq!(row.local_key_secret_id, built.key_secret_id);
+        assert_eq!(row.local_history_node_secret_id, built.leaf_id);
     }
 
     #[test]
@@ -334,7 +384,7 @@ mod tests {
             target_message_id: [10; 32],
             author_user_id: [11; 32],
             removal_frontier_id: [14; 32],
-            local_key_secret_id: [15; 32],
+            local_history_node_secret_id: [15; 32],
             nonce: [16; crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES],
             ciphertext: [17; super::super::types::REACTION_CIPHERTEXT_BYTES],
         };
@@ -357,7 +407,7 @@ mod tests {
             target_message_id: [2; 32],
             author_user_id: [3; 32],
             removal_frontier_id: [4; 32],
-            local_key_secret_id: [5; 32],
+            local_history_node_secret_id: [5; 32],
             nonce: [6; crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES],
             ciphertext: [7; super::super::types::REACTION_CIPHERTEXT_BYTES],
         });

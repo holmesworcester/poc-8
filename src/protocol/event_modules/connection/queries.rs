@@ -1,7 +1,8 @@
 //! Read-only connection CLI views.
 //!
-//! Workers keep operational reads close to the work they perform. This file is
-//! intentionally just the reporting surface used by CLI count/status commands.
+//! Active workers and projectors keep their connection-state reads local to the
+//! operation they are performing. This file stays intentionally small: it only
+//! exposes reporting/counting queries for user-facing status commands.
 
 use crate::core::store::Store;
 

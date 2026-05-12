@@ -74,11 +74,11 @@ for worker in workers:
 The daemon's current worker catalog is:
 
 ```text
-bootstrap_exchange
 transit_in
 event_admission
 event_projection
 dependency_unblock
+encryption
 content_purge
 sync
 transit_out
@@ -89,19 +89,13 @@ single route/frame boundary.
 
 ## Current Workers
 
-- `bootstrap_exchange`: accepts daemon or finite-listener TCP streams and runs
-  the pre-route exchange. Unscoped invites carry connection requests. Identity
-  invites carry one invite-key batch of shared identity bootstrap events and, on
-  the invite owner, produce one reply batch containing the invite event's
-  current workspace identity-bootstrap set, excluding the acceptor's
-  just-submitted events. It is a socket adapter over transit projection and the
-  common event pipeline; it does not project identity facts directly or make a
-  normal connection exist.
-- `transit_in`: consumes raw `core.network.inbound` frames. It runs the
-  protocol transit projector, unwraps/authenticates transport envelopes using
-  explicit local context, and writes recovered inner bytes to `canonical.in`
-  with provenance. It does not decode the inner event type or admit semantic
-  facts.
+- `transit_in`: accepts daemon or finite-listener TCP streams and consumes raw
+  `core.network.inbound` frames. It runs the protocol transit projector,
+  unwraps/authenticates transport envelopes using explicit local context, and
+  feeds recovered inner bytes to the common admission pipeline with provenance.
+  It does not create connection responses; connection bootstrap work is queued
+  for the `connection` worker. Ordinary sync responses are queued for
+  `transit_out` and sent on routed connections in later worker turns.
 - `event_admission`: consumes `canonical.in` rows. It inserts/dedupes events,
   performs the initial dependency check, keeps receive metadata beside blocked
   received events, and writes `event_modules.ready_events` or blocker indexes.
@@ -114,26 +108,41 @@ single route/frame boundary.
 - `dependency_unblock`: consumes `event_modules.recently_valid_events`, clears
   missing-dependency edges, and writes newly unblocked events to
   `event_modules.ready_events`.
+- `encryption`: consumes encryption-domain queues. It drains `key_wrap`'s
+  projected pending unwrap rows to create local-only key-secret events through
+  the common pipeline, then derives pending per-message/file content leaves
+  once those local secrets exist.
 - `content_purge`: consumes worker-owned local retention work and deletes local
   payload bytes after durable semantic events preserve what peers need to know.
   It is not a protocol deletion event and does not authorize remote erasure.
+- `connection`: consumes projected pending connection attempts and responses.
+  It retries invite-address connection requests, creates connection response
+  events for validated inbound requests, sends handshake frames through
+  `transit_out`, and retires rows once a connection response projects or a
+  response frame is delivered. This is the long-term home for peer-selection,
+  connection-count, retry/backoff, and stale-connection policy.
 - `sync`: consumes `event_modules.applied_shared_events`, `sync.in`, and
   explicit sync-start requests. It catches up the protocol-owned warm sync
   index before responding, calls sync commands for compare/have/need decisions,
   writes sync protocol events through canonical in, and writes durable send ids to
-  `transit.out`. Inbound sync work is authorized by the receiving
-  connection id, but responses are queued on a routed connection to the same
-  remote endpoint so daemon sync does not depend on same-stream replies. New
-  daemon rounds are started only by the endpoint whose id sorts lower than its
-  peer's id.
-- `transit_out`: consumes `transit.out`, loads event bytes,
-  enforces route/scope/workspace policy, wraps transit frames, and writes
-  outbound transport rows.
+  `transit.out`. Inbound sync work is authorized by the receiving connection id.
+  The daemon drains inbound sync work before starting new compares.
+  Invite-scoped routes poll from both endpoints so either side can discover new
+  workspace history. Plain connections use deterministic endpoint ordering to
+  avoid duplicate starters.
+- `transit_out`: consumes `transit.out`, loads queued event bytes, enforces
+  route/scope/workspace policy, wraps transit frames, and writes outbound
+  transport rows. It also provides the direct opaque-frame send helper used by
+  the `connection` worker, but it does not own connection retry policy.
+  Established-route sends drain by connection, then coalesce frames by socket
+  address so multiple routes to one daemon cost one accepted TCP stream per
+  outbound pass.
 - `common::event_pipeline` is not a daemon worker. It provides the shared
   admission/projection/block-unblock machinery and finite command/test helpers
-  over the explicit workers above. The remaining one-shot connect path only
-  sends the initial request and records the invite address as outbound route
-  state; inbound responses still enter through transit in and event admission.
+  over the explicit workers above. Connection bootstrap is ordinary projected
+  state: request projection queues attempts/responses, the `connection` worker
+  decides what to dial or answer, and inbound responses still enter through
+  transit in and event admission.
 
 ## Runtime Boundaries Outside This Folder
 

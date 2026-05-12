@@ -72,7 +72,7 @@ mod tests {
     use crate::protocol::event_modules::schema::{self as event_schema, EventLabel};
     use crate::protocol::event_modules::types::{event_id, EventRecord, EventScope};
     use crate::protocol::Protocol;
-    use crate::workers::common::event_store;
+    use crate::workers::pipeline_helpers::event_lifecycle;
 
     use super::*;
 
@@ -92,8 +92,8 @@ mod tests {
         let target_id = event_id(&record.canonical_bytes);
         let label = b"local-retention-proof".to_vec();
 
-        event_store::insert_event(&store, &record, EventStatus::Ready).expect("insert event");
-        event_store::insert_blocked_event_missing_dep(&store, &missing_dep_id, &target_id)
+        event_lifecycle::insert_event(&store, &record, EventStatus::Ready).expect("insert event");
+        event_lifecycle::insert_blocked_event_missing_dep(&store, &missing_dep_id, &target_id)
             .expect("insert missing dependency edge");
         store
             .insert_table_rows(event_schema::event_label_rows(vec![EventLabel {
@@ -116,12 +116,13 @@ mod tests {
             Vec::new()
         );
         assert_eq!(
-            event_store::blocked_events_by_missing_dep(&store, &missing_dep_id)
+            event_lifecycle::blocked_events_by_missing_dep(&store, &missing_dep_id)
                 .expect("forward deps"),
             Vec::<EventId>::new()
         );
         assert!(
-            !event_store::blocked_event_has_missing_deps(&store, &target_id).expect("reverse deps")
+            !event_lifecycle::blocked_event_has_missing_deps(&store, &target_id)
+                .expect("reverse deps")
         );
         assert_eq!(
             event_schema::event_labels(&store, &target_id).expect("labels"),

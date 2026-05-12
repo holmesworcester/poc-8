@@ -8,7 +8,7 @@
 //! the primary row without scanning the full table. The sealed row carries
 //! every clear-text field the projector saw plus the AEAD nonce + ciphertext;
 //! the read-side CLI opens the slot using the local key-secret named by
-//! `local_key_secret_id` to reveal filename and mime.
+//! `local_history_node_secret_id` to reveal filename and mime.
 
 use std::collections::BTreeMap;
 
@@ -16,9 +16,7 @@ use crate::core::store::{Schema, Store, TableName, TableRow};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::wire::{Reader, Writer};
 
-use super::types::{
-    FileEvent, SealedFileRow, FILE_DESCRIPTOR_CIPHERTEXT_BYTES,
-};
+use super::types::{FileEvent, SealedFileRow, FILE_DESCRIPTOR_CIPHERTEXT_BYTES};
 use crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES;
 
 pub const FILES: TableName = TableName::new("content.files");
@@ -26,9 +24,9 @@ pub const FILES_BY_MESSAGE: TableName = TableName::new("content.files_by_message
 pub const FILES_BY_FILE_ID: TableName = TableName::new("content.files_by_file_id");
 
 pub const SCHEMAS: &[Schema] = &[
-    Schema::durable_row_table("content.files.v1", FILES),
-    Schema::durable_row_table("content.files_by_message.v1", FILES_BY_MESSAGE),
-    Schema::durable_row_table("content.files_by_file_id.v1", FILES_BY_FILE_ID),
+    Schema::durable_row_table("content.files.v2", FILES),
+    Schema::durable_row_table("content.files_by_message.v2", FILES_BY_MESSAGE),
+    Schema::durable_row_table("content.files_by_file_id.v2", FILES_BY_FILE_ID),
 ];
 
 pub fn file_rows(
@@ -136,7 +134,7 @@ pub fn decode_sealed_file_row(key: &[u8], value: &[u8]) -> Result<SealedFileRow,
     let slice_bytes = reader.u32()?;
     let root_hash = reader.id()?;
     let removal_frontier_id = reader.id()?;
-    let local_key_secret_id = reader.id()?;
+    let local_history_node_secret_id = reader.id()?;
     let nonce = reader
         .bytes(XCHACHA20_POLY1305_NONCE_BYTES)?
         .try_into()
@@ -159,7 +157,7 @@ pub fn decode_sealed_file_row(key: &[u8], value: &[u8]) -> Result<SealedFileRow,
         slice_bytes,
         root_hash,
         removal_frontier_id,
-        local_key_secret_id,
+        local_history_node_secret_id,
         nonce,
         ciphertext,
     })
@@ -282,7 +280,7 @@ fn encode_sealed_value(signer_endpoint_shared_id: EventId, event: &FileEvent) ->
     out.u32(event.slice_bytes as usize);
     out.id(&event.root_hash);
     out.id(&event.removal_frontier_id);
-    out.id(&event.local_key_secret_id);
+    out.id(&event.local_history_node_secret_id);
     out.raw(&event.nonce);
     out.raw(&event.ciphertext);
     out.finish()

@@ -117,7 +117,7 @@ mod tests {
     }
 
     /// Invariant: replay/admission can block invite_accepted on the exact local
-    /// invite-secret event that authorizes its scoped bootstrap key.
+    /// invite-secret event that records the scoped invite secret.
     #[test]
     fn record_declares_local_scope_and_invite_secret_dependency() {
         let record = record_from_bytes(encode(&event())).expect("record");

@@ -6,7 +6,7 @@
 //! verifies the slice's ciphertext bytes against the descriptor's
 //! `root_hash`. Verified ciphertext is stored in the slice row; the read path
 //! decrypts each slice using the local key-secret resolved from the
-//! descriptor's `local_key_secret_id` to recover plaintext. The slice's
+//! descriptor's `local_history_node_secret_id` to recover plaintext. The slice's
 //! per-slice nonce is derived deterministically from
 //! `(file_id, slice_number)` so the AEAD construction is reproducible across
 //! sender, receiver, and replay. The on-wire `proof` field is fixed-width so
@@ -53,7 +53,7 @@ pub struct FileSliceEvent {
     pub created_at_ms: u64,
     pub file_id: EventId,
     pub slice_number: u32,
-    pub local_key_secret_id: EventId,
+    pub local_history_node_secret_id: EventId,
     /// Plaintext byte length of this slice. Ciphertext length is
     /// `plaintext_len + AEAD tag`, and the BAO proof verifies that range
     /// inside the encrypted blob.
@@ -77,7 +77,7 @@ pub struct BuildSlice<'a> {
     pub created_at_ms: u64,
     pub file_id: EventId,
     pub slice_number: u32,
-    pub local_key_secret_id: EventId,
+    pub local_history_node_secret_id: EventId,
     pub plaintext_len: u32,
     pub ciphertext: &'a [u8],
     pub outboard: &'a [u8],
@@ -93,11 +93,11 @@ pub struct FileSliceRow {
     pub slice_event_id: EventId,
     pub created_at_ms: u64,
     pub signer_endpoint_shared_id: EventId,
-    pub local_key_secret_id: EventId,
+    pub local_history_node_secret_id: EventId,
     pub plaintext_len: u32,
     /// BAO-verified ciphertext bytes for this slice. Stored only after the
     /// slice's proof checked against the descriptor's root hash; the read
     /// path decrypts using the local key-secret named by
-    /// `local_key_secret_id`.
+    /// `local_history_node_secret_id`.
     pub ciphertext: Vec<u8>,
 }

@@ -3,6 +3,7 @@
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 pub fn topo(args: &[&str]) -> Output {
@@ -80,6 +81,22 @@ pub fn stderr(output: &Output) -> String {
 }
 
 pub fn free_port() -> u16 {
+    static NEXT_PORT: OnceLock<AtomicUsize> = OnceLock::new();
+
+    let next_port = NEXT_PORT.get_or_init(|| {
+        let offset = (std::process::id() as usize % 100) * 200;
+        AtomicUsize::new(41000 + offset)
+    });
+    for _ in 0..20_000 {
+        let port = next_port.fetch_add(1, Ordering::Relaxed);
+        if port > 61000 {
+            break;
+        }
+        if TcpListener::bind(("127.0.0.1", port as u16)).is_ok() {
+            return port as u16;
+        }
+    }
+
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
 }

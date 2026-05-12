@@ -8,8 +8,10 @@
 
 use crate::protocol::event_modules::content::message_deletion::types::deletion_label_author;
 use crate::protocol::event_modules::identity::{endpoint_shared, signed, user};
+use crate::protocol::event_modules::leaf_history_node;
 use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput, TableDelete};
 
+use super::types::unix_minute_for;
 use super::{codec, schema};
 
 pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String> {
@@ -55,6 +57,37 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
         return Err("message signer endpoint is not authorized by the named author".to_string());
     }
 
+    // Validate the binding to the per-message leaf event. The message's
+    // canonical bytes name the leaf id as a dependency, so projection runs
+    // after the leaf has been admitted by its own projector. The leaf event
+    // body must declare the same `unix_minute` as the message and carry
+    // `event_id_in_minute = Some(message.event_id_in_minute_derived())`. The
+    // projector recomputes the deterministic leaf coordinate from canonical
+    // fields rather than trusting any wire-side nonce.
+    let leaf_record = event
+        .context
+        .dependency(&message.local_history_node_secret_id)
+        .ok_or_else(|| "message leaf history node dependency is missing".to_string())?;
+    let leaf = leaf_history_node::codec::decode(&leaf_record.canonical_bytes)
+        .map_err(|_| "message leaf dependency is not a local_history_node_secret".to_string())?;
+    if leaf.workspace_id != message.workspace_id
+        || leaf.removal_frontier_id != message.removal_frontier_id
+    {
+        return Err("message leaf workspace or frontier does not match message".to_string());
+    }
+    let expected_minute = unix_minute_for(message.created_at_ms);
+    if leaf.range_start != expected_minute || leaf.range_width != super::types::LEAF_RANGE_WIDTH {
+        return Err("message leaf coordinate does not match message minute".to_string());
+    }
+    if leaf.bit_depth != leaf_history_node::types::TRIE_LEAF_BIT_DEPTH
+        || leaf.event_id_prefix != message.event_id_in_minute_derived()
+    {
+        return Err(
+            "message leaf event_id_in_minute does not match deterministic message coord"
+                .to_string(),
+        );
+    }
+
     // Purge-on-project: a deletion event labels its target message id with
     // `content.deleted:<author_user_id>`. If the tombstone arrived first, the
     // message is valid but must not leave a visible row behind.
@@ -88,13 +121,14 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
 
 #[cfg(test)]
 mod tests {
+    use crate::protocol::event_modules::encryption::local_history_node_secret as leaf_module;
     use crate::protocol::event_modules::identity::{endpoint_shared, signed, user};
     use crate::protocol::event_modules::types::event_id;
     use crate::protocol::event_modules::worker::{
         DependencyContext, EventContext, EventWithContext,
     };
 
-    use super::super::types::MessageEvent;
+    use super::super::types::{unix_minute_for, MessageEvent};
     use super::*;
 
     type Record = crate::protocol::event_modules::types::EventRecord;
@@ -103,6 +137,8 @@ mod tests {
     struct BuiltMessage {
         record: Record,
         message_id: [u8; 32],
+        leaf_id: [u8; 32],
+        leaf_record: Record,
     }
 
     fn signing_public_key_for(private_key: &[u8; 32]) -> [u8; 32] {
@@ -150,15 +186,46 @@ mod tests {
         signer_private_key: &[u8; 32],
         signer_endpoint_shared_id: [u8; 32],
     ) -> BuiltMessage {
+        let created_at_ms = 5u64;
+        let removal_frontier_id = [30; 32];
+        // Mint a real leaf event for the deterministic
+        // `(unix_minute_for(5), event_id_in_minute_derived())` so the
+        // projector's leaf-binding check has a real local_history_node_secret
+        // dependency. Source it from a stub minute_node id so derivation
+        // succeeds; production would source from the minute_node admitted
+        // earlier in the worker.
+        let event_id_in_minute = super::super::types::message_event_id_in_minute(
+            &workspace_id,
+            &author_user_id,
+            &removal_frontier_id,
+            created_at_ms,
+        );
+        let leaf_output =
+            leaf_module::commands::derive_trie_split(leaf_module::commands::DeriveTrieSplit {
+                workspace_id,
+                removal_frontier_id,
+                parent_secret_id: [200; 32],
+                parent_secret: [201; 32],
+                range_start: unix_minute_for(created_at_ms),
+                parent_bit_depth: 0,
+                parent_event_id_prefix: [0; 32],
+                child_side: leaf_module::types::bit_at(&event_id_in_minute, 0),
+                child_bit_depth: leaf_module::types::TRIE_LEAF_BIT_DEPTH,
+                child_event_id_prefix: event_id_in_minute,
+                tombstone_node_id: None,
+            })
+            .expect("derive leaf for projector test");
+        let leaf_record = leaf_output.events[0].record().clone();
+        let leaf_id = leaf_output.value.local_history_node_secret_id;
         let output = super::super::commands::send(super::super::commands::SendMessage {
             workspace_id,
-            created_at_ms: 5,
+            created_at_ms,
             author_user_id,
             signer_endpoint_shared_id,
             signer_private_key: *signer_private_key,
-            removal_frontier_id: [30; 32],
-            local_key_secret_id: [31; 32],
-            key_secret: KEY_SECRET,
+            removal_frontier_id,
+            local_history_node_secret_id: leaf_id,
+            leaf_node_secret: KEY_SECRET,
             text: "hello".to_string(),
         })
         .expect("send");
@@ -166,6 +233,8 @@ mod tests {
         BuiltMessage {
             record,
             message_id: output.value.message_id,
+            leaf_id,
+            leaf_record,
         }
     }
 
@@ -188,6 +257,10 @@ mod tests {
                     DependencyContext {
                         event_id: author_id,
                         record: author_record,
+                    },
+                    DependencyContext {
+                        event_id: built.leaf_id,
+                        record: built.leaf_record.clone(),
                     },
                 ],
                 labels: Vec::new(),
@@ -355,7 +428,7 @@ mod tests {
             created_at_ms: 5,
             author_user_id: [2; 32],
             removal_frontier_id: [3; 32],
-            local_key_secret_id: [4; 32],
+            local_history_node_secret_id: [4; 32],
             nonce: [5; 24],
             ciphertext: [6; super::super::types::MESSAGE_CIPHERTEXT_BYTES],
         });

@@ -22,9 +22,7 @@ use crate::core::crypto::XCHACHA20_POLY1305_TAG_BYTES;
 use crate::core::store::Store;
 use crate::protocol::cli::Context;
 use crate::protocol::event_modules::content::{file, file_slice, message};
-use crate::protocol::event_modules::identity::{
-    endpoint, endpoint_shared, user, workspace,
-};
+use crate::protocol::event_modules::identity::{endpoint, endpoint_shared, user, workspace};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker::{self, CommandOutput, ProposedEvent};
 
@@ -110,19 +108,38 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
 
     let starting_timestamp = message::cli::next_timestamp(&context.store, parsed.workspace_id)?;
     let mut timestamp = starting_timestamp;
-    let content_key = message::cli::require_content_key(&context.store, parsed.workspace_id)?;
+    let removal_frontier_id =
+        message::cli::require_active_frontier_id(&context.store, parsed.workspace_id)?;
     let signer_endpoint = membership.endpoint_shared_id;
+    let author_user_id = membership.user_authority_event_id;
 
-    // Send-message event under the parent's content key.
+    // Derive the message's own per-event leaf using the deterministic coord
+    // computed from canonical message fields.
+    let message_event_coord = message::types::message_event_id_in_minute(
+        &parsed.workspace_id,
+        &author_user_id,
+        &removal_frontier_id,
+        timestamp,
+    );
+    let message_leaf = message::cli::derive_message_leaf(
+        &context.store,
+        &context.protocol,
+        parsed.workspace_id,
+        removal_frontier_id,
+        timestamp,
+        message_event_coord,
+    )?;
+
+    // Send-message event under the message's own content key.
     let send = message::commands::send(message::commands::SendMessage {
         workspace_id: parsed.workspace_id,
         created_at_ms: timestamp,
-        author_user_id: membership.user_authority_event_id,
+        author_user_id,
         signer_endpoint_shared_id: signer_endpoint,
         signer_private_key: local.signing_secret,
-        removal_frontier_id: content_key.removal_frontier_id,
-        local_key_secret_id: content_key.local_key_secret_id,
-        key_secret: content_key.key_secret,
+        removal_frontier_id,
+        local_history_node_secret_id: message_leaf.local_history_node_secret_id,
+        leaf_node_secret: message_leaf.leaf_node_secret,
         text: parsed.text,
     })?;
     let message_id = send.value.message_id;
@@ -130,9 +147,30 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
 
     let file_id = derive_file_id(&signer_endpoint, message_id, starting_timestamp);
 
-    // Encrypt each plaintext slice with the parent's content key. Slice AAD
-    // is independent of file_event_id (see file_slice::codec docs), so a
-    // single seal pass + BAO outboard suffices.
+    // Files now author their own leaf, distinct from the parent message's
+    // leaf. Two clients independently authoring the same file (same
+    // workspace, author, parent message, file_id, frontier, timestamp) reach
+    // the same leaf coord and admission collapses the duplicate.
+    let file_event_coord = file::types::file_event_id_in_minute(
+        &parsed.workspace_id,
+        &author_user_id,
+        &message_id,
+        &file_id,
+        &removal_frontier_id,
+        timestamp,
+    );
+    let file_leaf = message::cli::derive_message_leaf(
+        &context.store,
+        &context.protocol,
+        parsed.workspace_id,
+        removal_frontier_id,
+        timestamp,
+        file_event_coord,
+    )?;
+
+    // Encrypt each plaintext slice with the file's own leaf node secret.
+    // Slice AAD is independent of file_event_id (see file_slice::codec
+    // docs), so a single seal pass + BAO outboard suffices.
     let mut ciphertext_total = Vec::with_capacity(
         plaintext.len() + (total_slices as usize) * XCHACHA20_POLY1305_TAG_BYTES,
     );
@@ -140,7 +178,7 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
         let start = (slice_number as usize) * slice_bytes as usize;
         let end = ((slice_number + 1) as usize * slice_bytes as usize).min(plaintext.len());
         let chunk = file_slice::codec::seal_slice(
-            &content_key.key_secret,
+            &file_leaf.leaf_node_secret,
             &parsed.workspace_id,
             &file_id,
             slice_number,
@@ -159,7 +197,7 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
         workspace_id: parsed.workspace_id,
         created_at_ms: timestamp,
         message_id,
-        author_user_id: membership.user_authority_event_id,
+        author_user_id,
         signer_endpoint_shared_id: signer_endpoint,
         signer_private_key: local.signing_secret,
         file_id,
@@ -169,9 +207,9 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
         root_hash,
         filename: filename.clone(),
         mime_type: parsed.mime_type.clone(),
-        removal_frontier_id: content_key.removal_frontier_id,
-        local_key_secret_id: content_key.local_key_secret_id,
-        key_secret: content_key.key_secret,
+        removal_frontier_id,
+        local_history_node_secret_id: file_leaf.local_history_node_secret_id,
+        key_secret: file_leaf.leaf_node_secret,
     })?;
     let file_event_id = create_file.value.file_event_id;
     timestamp = timestamp.saturating_add(1);
@@ -197,7 +235,7 @@ fn run_send_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
                 slice_number,
                 signer_endpoint_shared_id: signer_endpoint,
                 signer_private_key: local.signing_secret,
-                local_key_secret_id: content_key.local_key_secret_id,
+                local_history_node_secret_id: file_leaf.local_history_node_secret_id,
                 plaintext_len,
                 ciphertext: &ciphertext_total,
                 outboard: &outboard,
@@ -346,8 +384,7 @@ fn run_view_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
         .table_row(workspace::schema::WORKSPACES, &workspace_id)
         .map_err(|err| format!("load workspace: {err}"))?
         .ok_or_else(|| "workspace row is missing".to_string())?;
-    let workspace_row =
-        workspace::schema::decode_workspace_row(&workspace_id, &workspace_value)?;
+    let workspace_row = workspace::schema::decode_workspace_row(&workspace_id, &workspace_value)?;
 
     let users = workspace_user_view(&context.store, workspace_id, local.endpoint)?;
     let messages = message::cli::list_for_display(&context.store, workspace_id, 0)?;
@@ -364,7 +401,10 @@ fn run_view_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
     let now_ms = current_unix_ms();
     let mut lines = Vec::new();
     lines.push("IDENTITY:".to_string());
-    lines.push(format!("  endpoint_id: {}", message::cli::hex_id(local.endpoint)));
+    lines.push(format!(
+        "  endpoint_id: {}",
+        message::cli::hex_id(local.endpoint)
+    ));
     lines.push(format!(
         "  signing_public_key: {}",
         message::cli::hex_id(local.signing_public_key)
@@ -516,8 +556,7 @@ fn reactions_with_authors(
     // cleartext rows; the visible set must match the `messages` listing.
     let rows = message::cli::visible_reaction_rows(store, workspace_id)?;
     let mut grouped: BTreeMap<EventId, Vec<(String, EventId)>> = BTreeMap::new();
-    let mut seen: BTreeMap<EventId, std::collections::HashSet<(EventId, String)>> =
-        BTreeMap::new();
+    let mut seen: BTreeMap<EventId, std::collections::HashSet<(EventId, String)>> = BTreeMap::new();
     for row in rows {
         let entry = seen.entry(row.target_message_id).or_default();
         let key = (row.author_user_id, row.emoji.clone());
@@ -581,11 +620,7 @@ fn format_file_display(
     slices_received: u32,
 ) -> String {
     let complete = total_slices > 0 && slices_received >= total_slices;
-    let status = if complete {
-        "\u{2714}"
-    } else {
-        "\u{23f3}"
-    };
+    let status = if complete { "\u{2714}" } else { "\u{23f3}" };
     let size = format_byte_size(blob_bytes);
     if !complete && total_slices > 0 {
         let pct = (slices_received as f64 / total_slices as f64 * 100.0) as u32;

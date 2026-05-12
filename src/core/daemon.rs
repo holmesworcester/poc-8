@@ -84,6 +84,16 @@ pub trait DaemonProtocol {
 
     fn daemon_db_path(context: &Self::Context) -> &Path;
     fn daemon_workers() -> Vec<Worker<Self::Context>>;
+    /// Called once after the listener is bound but before any worker step
+    /// runs. The protocol may use this hook to advertise the bound address as
+    /// memory-only state. The default implementation does nothing so most
+    /// protocols can ignore the hook.
+    fn after_listener_bound(
+        _context: &mut Self::Context,
+        _local_addr: SocketAddr,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,9 +177,18 @@ where
 {
     let options = StartOptions::parse(args)?;
     install_termination_handlers();
-    let _lock = DaemonLock::acquire(P::daemon_db_path(context))?;
-    let report = run_after_bind(
+    let lock = DaemonLock::acquire(P::daemon_db_path(context))?;
+    let listener = tcp::listen(options.listen)?;
+    let local_addr = listener.local_addr();
+    // Record the bound address in the lock file before printing the visibility
+    // line so a sibling CLI process that synchronizes on `listening: <addr>`
+    // can read it back via `current_listen_addr` immediately.
+    lock.record_listen_addr(local_addr)?;
+    P::after_listener_bound(context, local_addr)?;
+    print_line_now(&format!("listening: {local_addr}"))?;
+    let report = run_with_listener(
         context,
+        listener,
         &P::daemon_workers(),
         DaemonOptions {
             listen: options.listen,
@@ -177,7 +196,6 @@ where
             idle: Duration::from_millis(options.tick_ms),
             work_limit: DEFAULT_WORK_LIMIT,
         },
-        |addr| print_line_now(&format!("listening: {addr}")),
     )?;
     Ok(CliOutput::lines(report.lines()))
 }
@@ -213,6 +231,15 @@ pub fn run_after_bind<C>(
 ) -> Result<DaemonReport, String> {
     let listener = tcp::listen(options.listen)?;
     after_bind(listener.local_addr())?;
+    run_with_listener(context, listener, workers, options)
+}
+
+fn run_with_listener<C>(
+    context: &mut C,
+    listener: tcp::Listener,
+    workers: &[Worker<C>],
+    options: DaemonOptions,
+) -> Result<DaemonReport, String> {
     let started = Instant::now();
     let mut report = DaemonReport {
         local_addr: Some(listener.local_addr()),
@@ -291,7 +318,9 @@ fn stop_daemon(db_path: &Path) -> Result<Vec<String>, String> {
             // running daemon: if a current daemon owned it, the file would
             // contain a fresh PID. Removing the file unblocks future starts.
             let _ = fs::remove_file(&lock);
-            return Ok(vec!["no daemon running (cleared unreadable lock)".to_string()]);
+            return Ok(vec![
+                "no daemon running (cleared unreadable lock)".to_string()
+            ]);
         }
         LockState::Pid(pid) => pid,
     };
@@ -382,7 +411,9 @@ fn validate_reset_path(db_path: &Path) -> Result<PathBuf, String> {
             db_path.display()
         ));
     }
-    let parent_abs = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    let parent_abs = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
     if parent_abs.as_os_str().is_empty() || parent_abs == Path::new("/") {
         return Err(format!(
             "reset: refusing to operate inside `{}`",
@@ -406,10 +437,13 @@ enum LockState {
 
 fn read_lock_pid(lock: &Path) -> Result<LockState, String> {
     match fs::read_to_string(lock) {
-        Ok(text) => match text.trim().parse::<u32>() {
-            Ok(pid) if pid > 0 => Ok(LockState::Pid(pid)),
-            _ => Ok(LockState::Unreadable),
-        },
+        Ok(text) => {
+            let pid_line = text.lines().next().unwrap_or("");
+            match pid_line.trim().parse::<u32>() {
+                Ok(pid) if pid > 0 => Ok(LockState::Pid(pid)),
+                _ => Ok(LockState::Unreadable),
+            }
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(LockState::Missing),
         Err(err) => Err(format!("read daemon lock: {err}")),
     }
@@ -516,12 +550,65 @@ impl DaemonLock {
             Err(err) => Err(format!("create daemon lock: {err}")),
         }
     }
+
+    /// Append the bound listen address to this daemon's lock file. Sibling CLI
+    /// processes call `current_listen_addr` to read it back without going
+    /// through any protocol-owned table — the lock file's lifetime is the
+    /// daemon's lifetime, so a stale row cannot survive a restart.
+    fn record_listen_addr(&self, addr: SocketAddr) -> Result<(), String> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+            .map_err(|err| format!("rewrite daemon lock: {err}"))?;
+        writeln!(file, "{}", std::process::id())
+            .map_err(|err| format!("write daemon lock pid: {err}"))?;
+        writeln!(file, "{addr}").map_err(|err| format!("write daemon lock addr: {err}"))?;
+        file.flush()
+            .map_err(|err| format!("flush daemon lock: {err}"))
+    }
 }
 
 impl Drop for DaemonLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+/// Return the bound listen address of a running daemon for `db_path`, or
+/// `None` if no live daemon is recorded.
+///
+/// This is the core-owned affordance protocol code uses to ask "is a daemon
+/// running locally, and where is it listening?" without persisting the answer
+/// in any protocol-owned table. The lock file is removed when the daemon
+/// exits cleanly; for a hard crash, the PID liveness check filters out the
+/// stale entry. Sibling CLI processes that share the database file read the
+/// same lock file the daemon writes.
+pub fn current_listen_addr(db_path: &Path) -> Result<Option<SocketAddr>, String> {
+    let path = lock_path(db_path);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("read daemon lock: {err}")),
+    };
+    let mut lines = text.lines();
+    let Some(pid_line) = lines.next() else {
+        return Ok(None);
+    };
+    let Ok(pid) = pid_line.trim().parse::<u32>() else {
+        return Ok(None);
+    };
+    if !Path::new(&format!("/proc/{pid}")).exists() {
+        return Ok(None);
+    }
+    let Some(addr_line) = lines.next() else {
+        return Ok(None);
+    };
+    addr_line
+        .trim()
+        .parse::<SocketAddr>()
+        .map(Some)
+        .map_err(|err| format!("daemon lock listen addr is invalid: {err}"))
 }
 
 fn lock_path(db_path: &Path) -> PathBuf {
@@ -543,8 +630,9 @@ fn create_lock_file(path: &Path) -> std::io::Result<File> {
 }
 
 fn stale_lock_can_be_removed(path: &Path) -> Result<bool, String> {
-    let pid_text = fs::read_to_string(path).map_err(|err| format!("read daemon lock: {err}"))?;
-    let Ok(pid) = pid_text.trim().parse::<u32>() else {
+    let text = fs::read_to_string(path).map_err(|err| format!("read daemon lock: {err}"))?;
+    let pid_line = text.lines().next().unwrap_or("");
+    let Ok(pid) = pid_line.trim().parse::<u32>() else {
         return Ok(false);
     };
     Ok(!Path::new(&format!("/proc/{pid}")).exists())

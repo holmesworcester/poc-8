@@ -12,6 +12,7 @@
 
 use crate::protocol::event_modules::content::message;
 use crate::protocol::event_modules::identity::{endpoint_shared, signed, user};
+use crate::protocol::event_modules::leaf_history_node;
 use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput};
 
 use super::{codec, schema};
@@ -70,9 +71,31 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
     if parent_message.workspace_id != file.workspace_id {
         return Err("file parent message workspace does not match file".to_string());
     }
-    if parent_message.local_key_secret_id != file.local_key_secret_id {
+
+    // Each file authors its own leaf under the per-minute coarse cover,
+    // independent of the parent message's leaf. The named leaf must live in
+    // the file's `unix_minute` and carry the deterministic
+    // `event_id_in_minute` recomputed from the file's canonical fields.
+    let leaf_record = event
+        .context
+        .dependency(&file.local_history_node_secret_id)
+        .ok_or_else(|| "file leaf history node dependency is missing".to_string())?;
+    let leaf = leaf_history_node::codec::decode(&leaf_record.canonical_bytes)
+        .map_err(|_| "file leaf dependency is not a local_history_node_secret".to_string())?;
+    if leaf.workspace_id != file.workspace_id
+        || leaf.removal_frontier_id != file.removal_frontier_id
+    {
+        return Err("file leaf workspace or frontier does not match file".to_string());
+    }
+    let expected_minute = message::types::unix_minute_for(file.created_at_ms);
+    if leaf.range_start != expected_minute || leaf.range_width != message::types::LEAF_RANGE_WIDTH {
+        return Err("file leaf coordinate does not match file minute".to_string());
+    }
+    if leaf.bit_depth != leaf_history_node::types::TRIE_LEAF_BIT_DEPTH
+        || leaf.event_id_prefix != file.event_id_in_minute_derived()
+    {
         return Err(
-            "file local key secret id does not match parent message local key secret".to_string(),
+            "file leaf event_id_in_minute does not match deterministic file coord".to_string(),
         );
     }
 
@@ -89,7 +112,7 @@ mod tests {
         self, XChaCha20Poly1305Key, XChaCha20Poly1305Nonce, XCHACHA20_POLY1305_NONCE_BYTES,
     };
     use crate::protocol::event_modules::content::message;
-    use crate::protocol::event_modules::encryption::local_key_secret;
+    use crate::protocol::event_modules::encryption::local_history_node_secret as leaf_module;
     use crate::protocol::event_modules::identity::{endpoint_shared, signed, user};
     use crate::protocol::event_modules::types::{event_id, EventScope};
     use crate::protocol::event_modules::worker::{
@@ -97,13 +120,13 @@ mod tests {
     };
 
     use super::super::types::{
-        FileDescriptorPlaintext, FileEvent, FILE_DESCRIPTOR_CIPHERTEXT_BYTES,
+        file_event_id_in_minute, FileDescriptorPlaintext, FileEvent,
+        FILE_DESCRIPTOR_CIPHERTEXT_BYTES,
     };
     use super::*;
 
     type Record = crate::protocol::event_modules::types::EventRecord;
 
-    const KEY_SECRET: XChaCha20Poly1305Key = [77; 32];
     const NONCE: XChaCha20Poly1305Nonce = [13; XCHACHA20_POLY1305_NONCE_BYTES];
 
     struct BuiltDescriptor {
@@ -115,7 +138,9 @@ mod tests {
         author_record: Record,
         parent_id: [u8; 32],
         parent_record: Record,
-        local_secret_id: [u8; 32],
+        leaf_id: [u8; 32],
+        leaf_record: Record,
+        leaf_node_secret: XChaCha20Poly1305Key,
         workspace_id: [u8; 32],
     }
 
@@ -162,36 +187,20 @@ mod tests {
         workspace_id: [u8; 32],
         author_user_id: [u8; 32],
         frontier_id: [u8; 32],
-        local_key_secret_id: [u8; 32],
+        local_history_node_secret_id: [u8; 32],
     ) -> Record {
         let payload = message::codec::encode(&message::types::MessageEvent {
             workspace_id,
             created_at_ms: 1,
             author_user_id,
             removal_frontier_id: frontier_id,
-            local_key_secret_id,
+            local_history_node_secret_id,
             nonce: [32; XCHACHA20_POLY1305_NONCE_BYTES],
             ciphertext: [33; message::types::MESSAGE_CIPHERTEXT_BYTES],
         });
         let envelope = message::codec::sign([42; 32], &[43; 32], payload);
         let bytes = message::codec::encode_signed(&envelope);
         message::codec::signed_record_from_bytes(bytes).expect("record")
-    }
-
-    fn local_secret_record(
-        workspace_id: [u8; 32],
-        frontier_id: [u8; 32],
-    ) -> (Record, [u8; 32]) {
-        let output = local_key_secret::commands::from_key_secret(
-            workspace_id,
-            frontier_id,
-            KEY_SECRET,
-        )
-        .expect("local key secret");
-        (
-            output.events[0].record().clone(),
-            output.value.local_key_secret_id,
-        )
     }
 
     fn build_descriptor(filename: &str, mime: &str) -> BuiltDescriptor {
@@ -203,32 +212,62 @@ mod tests {
         let author_id = event_id(&author_record.canonical_bytes);
         let signer_record = endpoint_shared_record(workspace_id, author_id, signer_pubkey);
         let signer_id = event_id(&signer_record.canonical_bytes);
-        let (_, local_secret_id) = local_secret_record(workspace_id, frontier_id);
-        let parent_record =
-            message_record(workspace_id, author_id, frontier_id, local_secret_id);
+        // The parent message's leaf id is decoupled from the file's leaf id;
+        // this test only needs *some* valid signed message to satisfy the
+        // workspace-equality dependency check.
+        let parent_record = message_record(workspace_id, author_id, frontier_id, [200; 32]);
         let parent_id = event_id(&parent_record.canonical_bytes);
+
+        let file_id: [u8; 32] = [99; 32];
+        let created_at_ms = 5u64;
+        let event_id_in_minute = file_event_id_in_minute(
+            &workspace_id,
+            &author_id,
+            &parent_id,
+            &file_id,
+            &frontier_id,
+            created_at_ms,
+        );
+        let leaf_output =
+            leaf_module::commands::derive_trie_split(leaf_module::commands::DeriveTrieSplit {
+                workspace_id,
+                removal_frontier_id: frontier_id,
+                parent_secret_id: [205; 32],
+                parent_secret: [206; 32],
+                range_start: message::types::unix_minute_for(created_at_ms),
+                parent_bit_depth: 0,
+                parent_event_id_prefix: [0; 32],
+                child_side: leaf_module::types::bit_at(&event_id_in_minute, 0),
+                child_bit_depth: leaf_module::types::TRIE_LEAF_BIT_DEPTH,
+                child_event_id_prefix: event_id_in_minute,
+                tombstone_node_id: None,
+            })
+            .expect("derive leaf");
+        let leaf_id = leaf_output.value.local_history_node_secret_id;
+        let leaf_record = leaf_output.events[0].record().clone();
+        let leaf_node_secret = leaf_output.value.event.node_secret;
 
         let blob: Vec<u8> = (0..1024u32).map(|byte| byte as u8).collect();
         let (root_hash, _) = crypto::bao_outboard(&blob).expect("outboard");
 
         let mut event = FileEvent {
             workspace_id,
-            created_at_ms: 5,
+            created_at_ms,
             message_id: parent_id,
             author_user_id: author_id,
-            file_id: [99; 32],
+            file_id,
             blob_bytes: blob.len() as u64,
             total_slices: 1,
             slice_bytes: 1024,
             root_hash,
             removal_frontier_id: frontier_id,
-            local_key_secret_id: local_secret_id,
+            local_history_node_secret_id: leaf_id,
             nonce: NONCE,
             ciphertext: [0; FILE_DESCRIPTOR_CIPHERTEXT_BYTES],
         };
         let aad = codec::descriptor_associated_data(&event, signer_id);
         event.ciphertext = codec::seal_descriptor_slot(
-            &KEY_SECRET,
+            &leaf_node_secret,
             &event.nonce,
             &aad,
             &FileDescriptorPlaintext {
@@ -251,7 +290,9 @@ mod tests {
             author_record,
             parent_id,
             parent_record,
-            local_secret_id,
+            leaf_id,
+            leaf_record,
+            leaf_node_secret,
             workspace_id,
         }
     }
@@ -274,6 +315,10 @@ mod tests {
                         event_id: built.parent_id,
                         record: built.parent_record.clone(),
                     },
+                    DependencyContext {
+                        event_id: built.leaf_id,
+                        record: built.leaf_record.clone(),
+                    },
                 ],
                 labels: Vec::new(),
                 receive: None,
@@ -294,7 +339,7 @@ mod tests {
             .expect("decode row");
         assert_eq!(row.workspace_id, built.workspace_id);
         assert_eq!(row.file_event_id, built.file_event_id);
-        assert_eq!(row.local_key_secret_id, built.local_secret_id);
+        assert_eq!(row.local_history_node_secret_id, built.leaf_id);
         // Sealed row never carries plaintext filename or mime.
         assert!(!row
             .ciphertext
@@ -304,23 +349,41 @@ mod tests {
             .ciphertext
             .windows("image/jpeg".len())
             .any(|w| w == b"image/jpeg"));
+        // Smoke-test the AEAD round trip with the file's own leaf node secret.
+        let aad = codec::descriptor_associated_data(
+            &FileEvent {
+                workspace_id: row.workspace_id,
+                created_at_ms: row.created_at_ms,
+                message_id: row.message_id,
+                author_user_id: row.author_user_id,
+                file_id: row.file_id,
+                blob_bytes: row.blob_bytes,
+                total_slices: row.total_slices,
+                slice_bytes: row.slice_bytes,
+                root_hash: row.root_hash,
+                removal_frontier_id: row.removal_frontier_id,
+                local_history_node_secret_id: row.local_history_node_secret_id,
+                nonce: row.nonce,
+                ciphertext: row.ciphertext,
+            },
+            row.signer_endpoint_shared_id,
+        );
+        let plaintext =
+            codec::open_descriptor_slot(&built.leaf_node_secret, &row.nonce, &aad, &row.ciphertext)
+                .expect("open descriptor");
+        assert_eq!(plaintext.filename, "photo.jpg");
+        assert_eq!(plaintext.mime_type, "image/jpeg");
     }
 
     #[test]
     fn rejects_parent_message_for_other_workspace() {
         let mut built = build_descriptor("a.bin", "application/octet-stream");
         let other_workspace = [8; 32];
-        let other_parent = message_record(
-            other_workspace,
-            built.author_id,
-            [30; 32],
-            built.local_secret_id,
-        );
+        let other_parent = message_record(other_workspace, built.author_id, [30; 32], [200; 32]);
         built.parent_id = event_id(&other_parent.canonical_bytes);
         built.parent_record = other_parent;
 
-        let envelope =
-            codec::decode_signed(&built.record.canonical_bytes).expect("decode signed");
+        let envelope = codec::decode_signed(&built.record.canonical_bytes).expect("decode signed");
         let mut file = codec::decode(&envelope.payload).expect("decode file");
         file.message_id = built.parent_id;
         let payload = codec::encode(&file).expect("re-encode");
@@ -337,30 +400,76 @@ mod tests {
     }
 
     #[test]
-    fn rejects_descriptor_whose_local_key_secret_id_diverges_from_parent_message() {
-        let mut built = build_descriptor("a.bin", "application/octet-stream");
-        // Build a descriptor that references a different local_key_secret_id
-        // than the parent message; the projector must reject so that purges
-        // and key-blocked admission rules cannot be bypassed.
-        let envelope =
-            codec::decode_signed(&built.record.canonical_bytes).expect("decode signed");
+    fn rejects_descriptor_whose_leaf_coord_diverges_from_canonical_fields() {
+        let built = build_descriptor("a.bin", "application/octet-stream");
+        // Mint a different leaf event that does not match the deterministic
+        // file coord, then point the file at it. The projector must reject so
+        // that two clients cannot fake idempotency by aliasing leaves.
+        let other_leaf =
+            leaf_module::commands::derive_trie_split(leaf_module::commands::DeriveTrieSplit {
+                workspace_id: built.workspace_id,
+                removal_frontier_id: [30; 32],
+                parent_secret_id: [205; 32],
+                parent_secret: [206; 32],
+                range_start: message::types::unix_minute_for(5),
+                parent_bit_depth: 0,
+                parent_event_id_prefix: [0; 32],
+                child_side: leaf_module::types::bit_at(&[222; 32], 0),
+                child_bit_depth: leaf_module::types::TRIE_LEAF_BIT_DEPTH,
+                child_event_id_prefix: [222; 32],
+                tombstone_node_id: None,
+            })
+            .expect("derive other leaf");
+        let other_leaf_id = other_leaf.value.local_history_node_secret_id;
+        let other_leaf_record = other_leaf.events[0].record().clone();
+
+        let envelope = codec::decode_signed(&built.record.canonical_bytes).expect("decode signed");
         let mut file = codec::decode(&envelope.payload).expect("decode file");
-        file.local_key_secret_id = [200; 32];
+        file.local_history_node_secret_id = other_leaf_id;
         let payload = codec::encode(&file).expect("re-encode");
         let resigned = codec::sign(built.signer_id, &[9; 32], payload);
         let bytes = codec::encode_signed(&resigned);
-        built.file_event_id = crate::protocol::event_modules::types::event_id(&bytes);
-        built.record = codec::signed_record_from_bytes(bytes).expect("record");
-
-        let event = context_for(&built);
+        let new_id = crate::protocol::event_modules::types::event_id(&bytes);
+        let new_record = codec::signed_record_from_bytes(bytes).expect("record");
+        let mut tampered = built;
+        tampered.file_event_id = new_id;
+        tampered.record = new_record;
+        // Replace the file's leaf dependency in the context with the
+        // mismatching leaf so the projector sees the divergence.
+        let event = EventWithContext {
+            record: &tampered.record,
+            context: EventContext {
+                event_id: tampered.file_event_id,
+                dependencies: vec![
+                    DependencyContext {
+                        event_id: tampered.signer_id,
+                        record: tampered.signer_record.clone(),
+                    },
+                    DependencyContext {
+                        event_id: tampered.author_id,
+                        record: tampered.author_record.clone(),
+                    },
+                    DependencyContext {
+                        event_id: tampered.parent_id,
+                        record: tampered.parent_record.clone(),
+                    },
+                    DependencyContext {
+                        event_id: other_leaf_id,
+                        record: other_leaf_record,
+                    },
+                ],
+                labels: Vec::new(),
+                receive: None,
+            },
+        };
         assert_eq!(
-            project(&event).expect_err("local_key_secret mismatch must fail"),
-            "file local key secret id does not match parent message local key secret"
+            project(&event).expect_err("leaf coord mismatch must fail"),
+            "file leaf event_id_in_minute does not match deterministic file coord"
         );
     }
 
     #[test]
-    fn record_exposes_signer_workspace_author_message_local_key_dependencies() {
+    fn record_exposes_signer_workspace_author_message_leaf_dependencies() {
         let built = build_descriptor("a.bin", "application/octet-stream");
         let record = &built.record;
         assert_eq!(
@@ -370,7 +479,7 @@ mod tests {
                 built.workspace_id,
                 built.author_id,
                 built.parent_id,
-                built.local_secret_id,
+                built.leaf_id,
             ]
         );
         assert_eq!(record.scope, EventScope::Shared);
@@ -379,8 +488,7 @@ mod tests {
     #[test]
     fn raw_file_bytes_are_not_admissible() {
         let built = build_descriptor("a.bin", "application/octet-stream");
-        let envelope =
-            codec::decode_signed(&built.record.canonical_bytes).expect("decode signed");
+        let envelope = codec::decode_signed(&built.record.canonical_bytes).expect("decode signed");
         assert_eq!(
             crate::protocol::event_modules::record_from_bytes(envelope.payload)
                 .expect_err("raw file must fail"),

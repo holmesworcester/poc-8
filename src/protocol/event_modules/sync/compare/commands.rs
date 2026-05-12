@@ -55,6 +55,14 @@ pub fn start(
     connection_id: EventId,
     range: TimestampRange,
 ) -> Result<SyncReport, String> {
+    start_with_summary(context.summary(range)?, connection_id, range)
+}
+
+pub fn start_with_summary(
+    summary: RangeSummary,
+    connection_id: EventId,
+    range: TimestampRange,
+) -> Result<SyncReport, String> {
     // Start sends one compare over the caller-selected range. The
     // rest of the exchange is driven by projected inbound compare rows.
     let mut report = SyncReport::default();
@@ -63,7 +71,7 @@ pub fn start(
         .push(super::codec::outbound_record(CompareEvent {
             connection_id,
             range,
-            summary: context.summary(range)?,
+            summary,
             response_requested: true,
         })?);
     report.sent_events = 1;
@@ -243,4 +251,265 @@ fn compare_response(
         return Ok(records);
     }
     Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeSet, HashSet, VecDeque};
+
+    use crate::protocol::event_modules::types::EventIndexEntry;
+
+    use super::*;
+
+    const CONNECTION_ID: EventId = [7; 32];
+    const WORKSPACE_ID: EventId = [9; 32];
+
+    #[derive(Clone)]
+    struct SetContext {
+        entries: Vec<EventIndexEntry>,
+        ids: HashSet<EventId>,
+    }
+
+    impl SetContext {
+        fn new(mut entries: Vec<EventIndexEntry>) -> Self {
+            entries.sort_by_key(|entry| (entry.timestamp, entry.event_id));
+            let ids = entries.iter().map(|entry| entry.event_id).collect();
+            Self { entries, ids }
+        }
+
+        fn entries_in_range(&self, range: TimestampRange) -> Vec<EventIndexEntry> {
+            self.entries
+                .iter()
+                .filter(|entry| range.start <= entry.timestamp && entry.timestamp <= range.end)
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl ReadContext for SetContext {
+        fn summary(&self, range: TimestampRange) -> Result<RangeSummary, String> {
+            Ok(summary_of(&self.entries_in_range(range)))
+        }
+
+        fn ids_in_range(&self, range: TimestampRange) -> Result<Vec<EventIndexEntry>, String> {
+            Ok(self.entries_in_range(range))
+        }
+
+        fn timestamp_bounds(&self, range: TimestampRange) -> Result<Option<(u64, u64)>, String> {
+            let entries = self.entries_in_range(range);
+            let Some(first) = entries.first() else {
+                return Ok(None);
+            };
+            let last = entries.last().unwrap_or(first);
+            Ok(Some((first.timestamp, last.timestamp)))
+        }
+
+        fn has_event(&self, event_id: &EventId) -> Result<bool, String> {
+            Ok(self.ids.contains(event_id))
+        }
+
+        fn can_send_event(&self, event_id: &EventId) -> Result<bool, String> {
+            Ok(self.ids.contains(event_id))
+        }
+
+        fn dependency_closure_entries(
+            &self,
+            _roots: &[EventIndexEntry],
+        ) -> Result<Vec<EventIndexEntry>, String> {
+            Ok(Vec::new())
+        }
+
+        fn fresh_have_entries(
+            &self,
+            _connection_id: EventId,
+            entries: Vec<EventIndexEntry>,
+        ) -> Result<Vec<EventIndexEntry>, String> {
+            Ok(entries)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Recipient {
+        Left,
+        Right,
+    }
+
+    #[test]
+    fn large_scattered_differences_reconcile_with_bounded_idempotent_exchange() {
+        let common_count = 65_536u64;
+        let diff_count = 768u64;
+        let stride = u64::MAX / (common_count + diff_count + 8);
+        let mut left_entries = Vec::with_capacity((common_count + diff_count) as usize);
+        let mut right_entries = Vec::with_capacity((common_count + diff_count) as usize);
+        let mut left_unique = BTreeSet::new();
+        let mut right_unique = BTreeSet::new();
+
+        for idx in 0..common_count {
+            let entry = EventIndexEntry {
+                event_id: test_id(b"common", idx),
+                timestamp: 1 + idx.saturating_mul(stride),
+                workspace_id: Some(WORKSPACE_ID),
+            };
+            left_entries.push(entry.clone());
+            right_entries.push(entry);
+        }
+
+        for idx in 0..diff_count {
+            // A prime stride scatters differences throughout the large common
+            // set instead of clustering them into one easy range.
+            let slot = (idx * 7_919) % common_count;
+            let base_timestamp = 1 + slot.saturating_mul(stride);
+            let left_id = test_id(b"left-only", idx);
+            let right_id = test_id(b"right-only", idx);
+            left_unique.insert(left_id);
+            right_unique.insert(right_id);
+            left_entries.push(EventIndexEntry {
+                event_id: left_id,
+                timestamp: base_timestamp
+                    .saturating_add(stride / 3)
+                    .max(base_timestamp),
+                workspace_id: Some(WORKSPACE_ID),
+            });
+            right_entries.push(EventIndexEntry {
+                event_id: right_id,
+                timestamp: base_timestamp
+                    .saturating_add((2 * stride) / 3)
+                    .max(base_timestamp.saturating_add(1)),
+                workspace_id: Some(WORKSPACE_ID),
+            });
+        }
+
+        let result = run_exchange(
+            SetContext::new(left_entries),
+            SetContext::new(right_entries),
+        );
+
+        assert_eq!(result.delivered_to_left, right_unique);
+        assert_eq!(result.delivered_to_right, left_unique);
+        assert!(
+            result.processed_protocol_events < 150_000,
+            "scattered sync exchange produced too many protocol events: {}",
+            result.processed_protocol_events
+        );
+    }
+
+    #[test]
+    fn mostly_disjoint_large_sets_reconcile_with_bounded_exchange() {
+        let count = 32_768u64;
+        let stride = u64::MAX / (count + 8);
+        let mut left_entries = Vec::with_capacity(count as usize);
+        let mut right_entries = Vec::with_capacity(count as usize);
+        let mut left_unique = BTreeSet::new();
+        let mut right_unique = BTreeSet::new();
+
+        for idx in 0..count {
+            let left_id = test_id(b"disjoint-left", idx);
+            let right_id = test_id(b"disjoint-right", idx);
+            left_unique.insert(left_id);
+            right_unique.insert(right_id);
+            left_entries.push(EventIndexEntry {
+                event_id: left_id,
+                timestamp: 1 + idx.saturating_mul(stride),
+                workspace_id: Some(WORKSPACE_ID),
+            });
+            right_entries.push(EventIndexEntry {
+                event_id: right_id,
+                timestamp: 1 + idx.saturating_mul(stride),
+                workspace_id: Some(WORKSPACE_ID),
+            });
+        }
+
+        let result = run_exchange(
+            SetContext::new(left_entries),
+            SetContext::new(right_entries),
+        );
+
+        assert_eq!(result.delivered_to_left, right_unique);
+        assert_eq!(result.delivered_to_right, left_unique);
+        assert!(
+            result.processed_protocol_events < 250_000,
+            "mostly-disjoint sync exchange produced too many protocol events: {}",
+            result.processed_protocol_events
+        );
+    }
+
+    struct ExchangeResult {
+        delivered_to_left: BTreeSet<EventId>,
+        delivered_to_right: BTreeSet<EventId>,
+        processed_protocol_events: usize,
+    }
+
+    fn run_exchange(left: SetContext, right: SetContext) -> ExchangeResult {
+        let mut delivered_to_left = BTreeSet::new();
+        let mut delivered_to_right = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        let mut processed_protocol_events = 0usize;
+
+        for event in start(&left, CONNECTION_ID, TimestampRange::ROOT)
+            .expect("start sync")
+            .events
+        {
+            queue.push_back((Recipient::Right, event));
+        }
+
+        while let Some((recipient, event)) = queue.pop_front() {
+            processed_protocol_events += 1;
+            let (context, response_recipient, delivered) = match recipient {
+                Recipient::Left => (&left, Recipient::Right, &mut delivered_to_right),
+                Recipient::Right => (&right, Recipient::Left, &mut delivered_to_left),
+            };
+            let report = handle_inbound_event(
+                context,
+                CONNECTION_ID,
+                CONNECTION_ID,
+                &event.canonical_bytes,
+            )
+            .expect("handle sync event");
+            delivered.extend(report.send_event_ids);
+            for response in report.events {
+                queue.push_back((response_recipient, response));
+            }
+            assert!(
+                processed_protocol_events < 300_000,
+                "sync exchange did not converge within the protocol event budget"
+            );
+        }
+
+        ExchangeResult {
+            delivered_to_left,
+            delivered_to_right,
+            processed_protocol_events,
+        }
+    }
+
+    fn summary_of(entries: &[EventIndexEntry]) -> RangeSummary {
+        let mut summary = RangeSummary {
+            count: entries.len() as u64,
+            fingerprint: [0; 32],
+        };
+        for entry in entries {
+            xor_into(&mut summary.fingerprint, &fingerprint_id(&entry.event_id));
+        }
+        summary
+    }
+
+    fn test_id(domain: &[u8], idx: u64) -> EventId {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(domain);
+        hasher.update(&idx.to_le_bytes());
+        *hasher.finalize().as_bytes()
+    }
+
+    fn fingerprint_id(id: &EventId) -> EventId {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"test-sync-event-id:");
+        hasher.update(id);
+        *hasher.finalize().as_bytes()
+    }
+
+    fn xor_into(target: &mut EventId, value: &EventId) {
+        for (left, right) in target.iter_mut().zip(value.iter()) {
+            *left ^= *right;
+        }
+    }
 }

@@ -321,6 +321,11 @@ fn run_key_derive_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cl
 }
 
 fn run_key_node_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutput, String> {
+    // Dev/test utility for materializing a time-tree split off a known parent
+    // secret. The parent must be either the workspace `local_key_secret`
+    // (frontier root) or a previously-materialized time-tree node. The CLI
+    // figures out the correct `parent_range_start`/`parent_range_width` by
+    // looking up `source_secret_id`.
     if args.values().len() != 5 && args.values().len() != 6 {
         return Err(KEY_NODE_USAGE.to_string());
     }
@@ -333,34 +338,105 @@ fn run_key_node_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliO
         .get(5)
         .map(|value| parse_hex_id(value, KEY_NODE_USAGE))
         .transpose()?;
-    let output = worker::run(
+
+    let (parent_secret, parent_range_start, parent_range_width) = load_time_tree_parent(
         &context.store,
-        &context.protocol,
-        worker::Work::DeriveHistoryNode {
+        workspace_id,
+        removal_frontier_id,
+        source_secret_id,
+    )?;
+    let child_side = if range_start < parent_range_start + parent_range_width / 2 {
+        0u8
+    } else {
+        1u8
+    };
+    let output = local_history_node_secret::commands::derive_time_split(
+        local_history_node_secret::commands::DeriveTimeSplit {
             workspace_id,
             removal_frontier_id,
-            source_secret_id,
-            range_start,
-            range_width,
+            parent_secret_id: source_secret_id,
+            parent_secret,
+            parent_range_start,
+            parent_range_width,
+            child_side,
+            child_range_start: range_start,
+            child_range_width: range_width,
             tombstone_node_id,
         },
     )?;
-    let worker::Output::DerivedHistoryNode(report) = output else {
-        return Err("unexpected key node worker output".to_string());
-    };
+    let local_history_node_secret_id = output.value.local_history_node_secret_id;
+    let admitted = common_worker::run(
+        &context.store,
+        &context.protocol,
+        common_worker::AdmitAndDrain {
+            output,
+            batch_size: common_worker::DEFAULT_READY_BATCH,
+        },
+    )
+    .map_err(|err| format!("admit local history node secret: {err}"))?;
+    let mut purged_event_bytes = 0usize;
+    if let Some(retired_node_id) = tombstone_node_id {
+        // Mirror worker's tombstone purge: drop the retired event's
+        // canonical bytes so its plaintext node_secret cannot be recovered.
+        let purged = context
+            .store
+            .write_transaction(|store| {
+                crate::workers::pipeline_helpers::purging::purge_event_storage_in_tx(
+                    store,
+                    &retired_node_id,
+                )
+            })
+            .map_err(|err| format!("purge retired history node bytes: {err}"))?;
+        if purged {
+            purged_event_bytes += 1;
+        }
+    }
 
     Ok(CliOutput::lines(vec![
         format!(
             "local_history_node_secret_id: {}",
-            optional_hex_id(report.local_history_node_secret_id)
+            hex_id(local_history_node_secret_id)
         ),
-        format!(
-            "tombstoned_node_id: {}",
-            optional_hex_id(report.tombstoned_node_id)
-        ),
-        format!("admitted_events: {}", report.admitted_events),
-        format!("purged_event_bytes: {}", report.purged_event_bytes),
+        format!("tombstoned_node_id: {}", optional_hex_id(tombstone_node_id)),
+        format!("admitted_events: {}", admitted.admitted.inserted_events),
+        format!("purged_event_bytes: {}", purged_event_bytes),
     ]))
+}
+
+/// Load `(parent_secret, parent_range_start, parent_range_width)` for a
+/// `source_secret_id` that names either a `local_key_secret` (frontier root)
+/// or an already-materialized `local_history_node_secret`.
+fn load_time_tree_parent(
+    store: &Store,
+    workspace_id: EventId,
+    removal_frontier_id: EventId,
+    source_secret_id: EventId,
+) -> Result<(crate::core::crypto::XChaCha20Poly1305Key, u64, u64), String> {
+    if let Some(row) = local_key_secret::schema::get(store, workspace_id, removal_frontier_id)? {
+        if row.local_key_secret_id == source_secret_id {
+            return Ok((
+                row.key_secret,
+                0,
+                crate::workers::encryption::TIME_TREE_ROOT_WIDTH,
+            ));
+        }
+    }
+    let node_bytes = event_schema::event_bytes(store, &source_secret_id)
+        .map_err(|err| format!("load source event: {err}"))?
+        .ok_or_else(|| "history node source event is missing".to_string())?;
+    let node = local_history_node_secret::codec::decode(&node_bytes)
+        .map_err(|_| "history node source event is not key material".to_string())?;
+    let row = local_history_node_secret::schema::get(
+        store,
+        workspace_id,
+        removal_frontier_id,
+        node.range_start,
+        node.range_width,
+        node.bit_depth,
+        node.event_id_prefix,
+    )?
+    .ok_or_else(|| "history node source has been tombstoned".to_string())?;
+    Ok((row.node_secret, row.range_start, row.range_width))
 }
 
 fn run_key_access_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutput, String> {
@@ -399,6 +475,27 @@ fn run_keys_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
         &context.store,
         workspace_id,
     )?;
+    let cover_summary =
+        local_history_node_secret::schema::cover_summary(&context.store, workspace_id)?;
+    use local_history_node_secret::types::{
+        is_leaf_row, is_minute_node_row, TIME_TREE_BIT_DEPTH, TRIE_LEAF_BIT_DEPTH,
+    };
+    let leaf_count = history_nodes
+        .iter()
+        .filter(|node| is_leaf_row(node))
+        .count();
+    let minute_node_count = history_nodes
+        .iter()
+        .filter(|node| is_minute_node_row(node))
+        .count();
+    let trie_internal_count = history_nodes
+        .iter()
+        .filter(|node| node.bit_depth > TIME_TREE_BIT_DEPTH && node.bit_depth < TRIE_LEAF_BIT_DEPTH)
+        .count();
+    let time_internal_count = history_nodes
+        .iter()
+        .filter(|node| node.bit_depth == TIME_TREE_BIT_DEPTH && node.range_width > 1)
+        .count();
 
     let mut lines = vec![
         format!("recipient_keys: {}", recipient_keys.len()),
@@ -411,10 +508,15 @@ fn run_keys_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
         format!("key_wraps: {}", key_wraps.len()),
         format!("local_key_secrets: {}", local_secrets.len()),
         format!("local_history_node_secrets: {}", history_nodes.len()),
+        format!("local_history_minute_nodes: {minute_node_count}"),
+        format!("local_history_leaves: {leaf_count}"),
+        format!("local_history_trie_internals: {trie_internal_count}"),
+        format!("local_history_time_internals: {time_internal_count}"),
         format!(
             "local_history_node_tombstones: {}",
             history_tombstones.len()
         ),
+        format!("cover_summary: {}", hex_bytes(&cover_summary)),
     ];
     for frontier in frontiers {
         let access = local_key_secret::schema::get(
@@ -430,16 +532,38 @@ fn run_keys_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
         ));
     }
     for node in history_nodes {
+        // Render `event_id_in_minute` as the leaf's full coord (when this row
+        // is a trie leaf) or `none` for time-tree nodes / minute_nodes /
+        // trie internals. Trie internals also surface their `bit_depth` and
+        // `prefix` so the test/debug output unambiguously names every row.
+        let event_id_in_minute_field = if is_leaf_row(&node) {
+            hex_id(node.event_id_prefix)
+        } else {
+            "none".to_string()
+        };
         lines.push(format!(
-            "history_node: {} frontier={} start={} width={} tombstones={}",
+            "history_node: {} frontier={} start={} width={} bit_depth={} prefix={} event_id_in_minute={} tombstones={}",
             hex_id(node.local_history_node_secret_id),
             hex_id(node.removal_frontier_id),
             node.range_start,
             node.range_width,
+            node.bit_depth,
+            hex_id(node.event_id_prefix),
+            event_id_in_minute_field,
             optional_hex_id(node.tombstone_node_id)
         ));
     }
     Ok(CliOutput::lines(lines))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn require_membership(

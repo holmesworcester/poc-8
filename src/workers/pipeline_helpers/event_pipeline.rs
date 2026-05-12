@@ -86,8 +86,8 @@ use crate::protocol::event_modules::types::{
 };
 
 use crate::protocol::event_modules::schema;
-use crate::workers::common::event_store;
 use crate::workers::dependency_unblock;
+use crate::workers::pipeline_helpers::event_lifecycle;
 use crate::workers::schema as worker_schema;
 
 /// Default upper bound for one ready-event drain.
@@ -894,7 +894,7 @@ fn store_durable_event_tx(
         EventStatus::Blocked
     };
 
-    let inserted = event_store::insert_event(store, record, status)?;
+    let inserted = event_lifecycle::insert_event(store, record, status)?;
     if inserted {
         report.inserted_events += 1;
         if missing.is_empty() {
@@ -932,7 +932,8 @@ fn project_ready_event_tx(
     event_id: &EventId,
 ) -> rusqlite::Result<ApplyReadyReport> {
     let mut report = ApplyReadyReport::default();
-    if event_store::set_event_status(store, event_id, EventStatus::Ready, EventStatus::Applied)? {
+    if event_lifecycle::set_event_status(store, event_id, EventStatus::Ready, EventStatus::Applied)?
+    {
         // The status change is the claim. Projection runs only for the worker
         // that successfully moved Ready -> Applied, which keeps duplicate drain
         // attempts idempotent when callers retry.
@@ -959,7 +960,8 @@ fn project_ready_event_record_in_tx(
     receive: Option<ReceiveMetadata>,
 ) -> rusqlite::Result<ApplyReadyReport> {
     let mut report = ApplyReadyReport::default();
-    if event_store::set_event_status(store, event_id, EventStatus::Ready, EventStatus::Applied)? {
+    if event_lifecycle::set_event_status(store, event_id, EventStatus::Ready, EventStatus::Applied)?
+    {
         let changes = project_event_with_context_in_tx(store, modules, event_id, record, receive)?;
         write_projection_output_in_tx(store, changes)?;
         write_applied_event_outputs_in_tx(store, event_id, record)?;
@@ -1056,7 +1058,7 @@ fn drain_ready(
         .write_transaction(|store| {
             let mut total = ApplyReadyReport::default();
             while total.applied_events < limit {
-                let Some(event_id) = event_store::next_ready_event(store)? else {
+                let Some(event_id) = event_lifecycle::next_ready_event(store)? else {
                     break;
                 };
                 let report = project_ready_event_tx(store, modules, &event_id)?;
@@ -1092,7 +1094,7 @@ fn module_error(err: String) -> rusqlite::Error {
 fn missing_dependencies(store: &Store, dependencies: &[EventId]) -> rusqlite::Result<Vec<EventId>> {
     let mut missing = Vec::new();
     for dependency in unique_dependencies(dependencies) {
-        if !event_store::event_is_applied(store, &dependency)? {
+        if !event_lifecycle::event_is_applied(store, &dependency)? {
             missing.push(dependency);
         }
     }
@@ -1113,7 +1115,7 @@ fn write_blockers(
 ) -> rusqlite::Result<usize> {
     let mut inserted = 0;
     for dependency in missing {
-        inserted += usize::from(event_store::insert_blocked_event_missing_dep(
+        inserted += usize::from(event_lifecycle::insert_blocked_event_missing_dep(
             store, dependency, event_id,
         )?);
     }
@@ -1121,16 +1123,16 @@ fn write_blockers(
 }
 
 fn unblock_dependents(store: &Store, applied_event_id: &EventId) -> rusqlite::Result<usize> {
-    let dependents = event_store::blocked_events_by_missing_dep(store, applied_event_id)?;
-    event_store::delete_blocked_events_by_missing_dep(store, applied_event_id)?;
+    let dependents = event_lifecycle::blocked_events_by_missing_dep(store, applied_event_id)?;
+    event_lifecycle::delete_blocked_events_by_missing_dep(store, applied_event_id)?;
 
     let mut unblocked = 0;
     for dependent in dependents {
         // Unblocking only changes status. It does not recursively project the
         // newly unblocked canonical inside the same stack frame, which prevents a large
         // dependency cascade from becoming one unbounded transaction.
-        if !event_store::blocked_event_has_missing_deps(store, &dependent)?
-            && event_store::set_event_status(
+        if !event_lifecycle::blocked_event_has_missing_deps(store, &dependent)?
+            && event_lifecycle::set_event_status(
                 store,
                 &dependent,
                 EventStatus::Blocked,

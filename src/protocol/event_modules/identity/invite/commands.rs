@@ -37,12 +37,12 @@ pub fn create(
     local: endpoint::types::EndpointKeypair,
     public_addr: SocketAddr,
 ) -> CommandOutput<String> {
-    // The link includes the secret; the local event stores only the mapping
-    // needed to authorize a future request that proves knowledge of it.
+    // The link includes the secret and address; the local event stores the same
+    // authority material so both sides derive the same request dependency id.
     let invite_event_id = nonce32();
     let bootstrap_secret = nonce32();
     let workspace_id = nonce32();
-    let secret_event = InviteSecretEvent::new(bootstrap_secret);
+    let secret_event = InviteSecretEvent::new_with_addr(bootstrap_secret, public_addr);
     let bytes = codec::encode(&secret_event);
     CommandOutput::with_events(
         format!(
@@ -103,7 +103,12 @@ pub fn create_scoped_with_role(
     endpoint_role: EndpointRole,
     user_authority_event_id: Option<EventId>,
 ) -> CommandOutput<String> {
-    let secret_event = InviteSecretEvent::scoped(invite_private_key, workspace_id, invite_event_id);
+    let secret_event = InviteSecretEvent::scoped_with_addr(
+        invite_private_key,
+        workspace_id,
+        invite_event_id,
+        public_addr,
+    );
     let bytes = codec::encode(&secret_event);
     let user_part = user_authority_event_id
         .map(|user_id| format!("/{LABEL_USER_ID}.{}", encode_hex(&user_id)))
@@ -341,6 +346,7 @@ mod tests {
             secret_hash(&invite.bootstrap_secret)
         );
         assert_eq!(secret_event.bootstrap_secret, invite.bootstrap_secret);
+        assert_eq!(secret_event.addr, Some(public_addr));
     }
 
     #[test]

@@ -1,10 +1,10 @@
 //! Projector for signed key-wrap events.
 //!
 //! Projection proves that the signer endpoint membership, removal frontier, and
-//! recipient key all live in the same workspace, then records the wrap and the
-//! local key-secret commitment it carries. It does not open the ciphertext or
-//! create local key-secret events; the domain worker performs that active step
-//! after local recipient material is available.
+//! recipient key all live in the same workspace, then records the wrap, the
+//! local key-secret commitment it carries, and a pending unwrap queue row. It
+//! does not open the ciphertext or create local key-secret events; the domain
+//! worker performs that active step after local recipient material is available.
 
 use crate::protocol::event_modules::identity::{endpoint_shared, signed};
 use crate::protocol::event_modules::worker::{EventWithContext, ProjectionOutput};
@@ -46,6 +46,7 @@ pub fn project(event: &EventWithContext<'_>) -> Result<ProjectionOutput, String>
             envelope.signer_public_key,
             &key_wrap,
         ),
+        schema::pending_key_unwrap_row(event.context.event_id, &key_wrap),
     ]))
 }
 
@@ -263,15 +264,25 @@ mod tests {
 
         let output = project(&event).expect("project key wrap");
 
-        assert_eq!(output.rows.len(), 2);
+        assert_eq!(output.rows.len(), 3);
         assert_eq!(output.rows[0].table, schema::KEY_SECRET_COMMITMENTS);
         assert_eq!(output.rows[1].table, schema::KEY_WRAPS);
+        assert_eq!(output.rows[2].table, schema::PENDING_KEY_UNWRAPS);
         let row = schema::decode_key_wrap_row(&output.rows[1].key, &output.rows[1].value)
             .expect("decode row");
         assert_eq!(row.workspace_id, [1; 32]);
         assert_eq!(row.key_wrap_id, event.context.event_id);
         assert_eq!(row.removal_frontier_id, frontier_id);
         assert_eq!(row.recipient_key_id, recipient_id);
+        let pending = schema::decode_pending_key_unwrap_row(
+            output.rows[2].key.clone(),
+            &output.rows[2].value,
+        )
+        .expect("decode pending unwrap");
+        assert_eq!(pending.key_wrap_id, event.context.event_id);
+        assert_eq!(pending.workspace_id, [1; 32]);
+        assert_eq!(pending.removal_frontier_id, frontier_id);
+        assert_eq!(pending.recipient_key_id, recipient_id);
     }
 
     #[test]

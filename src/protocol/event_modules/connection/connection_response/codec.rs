@@ -22,15 +22,19 @@ use super::types::ResponseEvent;
 
 pub const TAG: u8 = 2;
 
-/// Encode the canonical response bytes.
 pub fn encode(event: &ResponseEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(10 + 1 + 32 * 4);
+    let mut out = Writer::with_capacity(10 + 1 + 32 * 10);
     out.raw(EVENT_MAGIC);
     out.u8(TAG);
     out.id(&event.from_endpoint);
     out.id(&event.to_endpoint);
     out.id(&event.request_id);
-    out.id(&event.connection_id);
+    out.id(&event.invite_secret_event_id);
+    out.id(&event.initiator_ephemeral_secret_event_id);
+    out.id(&event.responder_ephemeral_secret_event_id);
+    out.id(&event.responder_ephemeral_public_key);
+    out.id(&event.handshake_hash);
+    out.id(&event.connection_secret);
     out.finish()
 }
 
@@ -48,7 +52,12 @@ pub fn decode(bytes: &[u8]) -> Result<ResponseEvent, String> {
         from_endpoint: reader.id()?,
         to_endpoint: reader.id()?,
         request_id: reader.id()?,
-        connection_id: reader.id()?,
+        invite_secret_event_id: reader.id()?,
+        initiator_ephemeral_secret_event_id: reader.id()?,
+        responder_ephemeral_secret_event_id: reader.id()?,
+        responder_ephemeral_public_key: reader.id()?,
+        handshake_hash: reader.id()?,
+        connection_secret: reader.id()?,
     };
     reader.finish()?;
     Ok(event)
@@ -71,7 +80,34 @@ pub fn record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
         timestamp: 0,
         body_len: 0,
         canonical_bytes: bytes,
-        dependencies: vec![event.request_id],
+        dependencies: vec![
+            event.request_id,
+            event.invite_secret_event_id,
+            event.responder_ephemeral_secret_event_id,
+        ],
+        workspace_id: None,
+        scope: EventScope::Local,
+    })
+}
+
+pub fn received_record_from_bytes(
+    _store: &crate::core::store::Store,
+    bytes: Vec<u8>,
+    request_id: [u8; 32],
+) -> Result<EventRecord, String> {
+    let event = decode(&bytes)?;
+    if event.request_id != request_id {
+        return Err("connection event does not answer transit request".to_string());
+    }
+    Ok(EventRecord {
+        timestamp: 0,
+        body_len: 0,
+        canonical_bytes: bytes,
+        dependencies: vec![
+            event.request_id,
+            event.invite_secret_event_id,
+            event.initiator_ephemeral_secret_event_id,
+        ],
         workspace_id: None,
         scope: EventScope::Local,
     })
