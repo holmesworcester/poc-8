@@ -11,45 +11,85 @@ I want to rewrite topo with clarity on:
 
 See appendix for documentation style rules and references.
 
-# Bootstrap Transit Simplification
+# Connection Bootstrap Simplification
 
-Bootstrap for identity invites is an invite-key transit lane, not a
-connection-request subprotocol. The authorization relation is per carried event:
+Bootstrap for identity invites is now ordinary connection establishment. The
+invite link gives the acceptor enough local authority to create a connection
+request and enough routing information to dial the invite address. It does not
+open a separate invite-key sync lane, and bootstrap never carries workspace
+identity ancestry.
+
+The causal graph is:
 
 ```text
-workspace <=> invite-derived transit key used <=> canonical event bytes
+invite link -> local invite_secret
+local transit endpoint + initiator ephemeral -> request transcript
+invite private key + invite id + request transcript -> signed connection_request
+connection_request + responder endpoint + responder ephemeral -> connection_response
+connection_response -> ordinary connection transit/sync
+ordinary sync -> workspace identity ancestry and pending join facts converge
 ```
 
-The invite creator stores a local invite-secret row keyed by the bootstrap hash.
-The acceptor learns the same secret from the invite link and stores the same
-local row before opening the bootstrap stream. A bootstrap frame then carries:
+There is no cycle: identity ancestry can depend on ordinary sync after the
+connection response, but connection establishment does not depend on identity
+ancestry. The connection response event id is the connection id. The response
+stores the connection secret derived from the invite secret, signed request
+transcript, initiator ephemeral key, responder ephemeral key, and responder
+static endpoint key; subsequent connection transit decrypts by loading that
+response event.
 
-- sender endpoint
-- recipient endpoint
-- bootstrap hash
-- workspace id
-- invite event id
-- encrypted batch of canonical shared identity events
+Identity invite acceptance first establishes the connection, then records a
+local `invite_accepted` fact and admits the proposed user/device join facts.
+Those join facts may remain blocked until ordinary connection sync brings in
+their remote dependencies. The inviter learns them through the same normal
+connection sync path.
 
-The authenticated envelope metadata chooses the invite-secret row and the
-workspace boundary. The decrypted canonical bytes still go through the normal
-event pipeline; there is no alternate admission path. Invite bootstrap may admit
-only shared identity-bootstrap events for the named workspace. It must not admit
-content, sync, local-only facts, or connection-scoped events.
+The invite address is the only bootstrap route until peer discovery exists. The
+stored local invite-secret event includes the invite link address, so the local
+connection-request projector can write a durable pending connection attempt
+row. Received connection requests with an advertised daemon address project a
+durable pending connection response row. The `connection` worker drains those
+queues: it retries normal connection requests to invite addresses, creates
+connection responses for validated inbound requests, sends handshake frames via
+`transit_out`, and records the invite address as the initial route once a
+connection response projects. It is not peer discovery, not route negotiation,
+not an invite ancestry exchange, and not a special sync round.
 
-The acceptor sends one invite-bootstrap batch containing the proposed join facts.
-The inviter admits those facts and replies with one invite-bootstrap batch
-containing the current workspace identity-bootstrap set. That is intentionally
-one batch rather than one frame per event, and it is still per-event
-authorization because admission checks every decrypted canonical event against
-the invite envelope workspace. The reply excludes the acceptor's just-submitted
-events because the acceptor admits those local proposals after validating the
-invite. The acceptor then has enough ancestry to validate the invite key against
-the received invite row and admit its own already-proposed facts locally.
+The connection worker is also the future policy home for peer selection,
+connection-count targets, retry/backoff, stale connection cleanup, and route
+choice once peer discovery exists. Transit workers stay at the byte boundary:
+`transit_in` unwraps/authenticates inbound frames into canonical events, and
+`transit_out` wraps/sends opaque outbound frames.
 
-Normal connection requests are ordinary connection establishment, separate from
-identity bootstrap. They should not authorize workspace bootstrap events, and
-identity bootstrap should not create connection-route rows as a side effect.
+Normal sync is one-way per transit-out send. Incoming sync frames are admitted
+and projected into `sync.in`; the sync worker later queues responses, and
+`transit_out` sends them on routed connections. `transit_out` still drains and
+wraps per connection, but coalesces all frames for the same socket address into
+one TCP stream per outbound pass so multiple workspace routes to the same
+daemon do not build an accept backlog. Same-stream replies are reserved for the
+connection handshake response only.
+
+# Content Key Wrap Derivation
+
+Key sharing is an ordinary event/dependency graph, not a manual side channel.
+A signed `key_wrap` event is shared. Its projector validates signer membership,
+removal frontier, and recipient key against dependency context, then writes:
+
+```text
+key_wrap row
+key_secret_commitment row
+pending_key_unwrap row
+```
+
+The projector never opens ciphertext and never creates local secret facts. The
+`pending_key_unwrap` row is the explicit worker queue. The encryption worker
+drains that queue, opens the wrap only if matching local recipient private
+material exists, and admits the resulting `local_key_secret` as a normal
+local-only event through the common event pipeline. Once that local-only event
+applies, the normal dependency-unblock worker wakes any encrypted content
+events that were blocked on the secret. No test or daemon path should need to
+run `key-derive` to make progress; `key-derive` is only a bounded diagnostic or
+offline worker invocation.
 
 # Identity/Auth Graph Port Plan
 
@@ -1428,32 +1468,39 @@ wrap. This does not imply per-connection core network queues. Per-connection
 dedupe and fairness remain protocol concerns, while physical backpressure
 remains target-scoped in core.
 
-**connection** is an event module. A connection event references two endpoints
-and establishes the transit context between them. Workspace authorization is not
-proved by the transit wrapper itself; it is derived from identity/auth events
-such as workspace, invite, user, admin, and endpoint membership facts that have
-already projected through the common worker. Rotation, revocation, and expiry
-are further connection-related events with their own dependencies and
-signatures. The same module owns `connection_secrets`: globally-unique
-`connection_secret_id` -> `(key, direction, connection_id, ttl)`, with separate
-inbound and outbound secrets per connection, each known only to the two
-endpoints.
+**connection** is an event module. A connection request is a local event that
+depends on the invite secret and the initiator's local ephemeral secret event.
+The request carries the invite id and an Ed25519 signature by the invite private
+key over the request transcript; it is not signed by the new endpoint identity.
+The response is the connection event: its event id is the `connection_id`, it
+answers exactly one request, and it carries the derived `connection_secret` used
+by normal connection transit. The response is encrypted back to the requester
+with a native Noise-like handshake key mixed from the invite secret,
+`DH(initiator_eph, responder_eph)`, and
+`DH(initiator_eph, responder_static)`.
 
-The connection module also owns the transit envelope as plain functions, not as a protocol runtime concern (mirroring poc-6's `crypto.wrap` / `crypto.unwrap_transit`):
+Connection-layer forward secrecy is deletion based. The ephemeral secret events,
+connection events, connection-scoped sync event bytes, and queued transit frames
+are local-only records and must be TTL-purged after they are no longer needed.
+After purge, retained connection transit ciphertext cannot be decrypted from the
+long-term endpoint secret alone. This does not make already-projected shared
+events disappear, and it does not protect local files/backups that retained the
+purged records. TODO: add the TTL purger for old connection ephemerals,
+connection events, connection-scoped event bytes, and transit queues.
 
-- `connection.wrap_bootstrap(remote_endpoint_id, inner_events) -> TransitBlob`: encrypts to the endpoint public key. Used for connection establishment and connection-secret repair.
-- `connection.wrap(connection_id, inner_events) -> TransitBlob`: looks up the
-  outbound secret for the connection, pads to a size bucket, and encrypts.
-  Send-side workers must only enqueue durable event bytes that pass their own
-  authorization checks, such as mutual workspace membership for sync `NeedId`
-  responses. The wrapper is allowed to assert generic shared-scope constraints,
-  but it must not become a content-specific authorization engine.
-- `connection.unwrap(bytes) -> Vec<CanonicalEventBytes>`: a parse-stage
-  transform run by the inbound-byte loop on every inbound frame. Unwraps either
-  endpoint-pubkey bootstrap frames or connection-secret frames. Connection-secret
-  frames recover `connection_id`; network admission rejects local-only
-  durable events from remote peers and passes shared canonical event bytes into
-  canonical-event processing.
+The connection module also owns the transit envelope as plain functions:
+
+- `connection.wrap_bootstrap(remote_endpoint_id, inner_event) -> TransitBlob`:
+  encrypts a connection request to the invite endpoint public key.
+- `connection.wrap_connection_handshake_response(request_id, inner_connection)`:
+  encrypts the connection event with the handshake response key.
+- `connection.wrap(connection_id, inner_events) -> TransitBlob`: loads the
+  connection event, derives a symmetric AEAD key from `connection_secret` and
+  frame associated data, and encrypts a batch of shared or connection-scoped
+  canonical bytes.
+- `connection.unwrap(bytes) -> Vec<CanonicalEventBytes>`: authenticates the
+  outer frame and emits inner canonical bytes plus transit provenance for the
+  common admission pipeline.
 
 Wrapped bytes are never canonical events. They have no event id, no dependencies, and no labels — they are an opaque transit form. Only inner canonical event bytes are ids in the event store.
 
@@ -1480,21 +1527,31 @@ fact; after unwrap it admits only shared-scope durable bytes to the common
 pipeline, which performs dependency, signature, projector, and storage
 validation.*
 
-For the current POC, connection request/response projection also owns route learning.
-Network admission attaches receive metadata as projector context to accepted
-inbound handshake records before admitting them. The projector writes:
+For the current POC, connection response projection owns connection rows and
+route learning. Request projection only validates and caches request bytes; it
+does not create a connection. Network admission attaches receive metadata as
+projector context to accepted inbound handshake records before admitting them.
+The response projector writes:
 
 ```
 connection.connections[connection_id] = remote_endpoint
-connection.transport_targets[connection_id] = observed_socket_addr   # only if remember_route
+connection.transport_targets[connection_id] = route_addr             # when a reusable route is known
 ```
 
 This keeps connection establishment and "where can I send back to that
 connection?" in one atomic projection. A transport target is still a protocol
 row consumed by transit out, but it is not its own child event module.
-For TCP listeners, the client's ephemeral source port is valid receive metadata
-but usually not a durable route; client-side response receive is the ordinary
-place to remember the listener address.
+For TCP listeners, the client's ephemeral source port is receive metadata but
+usually not a durable route. The invite address from the accepted link and the
+requester's advertised daemon listen address are the routes we rely on for now;
+peer discovery and observed-address promotion remain out of scope.
+
+Normal sync starts on any routed connection when the connection-scoped summary
+changes or when a new connection has no prior sync snapshot. Invite-scoped
+connections do not poll every tick; the connection worker owns retry/connect
+policy, while sync owns compare/have/need protocol decisions once a route
+exists. Plain non-invite connections still use deterministic endpoint ordering
+to avoid redundant initiators.
 
 `outbox` stores only deterministic event ids to process for a connection:
 
@@ -1770,7 +1827,7 @@ topo sync
   -> common event pipeline admits events
 
 Outgoing-scoped SyncCompare / SyncHaveId / SyncNeedId projected
-  -> connection_scoped_events(event_id, bytes)
+  -> local durable connection_scoped_events(event_id, bytes)
   -> temp outbox(connection_id, event_id)
 
 Incoming transit bytes
@@ -1898,14 +1955,15 @@ Keep the storage split explicit:
 
 ```
 event_modules.events(event_id, canonical_event_bytes, status, ...)
-connection.connection_scoped_events(event_id, canonical_event_bytes)   # temp
+connection.connection_events(event_id, canonical_request_or_connection_bytes) # local durable, TTL-purged
+connection.connection_scoped_events(event_id, canonical_event_bytes)   # local durable, TTL-purged
 transit.outbox(connection_id, event_id)                             # temp
 sync.inbound_events(connection_id, event_id, canonical_event_bytes)     # temp
 sync.index_*                                                           # future durable sync-owned index tables
 ```
 
 `connection/worker.rs` resolves an outbox `event_id` first from durable shared
-event storage, then from transient connection-scoped event storage. Sync modules
+event storage, then from local connection-scoped event storage. Sync modules
 do not batch ids into transport frames and do not create transit blobs. They
 either propose new connection-scoped sync events through commands or write
 id-only temp outbox rows for already-existing durable event ids requested by the

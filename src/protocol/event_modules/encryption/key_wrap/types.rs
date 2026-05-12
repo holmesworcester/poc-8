@@ -46,3 +46,12 @@ pub struct KeyWrapRow {
     pub nonce: XChaCha20Poly1305Nonce,
     pub ciphertext: KeyWrapCiphertext,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingKeyUnwrapRow {
+    pub key: Vec<u8>,
+    pub workspace_id: EventId,
+    pub removal_frontier_id: EventId,
+    pub recipient_key_id: EventId,
+    pub key_wrap_id: EventId,
+}

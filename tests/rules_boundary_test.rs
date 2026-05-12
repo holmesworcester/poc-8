@@ -248,8 +248,8 @@ fn daemon_runner_is_core_and_protocol_supplies_workers() {
     let workers = source_text(&root.join("src/workers/mod.rs"));
     assert!(
         workers.contains("pub fn daemon_workers")
-            && workers.contains("bootstrap_exchange::daemon_worker")
             && workers.contains("transit_in::daemon_worker")
+            && workers.contains("connection::daemon_worker")
             && workers.contains("event_admission::daemon_worker")
             && workers.contains("sync::daemon_worker"),
         "the worker catalog should aggregate protocol-owned daemon worker objects"
@@ -368,6 +368,8 @@ fn event_module_mod_rs_files_do_not_orchestrate_commands_or_work() {
         "Duration",
         "Instant",
         "connect_exchange",
+        "connect_stream",
+        "accept_stream_available",
         "accept_available",
         "worker::run",
         "Work::",
@@ -396,6 +398,33 @@ fn event_module_mod_rs_files_do_not_orchestrate_commands_or_work() {
 }
 
 #[test]
+fn event_module_mod_rs_files_do_not_own_receive_or_transit_policy() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let event_root = root.join("src/protocol/event_modules");
+    let files = rust_files(&event_root)
+        .into_iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == "mod.rs"))
+        .collect::<Vec<_>>();
+    let forbidden = [
+        "ReceiveMetadata::",
+        "ReceiveAuthorization",
+        "TransitEventType::",
+        "TransitProvenance {",
+        "accepted_workspace_ids",
+        "mutual_workspace_ids",
+        "invite_workspace(",
+        "bootstrap_invite(",
+        "endpoint_receive(",
+    ];
+    let violations = file_contains_violations(root, &files, &forbidden);
+    assert!(
+        violations.is_empty(),
+        "mod.rs files route to owners; receive/transit admission policy belongs in the transit projector or worker pipeline:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
 fn scoped_cli_files_do_not_own_transport_or_cross_cli_operations() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let event_root = root.join("src/protocol/event_modules");
@@ -416,6 +445,8 @@ fn scoped_cli_files_do_not_own_transport_or_cross_cli_operations() {
         "thread::sleep",
         "Instant",
         "connect_exchange",
+        "connect_stream",
+        "accept_stream_available",
         "accept_available",
         "DrainUntilIdle",
         "DrainReadyBatch",
@@ -616,8 +647,8 @@ fn workers_folder_has_standard_catalog_shape() {
         "pipeline_helpers/event_pipeline.rs",
         "pipeline_helpers/event_lifecycle.rs",
         "pipeline_helpers/purging.rs",
-        "bootstrap_exchange.rs",
         "transit_in.rs",
+        "connection.rs",
         "content_purge.rs",
         "event_admission.rs",
         "event_projection.rs",
@@ -639,24 +670,24 @@ fn workers_folder_has_standard_catalog_shape() {
 }
 
 #[test]
-fn socket_receive_is_bootstrap_exchange_transit_in_and_outbound_is_transit_out() {
+fn socket_receive_is_transit_in_and_outbound_is_transit_out() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     assert!(
         !root.join("src/workers/connection_io.rs").exists(),
-        "transit mechanics should live behind bootstrap_exchange, transit_in, and transit_out"
+        "transit mechanics should live behind transit_in and transit_out"
     );
     assert!(
-        !root.join("src/workers/connection.rs").exists(),
-        "connection facts belong to event modules/projectors; transit helpers should stay inside transit_in/transit_out or protocol helpers"
+        root.join("src/workers/connection.rs").exists(),
+        "connection policy should live in the connection worker, with facts in event modules/projectors and bytes in transit workers"
     );
 
     let catalog = source_text(&root.join("src/workers/mod.rs"));
     assert!(
         catalog.contains("transit_in::daemon_worker()")
-            && catalog.contains("bootstrap_exchange::daemon_worker()")
             && catalog.contains("event_admission::daemon_worker()")
+            && catalog.contains("connection::daemon_worker()")
             && catalog.contains("transit_out::daemon_worker()"),
-        "the daemon catalog should schedule bootstrap_exchange, transit_in, event_admission, and transit_out workers"
+        "the daemon catalog should schedule transit_in, event_admission, connection, and transit_out workers"
     );
     assert!(
         !catalog.contains("connection_io::daemon_worker()"),
@@ -784,6 +815,93 @@ fn codec_modules_have_type_files() {
 }
 
 #[test]
+fn types_files_do_not_depend_on_storage_workers_or_module_adapters() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let event_root = root.join("src/protocol/event_modules");
+    let files = rust_files(&event_root)
+        .into_iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == "types.rs"))
+        .collect::<Vec<_>>();
+    let forbidden = [
+        "crate::core::store",
+        "TableRow",
+        "TableName",
+        "Schema",
+        "commands::",
+        "projector::",
+        "schema::",
+        "worker::",
+        "network_queues",
+        "InboundNetworkRow",
+        "OutboundNetworkRow",
+    ];
+    let violations = file_contains_violations(root, &files, &forbidden);
+    assert!(
+        violations.is_empty(),
+        "types.rs files define semantic shapes and pure typed helpers; storage, workers, adapters, and projection logic belong elsewhere:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn connection_schema_does_not_own_store_queries() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = source_text(&root.join("src/protocol/event_modules/connection/schema.rs"));
+    let text = production_text_before_unit_tests(&source);
+    let forbidden = ["Store", "table_row(", "table_rows", "table_row_count"];
+    let violations = forbidden
+        .into_iter()
+        .filter(|needle| text.contains(needle))
+        .collect::<Vec<_>>();
+    assert!(
+        violations.is_empty(),
+        "connection/schema.rs owns table names and row builders; connection state reads belong in connection/queries.rs:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn transit_provenance_is_constructed_by_projector_api_not_literals() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let projector =
+        source_text(&root.join("src/protocol/event_modules/connection/transit/projector.rs"));
+    for field in [
+        "pub origin:",
+        "pub local_endpoint:",
+        "pub sender_endpoint:",
+        "pub remember_route:",
+        "pub event_type:",
+    ] {
+        assert!(
+            !projector.contains(field),
+            "TransitProvenance fields should stay private: {field}"
+        );
+    }
+    for constructor in [
+        "fn bootstrap(",
+        "fn connection_handshake(",
+        "fn connection(",
+    ] {
+        assert!(
+            projector.contains(constructor),
+            "TransitProvenance should expose typed constructor {constructor}"
+        );
+    }
+
+    let transit_projector = root.join("src/protocol/event_modules/connection/transit/projector.rs");
+    let files = rust_files(&root.join("src"))
+        .into_iter()
+        .filter(|path| path != &transit_projector)
+        .collect::<Vec<_>>();
+    let violations = file_contains_violations(root, &files, &["TransitProvenance {"]);
+    assert!(
+        violations.is_empty(),
+        "callers must use TransitProvenance constructors instead of field literals:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
 fn commands_files_live_only_in_event_modules() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let event_root = root.join("src/protocol/event_modules");
@@ -892,6 +1010,49 @@ fn functional_cli_and_network_tests_use_black_box_setup() {
     assert!(
         violations.is_empty(),
         "functional CLI/network tests must set up initial state through public CLI/process/network boundaries, not protocol/store internals:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn functional_cli_tests_do_not_poke_daemon_worker_commands() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let test_files = [
+        "tests/black_box_sync_test.rs",
+        "tests/content_cli_test.rs",
+        "tests/encryption_cli_test.rs",
+        "tests/invite_accept_cli_test.rs",
+        "tests/leaf_coord_cli_test.rs",
+        "tests/sync_storage_boundary_test.rs",
+    ];
+    let forbidden = [
+        (
+            "\"key-derive\"",
+            "key unwrap derivation should be daemon/process-driven",
+        ),
+        (
+            "\"sync\"",
+            "sync convergence should be daemon/process-driven",
+        ),
+        (
+            "\"connect\"",
+            "connection bootstrap tests should use accept/listener or daemon process paths",
+        ),
+    ];
+    let mut violations = Vec::new();
+
+    for file in test_files {
+        let text = source_text(&root.join(file));
+        for (needle, reason) in forbidden {
+            if text.contains(needle) {
+                violations.push(format!("{file} contains {needle}: {reason}"));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "functional CLI tests should assert eventual process behavior instead of poking worker-like CLI commands:\n{}",
         violations.join("\n")
     );
 }
@@ -1389,11 +1550,11 @@ fn connection_routes_are_projected_from_receive_metadata() {
     let response_projector = source_text(&connection_root.join("connection_response/projector.rs"));
     assert!(
         schema.contains("const TRANSPORT_TARGETS")
-            && request_projector.contains("context.receive")
-            && request_projector.contains("transport_target_row")
+            && !request_projector.contains("transport_target_row")
             && response_projector.contains("context.receive")
+            && response_projector.contains("request.from_listen_addr")
             && response_projector.contains("transport_target_row"),
-        "connection request/response projection should atomically write route rows from receive metadata"
+        "connection response projection should atomically write route rows from validated response receive metadata or request-advertised invite routes"
     );
 }
 
@@ -1735,7 +1896,8 @@ fn new_poc8_modules_document_responsibility_boundaries() {
         root.join("src/core/logical_clock.rs"),
         root.join("src/protocol/event_modules/content/cli.rs"),
         root.join("src/protocol/event_modules/identity/cli.rs"),
-        root.join("src/workers/bootstrap_exchange.rs"),
+        root.join("src/workers/connection.rs"),
+        root.join("src/workers/transit_out.rs"),
         root.join("src/workers/pipeline_helpers/mod.rs"),
         root.join("src/workers/content_purge.rs"),
         root.join("src/workers/encryption.rs"),

@@ -9,26 +9,28 @@ use std::time::Duration;
 use cli_harness::*;
 
 #[test]
-fn connect_handshake_does_not_create_durable_events() {
+fn accept_handshake_does_not_create_durable_events() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
     let bob = temp_db(&tmp, "bob.db");
     let port = free_port();
+    let alice_port = free_port();
     let bob_invite = invite(&bob, port);
     assert_eq!(count(&bob), 0, "invite facts must be local-only events");
 
     let _daemon = spawn_daemon(&bob, port);
-    let connected = connect_with_retry(&alice, &bob_invite);
+    let _alice_daemon = spawn_daemon(&alice, alice_port);
+    let connected = accept_connection_with_retry(&alice, &bob_invite);
     assert!(connected.contains("connected:"), "{connected}");
     wait_for_connection_count(&bob, 1);
-    wait_for_connection_event_count(&bob, 1);
+    wait_for_connection_event_count(&bob, 2);
 
-    assert_eq!(count(&alice), 0, "connect must not store local sync items");
+    assert_eq!(count(&alice), 0, "accept must not store local sync items");
     assert_eq!(count(&bob), 0, "connect must not store remote sync items");
     assert_eq!(connection_count(&alice), 1);
     assert_eq!(connection_count(&bob), 1);
-    assert_eq!(connection_event_count(&alice), 1);
-    assert_eq!(connection_event_count(&bob), 1);
+    assert_eq!(connection_event_count(&alice), 2);
+    assert_eq!(connection_event_count(&bob), 2);
 }
 
 #[test]
@@ -37,31 +39,42 @@ fn wrong_invite_private_key_does_not_project_receiver_connection() {
     let alice = temp_db(&tmp, "alice.db");
     let bob = temp_db(&tmp, "bob.db");
     let port = free_port();
+    let alice_port = free_port();
     let bob_invite = invite(&bob, port);
     let wrong_invite = replace_invite_private_key(&bob_invite, &"00".repeat(32));
 
     let _daemon = spawn_daemon(&bob, port);
-    let connected = connect_with_retry(&alice, &wrong_invite);
-    assert!(connected.contains("connected:"), "{connected}");
+    let _alice_daemon = spawn_daemon(&alice, alice_port);
+    let connected = accept_invite(&alice, &wrong_invite);
+    assert!(
+        !connected.status.success(),
+        "wrong invite unexpectedly connected:\n{}",
+        stdout(&connected)
+    );
+    assert!(
+        stderr(&connected).contains("did not produce a connection"),
+        "stderr:\n{}",
+        stderr(&connected)
+    );
     thread::sleep(Duration::from_millis(500));
 
     assert_eq!(count(&alice), 0);
     assert_eq!(count(&bob), 0);
-    assert_eq!(connection_count(&alice), 1);
+    assert_eq!(connection_count(&alice), 0);
     assert_eq!(connection_count(&bob), 0);
     assert_eq!(connection_event_count(&alice), 1);
     assert_eq!(connection_event_count(&bob), 0);
 }
 
 #[test]
-fn connect_reports_unreachable_invite_address() {
+fn accept_reports_unreachable_invite_address() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
     let unreachable_invite = invite(&alice, free_port());
-    let connected = connect_with_invite(&alice, &unreachable_invite);
+    let connected = accept_invite(&alice, &unreachable_invite);
     assert!(
         !connected.status.success(),
-        "connect unexpectedly reached unused port:\n{}",
+        "accept unexpectedly reached unused port:\n{}",
         stdout(&connected)
     );
     assert!(
@@ -70,7 +83,7 @@ fn connect_reports_unreachable_invite_address() {
         stderr(&connected)
     );
     assert_eq!(count(&alice), 0);
-    assert_eq!(connection_count(&alice), 1);
+    assert_eq!(connection_count(&alice), 0);
     assert_eq!(connection_event_count(&alice), 1);
 }
 
@@ -120,21 +133,21 @@ fn invite(db: &str, port: u16) -> String {
         .to_string()
 }
 
-fn connect_with_retry(db: &str, invite: &str) -> String {
+fn accept_connection_with_retry(db: &str, invite: &str) -> String {
     let mut last = String::new();
     for _ in 0..200 {
-        let output = connect_with_invite(db, invite);
+        let output = accept_invite(db, invite);
         if output.status.success() {
             return stdout(&output);
         }
         last = stderr(&output);
         thread::sleep(Duration::from_millis(50));
     }
-    panic!("connect never succeeded: {last}");
+    panic!("accept never succeeded: {last}");
 }
 
-fn connect_with_invite(db: &str, invite: &str) -> Output {
-    topo(&["--db", db, "connect", invite])
+fn accept_invite(db: &str, invite: &str) -> Output {
+    topo(&["--db", db, "accept", invite])
 }
 
 fn wait_for_connection_count(db: &str, expected: usize) {

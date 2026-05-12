@@ -2,14 +2,15 @@
 //!
 //! A request is local protocol history. It is not shared by sync, but it is
 //! durable enough for the matching response to name it as a dependency. The
-//! request itself names its invite-secret dependency, so bootstrap authorization
-//! goes through the same dependency/context path as every other local fact. The
-//! fixed magic prefix keeps connection establishment separate from ordinary
-//! tagged events, while `Reader::finish` ensures malformed extra bytes are
-//! rejected.
+//! request itself names its invite-secret dependency and carries an invite-key
+//! signature over the request transcript, so bootstrap authorization goes
+//! through the same dependency/context path as every other local fact. The fixed
+//! magic prefix keeps connection establishment separate from ordinary tagged
+//! events, while `Reader::finish` ensures malformed extra bytes are rejected.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+use crate::core::crypto::ED25519_SIGNATURE_BYTES;
 use crate::protocol::event_modules::types::{EventRecord, EventScope};
 use crate::protocol::wire::{Reader, Writer};
 
@@ -24,14 +25,19 @@ const ADDR_FAMILY_V6: u8 = 6;
 const ADDR_BLOCK_BYTES: usize = 1 + 16 + 2;
 
 pub fn encode(event: &RequestEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(10 + 1 + 32 * 5 + ADDR_BLOCK_BYTES);
+    let mut out =
+        Writer::with_capacity(10 + 1 + 32 * 8 + ED25519_SIGNATURE_BYTES + ADDR_BLOCK_BYTES);
     out.raw(EVENT_MAGIC);
     out.u8(TAG);
     out.id(&event.from_endpoint);
     out.id(&event.to_endpoint);
     out.id(&event.nonce);
+    out.id(&event.invite_event_id);
     out.id(&event.bootstrap_hash);
+    out.raw(&event.invite_signature);
     out.id(&event.invite_secret_event_id);
+    out.id(&event.initiator_ephemeral_secret_event_id);
+    out.id(&event.initiator_ephemeral_public_key);
     encode_optional_addr(&mut out, event.from_listen_addr);
     out.finish()
 }
@@ -49,12 +55,22 @@ pub fn decode(bytes: &[u8]) -> Result<RequestEvent, String> {
         from_endpoint: reader.id()?,
         to_endpoint: reader.id()?,
         nonce: reader.id()?,
+        invite_event_id: reader.id()?,
         bootstrap_hash: reader.id()?,
+        invite_signature: fixed_signature(reader.bytes(ED25519_SIGNATURE_BYTES)?)?,
         invite_secret_event_id: reader.id()?,
+        initiator_ephemeral_secret_event_id: reader.id()?,
+        initiator_ephemeral_public_key: reader.id()?,
         from_listen_addr: decode_optional_addr(&mut reader)?,
     };
     reader.finish()?;
     Ok(event)
+}
+
+fn fixed_signature(bytes: Vec<u8>) -> Result<[u8; ED25519_SIGNATURE_BYTES], String> {
+    bytes
+        .try_into()
+        .map_err(|_| "connection request invite signature length mismatch".to_string())
 }
 
 fn encode_optional_addr(out: &mut Writer, addr: Option<SocketAddr>) {
@@ -125,6 +141,21 @@ pub fn record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
         timestamp: 0,
         body_len: 0,
         canonical_bytes: bytes,
+        dependencies: vec![
+            event.invite_secret_event_id,
+            event.initiator_ephemeral_secret_event_id,
+        ],
+        workspace_id: None,
+        scope: EventScope::Local,
+    })
+}
+
+pub fn received_record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
+    let event = decode(&bytes)?;
+    Ok(EventRecord {
+        timestamp: 0,
+        body_len: 0,
+        canonical_bytes: bytes,
         dependencies: vec![event.invite_secret_event_id],
         workspace_id: None,
         scope: EventScope::Local,
@@ -140,8 +171,12 @@ mod tests {
             from_endpoint: [1; 32],
             to_endpoint: [2; 32],
             nonce: [3; 32],
-            bootstrap_hash: [4; 32],
-            invite_secret_event_id: [5; 32],
+            invite_event_id: [4; 32],
+            bootstrap_hash: [5; 32],
+            invite_signature: [6; ED25519_SIGNATURE_BYTES],
+            invite_secret_event_id: [6; 32],
+            initiator_ephemeral_secret_event_id: [7; 32],
+            initiator_ephemeral_public_key: [8; 32],
             from_listen_addr: None,
         }
     }
@@ -151,7 +186,15 @@ mod tests {
         let record = record_from_bytes(encode(&request())).expect("record");
 
         assert_eq!(record.scope, EventScope::Local);
-        assert_eq!(record.dependencies, vec![[5; 32]]);
+        assert_eq!(record.dependencies, vec![[6; 32], [7; 32]]);
+    }
+
+    #[test]
+    fn received_record_declares_only_invite_secret_dependency() {
+        let record = received_record_from_bytes(encode(&request())).expect("record");
+
+        assert_eq!(record.scope, EventScope::Local);
+        assert_eq!(record.dependencies, vec![[6; 32]]);
     }
 
     #[test]

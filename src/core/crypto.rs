@@ -95,6 +95,15 @@ pub fn x25519_public_key(private_key: &X25519PrivateKey) -> X25519PublicKey {
     X25519Public::from(&X25519Secret::from(*private_key)).to_bytes()
 }
 
+pub fn x25519_diffie_hellman(
+    local_secret: &X25519PrivateKey,
+    remote_public_key: &X25519PublicKey,
+) -> [u8; 32] {
+    let secret = X25519Secret::from(*local_secret);
+    let remote = X25519Public::from(*remote_public_key);
+    *secret.diffie_hellman(&remote).as_bytes()
+}
+
 pub fn random_xchacha20poly1305_nonce() -> XChaCha20Poly1305Nonce {
     let mut nonce = [0; XCHACHA20_POLY1305_NONCE_BYTES];
     OsRng.fill_bytes(&mut nonce);
@@ -200,10 +209,8 @@ fn x25519_hkdf_sha256_key(
     remote_public_key: &X25519PublicKey,
     purpose: &[u8],
 ) -> Result<[u8; 32], String> {
-    let secret = X25519Secret::from(*local_secret);
-    let remote = X25519Public::from(*remote_public_key);
-    let shared = secret.diffie_hellman(&remote);
-    let hkdf = Hkdf::<Sha256>::new(Some(purpose), shared.as_bytes());
+    let shared = x25519_diffie_hellman(local_secret, remote_public_key);
+    let hkdf = Hkdf::<Sha256>::new(Some(purpose), &shared);
     let mut key = [0; 32];
     hkdf.expand(b"topo x25519 xchacha20poly1305 key", &mut key)
         .map_err(|_| "derive x25519 xchacha20poly1305 key".to_string())?;

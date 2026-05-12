@@ -1,8 +1,7 @@
 mod cli_harness;
 
 use std::io::{BufRead, BufReader, Read};
-use std::process::{Child, Output};
-use std::sync::mpsc::{self, Receiver};
+use std::process::Child;
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -18,26 +17,29 @@ fn two_endpoints_sync_multiple_mutual_workspaces() {
     let bob_port = free_port();
 
     let workspace_a = create_workspace(&alice, "workspace-a", "alice-a", "alice-a-laptop");
+    let workspace_b = create_workspace(&alice, "workspace-b", "alice-b", "alice-b-laptop");
+    let mut alice_daemon = spawn_daemon(&alice, alice_port);
+    let mut bob_daemon = spawn_daemon(&bob, bob_port);
     accept_workspace_invite(
         &alice,
         &bob,
         &workspace_a,
-        free_port(),
+        alice_port,
         "bob-a",
         "bob-a-phone",
     );
-    let workspace_b = create_workspace(&alice, "workspace-b", "alice-b", "alice-b-laptop");
     accept_workspace_invite(
         &alice,
         &bob,
         &workspace_b,
-        free_port(),
+        alice_port,
         "bob-b",
         "bob-b-phone",
     );
-    let _alice_daemon = spawn_daemon(&alice, alice_port);
-    let _bob_daemon = spawn_daemon(&bob, bob_port);
-    connect_daemon_pair(&alice, alice_port, &bob, bob_port);
+    alice_daemon.assert_running();
+    bob_daemon.assert_running();
+    poll_for_workspace_member(&bob, &workspace_a, "bob-a", 10_000);
+    poll_for_workspace_member(&bob, &workspace_b, "bob-b", 10_000);
 
     generate(&alice, &workspace_a, 3, 128);
     generate(&alice, &workspace_b, 4, 129);
@@ -55,11 +57,13 @@ fn two_player_sync_does_not_leak_alice_private_workspace_to_bob() {
     let bob_port = free_port();
 
     let shared = create_workspace(&alice, "shared-a", "alice-a", "alice-a-laptop");
-    accept_workspace_invite(&alice, &bob, &shared, free_port(), "bob-a", "bob-a-phone");
     let alice_private = create_workspace(&alice, "alice-b", "alice-b", "alice-b-laptop");
-    let _alice_daemon = spawn_daemon(&alice, alice_port);
-    let _bob_daemon = spawn_daemon(&bob, bob_port);
-    connect_daemon_pair(&alice, alice_port, &bob, bob_port);
+    let mut alice_daemon = spawn_daemon(&alice, alice_port);
+    let mut bob_daemon = spawn_daemon(&bob, bob_port);
+    accept_workspace_invite(&alice, &bob, &shared, alice_port, "bob-a", "bob-a-phone");
+    alice_daemon.assert_running();
+    bob_daemon.assert_running();
+    poll_for_workspace_member(&bob, &shared, "bob-a", 10_000);
 
     generate(&alice, &shared, 2, 128);
 
@@ -80,6 +84,10 @@ fn three_player_sync_through_alice_keeps_workspace_scopes_separate() {
     let carol_port = free_port();
 
     let workspace_a = create_workspace(&alice, "alice-bob-a", "alice-a", "alice-a-laptop");
+    let workspace_b = create_workspace(&alice, "alice-carol-b", "alice-b", "alice-b-laptop");
+    let mut alice_daemon = spawn_daemon(&alice, alice_port);
+    let mut bob_daemon = spawn_daemon(&bob, bob_port);
+    let mut carol_daemon = spawn_daemon(&carol, carol_port);
     accept_workspace_invite(
         &alice,
         &bob,
@@ -88,7 +96,6 @@ fn three_player_sync_through_alice_keeps_workspace_scopes_separate() {
         "bob-a",
         "bob-a-phone",
     );
-    let workspace_b = create_workspace(&alice, "alice-carol-b", "alice-b", "alice-b-laptop");
     accept_workspace_invite(
         &alice,
         &carol,
@@ -97,11 +104,11 @@ fn three_player_sync_through_alice_keeps_workspace_scopes_separate() {
         "carol-b",
         "carol-b-phone",
     );
-    let _alice_daemon = spawn_daemon(&alice, alice_port);
-    let _bob_daemon = spawn_daemon(&bob, bob_port);
-    let _carol_daemon = spawn_daemon(&carol, carol_port);
-    connect_daemon_pair(&alice, alice_port, &bob, bob_port);
-    connect_daemon_pair(&alice, alice_port, &carol, carol_port);
+    alice_daemon.assert_running();
+    bob_daemon.assert_running();
+    carol_daemon.assert_running();
+    poll_for_workspace_member(&bob, &workspace_a, "bob-a", 10_000);
+    poll_for_workspace_member(&carol, &workspace_b, "carol-b", 10_000);
 
     generate(&bob, &workspace_a, 3, 128);
     generate(&carol, &workspace_b, 4, 128);
@@ -122,6 +129,8 @@ fn daemons_sync_cli_generated_content_without_manual_sync() {
     let alice_port = free_port();
     let bob_port = free_port();
     let workspace = create_workspace(&alice, "daemon-shared", "alice-daemon", "alice-laptop");
+    let mut alice_daemon = spawn_daemon(&alice, alice_port);
+    let mut bob_daemon = spawn_daemon(&bob, bob_port);
     accept_workspace_invite(
         &alice,
         &bob,
@@ -130,18 +139,9 @@ fn daemons_sync_cli_generated_content_without_manual_sync() {
         "bob-daemon",
         "bob-phone",
     );
-    let alice_invite = invite(&alice, alice_port);
-    let reverse_invite = invite(&bob, bob_port);
-
-    let _alice_daemon = spawn_daemon(&alice, alice_port);
-    let _bob_daemon = spawn_daemon(&bob, bob_port);
-    let connected = connect_with_retry(&bob, &alice_invite);
-    assert!(connected.contains("connected:"), "{connected}");
-    let reverse_connected = connect_with_retry(&alice, &reverse_invite);
-    assert!(
-        reverse_connected.contains("connected:"),
-        "{reverse_connected}"
-    );
+    alice_daemon.assert_running();
+    bob_daemon.assert_running();
+    poll_for_workspace_member(&bob, &workspace, "bob-daemon", 10_000);
 
     generate(&alice, &workspace, 3, 128);
 
@@ -163,12 +163,14 @@ fn cli_two_long_running_daemons_converge_messages_without_manual_sync() {
     let workspace = create_workspace(&alice, "asym-shared", "alice", "alice-laptop");
     let invite = workspace_invite_for_addr(&alice, &workspace, alice_port);
 
-    let _alice_daemon = spawn_daemon(&alice, alice_port);
-    let _bob_daemon = spawn_daemon(&bob, bob_port);
+    let mut alice_daemon = spawn_daemon(&alice, alice_port);
+    let mut bob_daemon = spawn_daemon(&bob, bob_port);
 
     let accepted = accept_with_identity_retry(&bob, &invite, "bob", "bob-phone");
     assert!(accepted.contains("connected:"), "{accepted}");
     assert_eq!(line_value(&accepted, "workspace_id"), workspace);
+    alice_daemon.assert_running();
+    bob_daemon.assert_running();
 
     // Wait for the membership graph to reach bob through the daemon's
     // periodic sync. The daemons exchange compare/have/need rounds without
@@ -193,7 +195,7 @@ fn cli_two_long_running_daemons_converge_messages_without_manual_sync() {
     );
     assert_eq!(line_value(&wrap, "recipient_key_id"), bob_recipient_id);
 
-    poll_for_derived_key_secrets(&bob, "1", 10_000);
+    poll_for_key_access(&bob, &workspace, &removal_frontier_id, "yes", 10_000);
 
     let alice_send = assert_success(topo(&["--db", &alice, "send", &workspace, "hello"]));
     assert_eq!(line_value(&alice_send, "text"), "hello");
@@ -203,7 +205,7 @@ fn cli_two_long_running_daemons_converge_messages_without_manual_sync() {
 
 #[test]
 #[ignore = "asymmetric three-peer late-joiner convergence still has a transit \
-admission race when alice's bootstrap_serve is concurrently processing bob's \
+admission race when alice's transit_in worker is concurrently processing bob's \
 sync compares while accepting carol's bootstrap stream; tracked as a follow-on \
 fix"]
 fn cli_three_long_running_daemons_converge_messages_among_late_joiner() {
@@ -268,8 +270,8 @@ fn cli_three_long_running_daemons_converge_messages_among_late_joiner() {
         &carol_recipient_id,
         10_000,
     );
-    poll_for_derived_key_secrets(&bob, "1", 10_000);
-    poll_for_derived_key_secrets(&carol, "1", 10_000);
+    poll_for_key_access(&bob, &workspace, &removal_frontier_id, "yes", 10_000);
+    poll_for_key_access(&carol, &workspace, &removal_frontier_id, "yes", 10_000);
 
     let alice_send = assert_success(topo(&["--db", &alice, "send", &workspace, "from-alice"]));
     assert_eq!(line_value(&alice_send, "text"), "from-alice");
@@ -304,12 +306,7 @@ fn invite_link_from_output(output: &str) -> String {
         .to_string()
 }
 
-fn accept_with_identity_retry(
-    db: &str,
-    invite: &str,
-    username: &str,
-    device_name: &str,
-) -> String {
+fn accept_with_identity_retry(db: &str, invite: &str, username: &str, device_name: &str) -> String {
     let mut last = String::new();
     for _ in 0..200 {
         let output = topo(&[
@@ -341,17 +338,32 @@ fn poll_for_workspace_member(db: &str, workspace_id: &str, username: &str, timeo
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
     let mut last = String::new();
     while std::time::Instant::now() < deadline {
-        let out = topo(&["--db", db, "users", workspace_id]);
-        if out.status.success() {
-            let text = stdout(&out);
+        let recipient = topo(&["--db", db, "key-recipient", workspace_id]);
+        let users = topo(&["--db", db, "users", workspace_id]);
+        if recipient.status.success() && users.status.success() {
+            let text = stdout(&users);
             if text.contains(username) {
                 return;
             }
             last = text;
+        } else {
+            last = format!(
+                "key-recipient stderr:\n{}\nusers stderr:\n{}",
+                stderr(&recipient),
+                stderr(&users)
+            );
         }
         thread::sleep(Duration::from_millis(250));
     }
-    panic!("user {username} did not converge into {db}; last output:\n{last}");
+    let count = topo(&["--db", db, "count"]);
+    let count_output = if count.status.success() {
+        stdout(&count)
+    } else {
+        stderr(&count)
+    };
+    panic!(
+        "user {username} did not converge into {db}; last users output:\n{last}\ncount output:\n{count_output}"
+    );
 }
 
 fn poll_for_wrap_eligibility(
@@ -384,14 +396,20 @@ fn poll_for_wrap_eligibility(
     panic!("key-wrap never succeeded in {db}; last error:\n{last}");
 }
 
-fn poll_for_derived_key_secrets(db: &str, expected: &str, timeout_ms: u64) {
+fn poll_for_key_access(
+    db: &str,
+    workspace_id: &str,
+    removal_frontier_id: &str,
+    expected: &str,
+    timeout_ms: u64,
+) {
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
     let mut last = String::new();
     while std::time::Instant::now() < deadline {
-        let out = topo(&["--db", db, "key-derive"]);
+        let out = topo(&["--db", db, "key-access", workspace_id, removal_frontier_id]);
         if out.status.success() {
             let text = stdout(&out);
-            if line_value(&text, "derived_key_secrets") == expected {
+            if line_value(&text, "access") == expected {
                 return;
             }
             last = text;
@@ -400,7 +418,7 @@ fn poll_for_derived_key_secrets(db: &str, expected: &str, timeout_ms: u64) {
         }
         thread::sleep(Duration::from_millis(250));
     }
-    panic!("key-derive did not reach {expected} in {db}; last output:\n{last}");
+    panic!("key-access did not reach {expected} in {db}; last output:\n{last}");
 }
 
 fn poll_for_message_text(db: &str, workspace_id: &str, expected_text: &str, timeout_ms: u64) {
@@ -455,55 +473,6 @@ fn second_daemon_for_same_db_is_rejected() {
     );
 }
 
-struct ListeningInvite {
-    child: Child,
-    invite_rx: Receiver<Result<String, String>>,
-    stdout: JoinHandle<String>,
-    stderr: JoinHandle<String>,
-}
-
-impl ListeningInvite {
-    fn invite_link(&mut self) -> String {
-        match self.invite_rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(line)) => {
-                assert!(
-                    line.starts_with("topo://invite/"),
-                    "missing invite link in first listener line: {line}"
-                );
-                thread::sleep(Duration::from_millis(50));
-                line
-            }
-            Ok(Err(err)) => {
-                let _ = self.child.kill();
-                panic!("listener did not print invite link: {err}");
-            }
-            Err(err) => {
-                let _ = self.child.kill();
-                panic!("timed out waiting for invite link: {err}");
-            }
-        }
-    }
-
-    fn wait_success(mut self, label: &str) -> String {
-        let status = self.child.wait().expect("wait for listener");
-        let stdout = self.stdout.join().expect("join stdout reader");
-        let stderr = self.stderr.join().expect("join stderr reader");
-        assert!(
-            status.success(),
-            "{label} failed\nstdout={stdout}\nstderr={stderr}"
-        );
-        stdout
-    }
-
-    fn fail(mut self, label: &str, err: String) -> ! {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let stdout = self.stdout.join().expect("join stdout reader");
-        let stderr = self.stderr.join().expect("join stderr reader");
-        panic!("{label}: {err}\nlistener stdout:\n{stdout}\nlistener stderr:\n{stderr}");
-    }
-}
-
 fn create_workspace(db: &str, name: &str, username: &str, device_name: &str) -> String {
     let out = assert_success(topo(&[
         "--db",
@@ -526,85 +495,18 @@ fn accept_workspace_invite(
     username: &str,
     device_name: &str,
 ) {
-    let mut listener = spawn_workspace_invite_listener(host_db, workspace_id, port, 1);
-    let invite = listener.invite_link();
+    let invite = workspace_invite_for_addr(host_db, workspace_id, port);
     let accepted = match try_accept_with_identity_retry(joiner_db, &invite, username, device_name) {
         Ok(output) => output,
-        Err(err) => listener.fail("workspace invite accept failed", err),
+        Err(err) => panic!("workspace invite accept failed: {err}"),
     };
     assert_eq!(line_value(&accepted, "workspace_id"), workspace_id);
-    let host_out = listener.wait_success("workspace invite listener");
-    assert!(host_out.contains("accepted_connections: 1"), "{host_out}");
-}
-
-fn spawn_workspace_invite_listener(
-    db: &str,
-    workspace_id: &str,
-    port: u16,
-    accept: usize,
-) -> ListeningInvite {
-    let port = port.to_string();
-    let accept = accept.to_string();
-    let child = spawn_topo(&[
-        "--db",
-        db,
-        "invite",
-        "--workspace",
-        workspace_id,
-        "--listen",
-        "127.0.0.1",
-        &port,
-        "--accept",
-        &accept,
-    ]);
-    listening_invite_from_child(child)
-}
-
-fn listening_invite_from_child(mut child: Child) -> ListeningInvite {
-    let stdout = child.stdout.take().expect("listener stdout");
-    let stderr = child.stderr.take().expect("listener stderr");
-    let (invite_tx, invite_rx) = mpsc::channel();
-    let stdout = thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        let mut output = String::new();
-        let mut first = String::new();
-        match reader.read_line(&mut first) {
-            Ok(0) => {
-                let _ = invite_tx.send(Err("stdout closed before first line".to_string()));
-            }
-            Ok(_) => {
-                output.push_str(&first);
-                let link = first.trim_end_matches(['\r', '\n']).to_string();
-                let _ = invite_tx.send(Ok(link));
-            }
-            Err(err) => {
-                let _ = invite_tx.send(Err(err.to_string()));
-            }
-        }
-
-        let mut rest = String::new();
-        if reader.read_to_string(&mut rest).is_ok() {
-            output.push_str(&rest);
-        }
-        output
-    });
-    let stderr = thread::spawn(move || {
-        let mut reader = BufReader::new(stderr);
-        let mut output = String::new();
-        let _ = reader.read_to_string(&mut output);
-        output
-    });
-    ListeningInvite {
-        child,
-        invite_rx,
-        stdout,
-        stderr,
-    }
 }
 
 struct RunningDaemon {
     child: Child,
     label: String,
+    stdout: Option<JoinHandle<String>>,
     stderr: Option<JoinHandle<String>>,
 }
 
@@ -612,16 +514,25 @@ impl Drop for RunningDaemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(stdout) = self.stdout.take() {
+            let _ = stdout.join();
+        }
         if let Some(stderr) = self.stderr.take() {
             if let Ok(text) = stderr.join() {
                 if !text.trim().is_empty() {
-                    eprintln!(
-                        "[daemon-stderr label={}] {}",
-                        self.label,
-                        text.trim_end()
-                    );
+                    eprintln!("[daemon-stderr label={}] {}", self.label, text.trim_end());
                 }
             }
+        }
+    }
+}
+
+impl RunningDaemon {
+    fn assert_running(&mut self) {
+        match self.child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => panic!("daemon {} exited early: {status}", self.label),
+            Err(err) => panic!("poll daemon {}: {err}", self.label),
         }
     }
 }
@@ -649,6 +560,11 @@ fn spawn_daemon(db: &str, port: u16) -> RunningDaemon {
         line.starts_with("listening: "),
         "daemon did not report listening: {line}"
     );
+    let stdout_handle = thread::spawn(move || {
+        let mut text = String::new();
+        let _ = reader.read_to_string(&mut text);
+        text
+    });
     let stderr_handle = thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
         let mut text = String::new();
@@ -658,43 +574,9 @@ fn spawn_daemon(db: &str, port: u16) -> RunningDaemon {
     RunningDaemon {
         child,
         label: format!("{db}@{port}"),
+        stdout: Some(stdout_handle),
         stderr: Some(stderr_handle),
     }
-}
-
-fn connect_daemon_pair(left_db: &str, left_port: u16, right_db: &str, right_port: u16) {
-    let left_invite = invite(left_db, left_port);
-    let right_invite = invite(right_db, right_port);
-    let right_to_left = connect_with_retry(right_db, &left_invite);
-    assert!(right_to_left.contains("connected:"), "{right_to_left}");
-    let left_to_right = connect_with_retry(left_db, &right_invite);
-    assert!(left_to_right.contains("connected:"), "{left_to_right}");
-}
-
-fn invite(db: &str, port: u16) -> String {
-    let addr = format!("127.0.0.1:{port}");
-    let out = assert_success(topo(&["--db", db, "invite", "--public-addr", &addr]));
-    out.lines()
-        .find(|line| line.starts_with("topo://invite/"))
-        .unwrap_or_else(|| panic!("missing invite link in output:\n{out}"))
-        .to_string()
-}
-
-fn connect_with_retry(db: &str, invite: &str) -> String {
-    let mut last = String::new();
-    for _ in 0..200 {
-        let output = connect_with_invite(db, invite);
-        if output.status.success() {
-            return stdout(&output);
-        }
-        last = stderr(&output);
-        thread::sleep(Duration::from_millis(50));
-    }
-    panic!("connect never succeeded: {last}");
-}
-
-fn connect_with_invite(db: &str, invite: &str) -> Output {
-    topo(&["--db", db, "connect", invite])
 }
 
 fn try_accept_with_identity_retry(

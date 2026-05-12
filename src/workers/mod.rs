@@ -17,7 +17,7 @@ use crate::core::daemon::Worker;
 use crate::core::store::Store;
 use crate::protocol::event_modules::content::message_deletion;
 
-pub mod bootstrap_exchange;
+pub mod connection;
 pub mod content_purge;
 pub mod dependency_unblock;
 pub mod encryption;
@@ -67,19 +67,13 @@ where
     C: DaemonWorkerContext,
 {
     vec![
-        // Accept any available inbound stream first so bootstrap responses
-        // (workspace identity events) ride out on the same TCP connection the
-        // requester opened. The same accept handler also writes a transport
-        // target row from the requester's advertised steady-state listener so
-        // the daemon can dial that peer back after the bootstrap stream
-        // closes.
-        bootstrap_exchange::daemon_worker(),
         transit_in::daemon_worker(),
         event_admission::daemon_worker(),
         event_projection::daemon_worker(),
         dependency_unblock::daemon_worker(),
         encryption::daemon_worker(),
         content_purge::daemon_worker(),
+        connection::daemon_worker(),
         sync::daemon_worker(),
         transit_out::daemon_worker(),
     ]
@@ -95,8 +89,9 @@ mod tests {
             .iter()
             .map(|w| w.name)
             .collect();
-        assert!(names.contains(&"bootstrap_serve"));
         assert!(names.contains(&"transit_in"));
+        assert!(names.contains(&"connection"));
+        assert!(names.contains(&"encryption"));
         assert!(names.contains(&"sync_tick"));
         assert!(names.contains(&"transit_out"));
         assert!(!names.contains(&"peer_supervisor"));
