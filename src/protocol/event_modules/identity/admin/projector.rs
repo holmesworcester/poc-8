@@ -261,7 +261,7 @@ mod tests {
             user_event_id: workspace_id,
         });
 
-        let err = crate::protocol::event_modules::record_from_bytes(record.canonical_bytes)
+        let err = crate::protocol::event_modules::event_from_bytes(record.canonical_bytes)
             .expect_err("raw admin must not be admitted");
 
         assert_eq!(err, "admin must be signed");

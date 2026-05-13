@@ -27,7 +27,7 @@ use crate::protocol::event_modules::connection::{
     connection_ephemeral_secret, connection_request, connection_response, schema, transit, types,
 };
 use crate::protocol::event_modules::identity::{endpoint, invite};
-use crate::protocol::event_modules::schema as event_schema;
+use crate::protocol::event_modules::queries as event_queries;
 use crate::protocol::event_modules::types::EventId;
 use crate::workers::pipeline_helpers::event_pipeline::{self as pipeline, EventRegistry};
 use crate::workers::{transit_out, DaemonWorkerContext};
@@ -351,7 +351,7 @@ fn connection_request_for_response(
     store: &Store,
     request_id: EventId,
 ) -> Result<Option<connection_request::types::RequestEvent>, String> {
-    let Some(bytes) = event_schema::event_bytes(store, &request_id)
+    let Some(bytes) = event_queries::event_bytes(store, &request_id)
         .map_err(|err| format!("load connection request event: {err}"))?
         .or_else(|| connection_event_bytes(store, request_id).ok())
     else {
@@ -364,7 +364,7 @@ fn invite_secret_for_response(
     store: &Store,
     invite_secret_event_id: &EventId,
 ) -> Result<invite::types::InviteSecretEvent, String> {
-    let bytes = event_schema::event_bytes(store, invite_secret_event_id)
+    let bytes = event_queries::event_bytes(store, invite_secret_event_id)
         .map_err(|err| format!("load invite secret event: {err}"))?
         .ok_or_else(|| "missing invite secret event".to_string())?;
     invite::codec::decode(&bytes)
@@ -375,7 +375,7 @@ fn responder_ephemeral_for_response(
     store: &Store,
     responder_ephemeral_event_id: &EventId,
 ) -> Result<connection_ephemeral_secret::types::EphemeralSecretEvent, String> {
-    let bytes = event_schema::event_bytes(store, responder_ephemeral_event_id)
+    let bytes = event_queries::event_bytes(store, responder_ephemeral_event_id)
         .map_err(|err| format!("load responder ephemeral event: {err}"))?
         .ok_or_else(|| "missing responder ephemeral event".to_string())?;
     connection_ephemeral_secret::codec::decode(&bytes)

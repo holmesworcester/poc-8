@@ -20,13 +20,14 @@
 use crate::core::daemon::{StepContext, Worker};
 use crate::core::logical_clock;
 use crate::core::store::Store;
+use crate::protocol::event_modules::content::message::queries as message_queries;
 use crate::protocol::event_modules::content::message::schema as message_schema;
 use crate::protocol::event_modules::content::message::types::{
     message_event_id_in_minute, UNIX_MINUTE_MS,
 };
-use crate::protocol::event_modules::content::reaction::schema as reaction_schema;
+use crate::protocol::event_modules::content::reaction::queries as reaction_queries;
 use crate::protocol::event_modules::content::reaction::types::reaction_event_id_in_minute;
-use crate::protocol::event_modules::identity::workspace::schema as workspace_schema;
+use crate::protocol::event_modules::identity::workspace::queries as workspace_queries;
 use crate::protocol::event_modules::types::EventId;
 use crate::workers::encryption as encryption_worker;
 use crate::workers::pipeline_helpers::event_pipeline::EventRegistry;
@@ -105,7 +106,7 @@ where
     };
     let now_minute = now_ms / UNIX_MINUTE_MS;
 
-    let workspaces = workspace_schema::list_all(store)?;
+    let workspaces = workspace_queries::list_all(store)?;
     let mut expired_jobs: Vec<ExpireMessageJob> = Vec::new();
 
     for workspace in workspaces {
@@ -254,7 +255,7 @@ fn sealed_messages_for_workspace(
     store: &Store,
     workspace_id: EventId,
 ) -> Result<Vec<message_schema::SealedMessageRow>, String> {
-    Ok(message_schema::list_sealed(store, usize::MAX)?
+    Ok(message_queries::list_sealed(store, usize::MAX)?
         .into_iter()
         .filter(|row| row.workspace_id == workspace_id)
         .collect())
@@ -272,7 +273,7 @@ fn retire_reaction_leaves_for_expired_messages<R: EventRegistry>(
     expired_messages: &[ExpireMessageJob],
     report: &mut ExpiryReport,
 ) -> Result<(), String> {
-    let reactions = reaction_schema::list_sealed(store, usize::MAX)?;
+    let reactions = reaction_queries::list_sealed(store, usize::MAX)?;
     for reaction in reactions {
         let parent = expired_messages.iter().find(|job| {
             job.workspace_id == reaction.workspace_id

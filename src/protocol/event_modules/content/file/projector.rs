@@ -494,7 +494,7 @@ mod tests {
         let built = build_descriptor("a.bin", "application/octet-stream");
         let envelope = codec::decode_signed(&built.record.canonical_bytes).expect("decode signed");
         assert_eq!(
-            crate::protocol::event_modules::record_from_bytes(envelope.payload)
+            crate::protocol::event_modules::event_from_bytes(envelope.payload)
                 .expect_err("raw file must fail"),
             "file must be signed"
         );

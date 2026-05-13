@@ -6,7 +6,7 @@
 //! shape only; commands/projectors decide when the row may exist.
 
 use crate::core::crypto::XCHACHA20_POLY1305_KEY_BYTES;
-use crate::core::store::{Schema, Store, TableName, TableRow};
+use crate::core::store::{Schema, TableName, TableRow};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::wire::{Reader, Writer};
 
@@ -32,31 +32,6 @@ pub fn local_key_secret_key(workspace_id: EventId, removal_frontier_id: EventId)
     key.extend_from_slice(&workspace_id);
     key.extend_from_slice(&removal_frontier_id);
     key
-}
-
-pub fn get(
-    store: &Store,
-    workspace_id: EventId,
-    removal_frontier_id: EventId,
-) -> Result<Option<LocalKeySecretRow>, String> {
-    let key = local_key_secret_key(workspace_id, removal_frontier_id);
-    store
-        .table_row(LOCAL_KEY_SECRETS, &key)
-        .map_err(|err| format!("load local key secret: {err}"))?
-        .map(|value| decode_local_key_secret_row(&key, &value))
-        .transpose()
-}
-
-pub fn list_for_workspace(
-    store: &Store,
-    workspace_id: EventId,
-) -> Result<Vec<LocalKeySecretRow>, String> {
-    store
-        .table_rows_with_key_prefix(LOCAL_KEY_SECRETS, &workspace_id, usize::MAX)
-        .map_err(|err| format!("load local key secrets: {err}"))?
-        .into_iter()
-        .map(|(key, value)| decode_local_key_secret_row(&key, &value))
-        .collect()
 }
 
 pub fn decode_local_key_secret_row(key: &[u8], value: &[u8]) -> Result<LocalKeySecretRow, String> {

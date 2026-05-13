@@ -82,8 +82,16 @@ pub(crate) fn purge_event_storage_in_tx(
     // skip the queue. The `enqueue_purge_in_tx` helper itself enforces the
     // workspace-id requirement, but checking `was_shared` here keeps the
     // intent legible at the call site.
-    if was_shared && workspace_id.is_some() {
-        let _ = negentropy_purges::enqueue_purge_in_tx(store, workspace_id, event_id)?;
+    // Enqueue a negentropy purge marker. Only workspace-scoped shared
+    // events get into the per-workspace sync index, so non-shared /
+    // workspace-less purges skip the queue entirely.
+    if was_shared {
+        if let Some(workspace_id) = workspace_id {
+            store.insert_table_rows_in_tx(vec![negentropy_purges::pending_purge_row(
+                workspace_id,
+                *event_id,
+            )])?;
+        }
     }
 
     Ok(deleted_any)
@@ -92,6 +100,7 @@ pub(crate) fn purge_event_storage_in_tx(
 #[cfg(test)]
 mod tests {
     use crate::protocol::event_modules::schema::{self as event_schema, EventLabel};
+    use crate::protocol::event_modules::sync::queries as negentropy_purge_queries;
     use crate::protocol::event_modules::sync::schema as negentropy_purges;
     use crate::protocol::event_modules::types::{event_id, EventRecord, EventScope};
     use crate::protocol::Protocol;
@@ -164,7 +173,7 @@ mod tests {
 
         assert!(!purged);
         assert_eq!(
-            negentropy_purges::pending_purge_count(&store).expect("count"),
+            negentropy_purge_queries::pending_purge_count(&store).expect("count"),
             0,
             "missing-event purge must not enqueue a negentropy purge row"
         );
@@ -192,10 +201,17 @@ mod tests {
             .expect("purge");
         assert!(purged);
 
-        let queued = negentropy_purges::drain_pending_purges(&store, 16).expect("drain");
+        // Verify by raw row scan since drain/clear are owned by the sync
+        // worker; the schema row constructor is the same shape it would
+        // produce.
+        let queued = store
+            .table_rows_with_key_prefix(negentropy_purges::NEGENTROPY_PENDING_PURGES, &[], 16)
+            .expect("scan");
         assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].workspace_id, workspace_id);
-        assert_eq!(queued[0].event_id, target_id);
+        let (queued_workspace, queued_event) =
+            negentropy_purges::decode_pending_purge_key(&queued[0].0).expect("decode key");
+        assert_eq!(queued_workspace, workspace_id);
+        assert_eq!(queued_event, target_id);
     }
 
     #[test]
@@ -219,7 +235,7 @@ mod tests {
             .expect("purge");
 
         assert_eq!(
-            negentropy_purges::pending_purge_count(&store).expect("count"),
+            negentropy_purge_queries::pending_purge_count(&store).expect("count"),
             0,
             "local-scope events are not in the negentropy index, so no queue row needed"
         );

@@ -12,10 +12,10 @@ use crate::core::cli::{CliArgs, CliCommand, CliOutput};
 use crate::core::logical_clock;
 use crate::core::store::Store;
 use crate::protocol::cli::Context;
-use crate::protocol::event_modules::content::message::schema as message_schema;
+use crate::protocol::event_modules::content::message::queries as message_queries;
 use crate::protocol::event_modules::content::message::types::UNIX_MINUTE_MS;
 use crate::protocol::event_modules::identity::{admin, endpoint, endpoint_shared};
-use crate::protocol::event_modules::schema as event_schema;
+use crate::protocol::event_modules::queries as event_queries;
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker as common_worker;
 
@@ -306,7 +306,7 @@ fn run_key_wrap_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliO
     let local = endpoint::commands::local_keypair(&context.store)?
         .ok_or_else(|| "local endpoint is missing".to_string())?;
     let key_secret =
-        local_key_secret::schema::get(&context.store, workspace_id, removal_frontier_id)?
+        local_key_secret::queries::get(&context.store, workspace_id, removal_frontier_id)?
             .ok_or_else(|| "local key secret is missing for removal frontier".to_string())?;
     let recipient_key = load_recipient_key(&context.store, workspace_id, recipient_key_id)?
         .ok_or_else(|| "recipient key is missing".to_string())?;
@@ -468,7 +468,7 @@ fn load_time_tree_parent(
     removal_frontier_id: EventId,
     source_secret_id: EventId,
 ) -> Result<(crate::core::crypto::XChaCha20Poly1305Key, u64, u64), String> {
-    if let Some(row) = local_key_secret::schema::get(store, workspace_id, removal_frontier_id)? {
+    if let Some(row) = local_key_secret::queries::get(store, workspace_id, removal_frontier_id)? {
         if row.local_key_secret_id == source_secret_id {
             return Ok((
                 row.key_secret,
@@ -477,12 +477,12 @@ fn load_time_tree_parent(
             ));
         }
     }
-    let node_bytes = event_schema::event_bytes(store, &source_secret_id)
+    let node_bytes = event_queries::event_bytes(store, &source_secret_id)
         .map_err(|err| format!("load source event: {err}"))?
         .ok_or_else(|| "history node source event is missing".to_string())?;
     let node = local_history_node_secret::codec::decode(&node_bytes)
         .map_err(|_| "history node source event is not key material".to_string())?;
-    let row = local_history_node_secret::schema::get(
+    let row = local_history_node_secret::queries::get(
         store,
         workspace_id,
         removal_frontier_id,
@@ -499,7 +499,7 @@ fn run_key_access_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cl
     args.require_len(2, KEY_ACCESS_USAGE)?;
     let workspace_id = parse_hex_id(args.get(0).expect("length checked"), KEY_ACCESS_USAGE)?;
     let removal_frontier_id = parse_hex_id(args.get(1).expect("length checked"), KEY_ACCESS_USAGE)?;
-    let access = local_key_secret::schema::get(&context.store, workspace_id, removal_frontier_id)?;
+    let access = local_key_secret::queries::get(&context.store, workspace_id, removal_frontier_id)?;
     let mut lines = Vec::new();
     lines.push(format!(
         "access: {}",
@@ -517,27 +517,27 @@ fn run_key_access_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cl
 fn run_keys_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutput, String> {
     args.require_len(1, KEYS_USAGE)?;
     let workspace_id = parse_hex_id(args.get(0).expect("length checked"), KEYS_USAGE)?;
-    let frontiers = removal_frontier::schema::list_for_workspace(&context.store, workspace_id)?;
-    let local_secrets = local_key_secret::schema::list_for_workspace(&context.store, workspace_id)?;
-    let recipient_keys = recipient_key::schema::list_for_workspace(&context.store, workspace_id)?;
+    let frontiers = removal_frontier::queries::list_for_workspace(&context.store, workspace_id)?;
+    let local_secrets = local_key_secret::queries::list_for_workspace(&context.store, workspace_id)?;
+    let recipient_keys = recipient_key::queries::list_for_workspace(&context.store, workspace_id)?;
     let recipient_key_tombstones =
-        recipient_key_tombstone::schema::list_for_workspace(&context.store, workspace_id)?;
+        recipient_key_tombstone::queries::list_for_workspace(&context.store, workspace_id)?;
     let local_recipient_keys =
-        local_recipient_key::schema::list_for_workspace(&context.store, workspace_id)?;
-    let key_wraps = key_wrap::schema::list_for_workspace(&context.store, workspace_id)?;
+        local_recipient_key::queries::list_for_workspace(&context.store, workspace_id)?;
+    let key_wraps = key_wrap::queries::list_for_workspace(&context.store, workspace_id)?;
     let history_nodes =
-        local_history_node_secret::schema::list_for_workspace(&context.store, workspace_id)?;
-    let history_tombstones = local_history_node_secret::schema::list_tombstones_for_workspace(
+        local_history_node_secret::queries::list_for_workspace(&context.store, workspace_id)?;
+    let history_tombstones = local_history_node_secret::queries::list_tombstones_for_workspace(
         &context.store,
         workspace_id,
     )?;
     let message_tombstones =
-        crate::protocol::event_modules::content::message::schema::list_message_tombstones_for_workspace(
+        crate::protocol::event_modules::content::message::queries::list_message_tombstones_for_workspace(
             &context.store,
             workspace_id,
         )?;
     let cover_summary =
-        local_history_node_secret::schema::cover_summary(&context.store, workspace_id)?;
+        local_history_node_secret::queries::cover_summary(&context.store, workspace_id)?;
     use local_history_node_secret::types::{
         is_leaf_row, is_minute_node_row, TIME_TREE_BIT_DEPTH, TRIE_LEAF_BIT_DEPTH,
     };
@@ -581,7 +581,7 @@ fn run_keys_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
         format!("cover_summary: {}", hex_bytes(&cover_summary)),
     ];
     for frontier in frontiers {
-        let access = local_key_secret::schema::get(
+        let access = local_key_secret::queries::get(
             &context.store,
             workspace_id,
             frontier.removal_frontier_id,
@@ -636,7 +636,7 @@ fn run_disappearing_set_command(
     )?
     .ok_or_else(|| "local user is not an admin in this workspace".to_string())?;
 
-    let previous = disappearing_messages_setting::schema::active_for_workspace(
+    let previous = disappearing_messages_setting::queries::active_for_workspace(
         &context.store,
         workspace_id,
     )?;
@@ -757,7 +757,7 @@ fn run_disappearing_status_command(
     let workspace_id =
         parse_hex_id(args.get(0).expect("length checked"), DISAPPEARING_STATUS_USAGE)?;
 
-    let active = disappearing_messages_setting::schema::active_for_workspace(
+    let active = disappearing_messages_setting::queries::active_for_workspace(
         &context.store,
         workspace_id,
     )?;
@@ -784,7 +784,7 @@ fn run_disappearing_status_command(
         .unwrap_or(0);
     let effective_floor = std::cmp::max(setting_floor, horizon_floor);
 
-    let frontiers = removal_frontier::schema::list_for_workspace(&context.store, workspace_id)?;
+    let frontiers = removal_frontier::queries::list_for_workspace(&context.store, workspace_id)?;
     // Report the highest `last_chopped_floor` across this workspace's
     // frontiers. One frontier is the norm; on a rotated workspace the
     // highest value is the meaningful signal because the dispatcher
@@ -793,7 +793,7 @@ fn run_disappearing_status_command(
     let mut last_chopped_floor: u64 = 0;
     let mut last_chopped_present = false;
     for frontier in &frontiers {
-        if let Some(value) = disappearing_messages_setting::schema::get_last_chopped_floor(
+        if let Some(value) = disappearing_messages_setting::queries::get_last_chopped_floor(
             &context.store,
             workspace_id,
             frontier.removal_frontier_id,
@@ -813,18 +813,18 @@ fn run_disappearing_status_command(
     // Live messages = opened (`MESSAGES`) + still-sealed
     // (`SEALED_MESSAGES`). The CLI `messages` listing folds these two
     // together, so this matches what an operator sees.
-    let live_messages = message_schema::count_for_workspace(&context.store, workspace_id)?
-        + message_schema::count_sealed_for_workspace(&context.store, workspace_id)?;
+    let live_messages = message_queries::count_for_workspace(&context.store, workspace_id)?
+        + message_queries::count_sealed_for_workspace(&context.store, workspace_id)?;
     let message_tombstones =
-        message_schema::list_message_tombstones_for_workspace(&context.store, workspace_id)?
+        message_queries::list_message_tombstones_for_workspace(&context.store, workspace_id)?
             .len();
-    let leaf_tombstones = local_history_node_secret::schema::list_tombstones_for_workspace(
+    let leaf_tombstones = local_history_node_secret::queries::list_tombstones_for_workspace(
         &context.store,
         workspace_id,
     )?
     .len();
     let pending_purges =
-        crate::protocol::event_modules::sync::schema::pending_purge_count(&context.store)
+        crate::protocol::event_modules::sync::queries::pending_purge_count(&context.store)
             .map_err(|err| format!("count pending purges: {err}"))?;
 
     Ok(CliOutput::lines(vec![
@@ -861,7 +861,7 @@ fn run_disappearing_tighten_command(
     )?
     .ok_or_else(|| "local user is not an admin in this workspace".to_string())?;
 
-    let previous = disappearing_messages_setting::schema::active_for_workspace(
+    let previous = disappearing_messages_setting::queries::active_for_workspace(
         &context.store,
         workspace_id,
     )?;
@@ -888,13 +888,13 @@ fn run_disappearing_tighten_command(
     // command directly. We sum opened + still-sealed rows because the
     // sealed projection is what receivers see before key derivation.
     let mut messages_below_floor: usize = 0;
-    for row in message_schema::list_for_workspace(&context.store, workspace_id)? {
+    for row in message_queries::list_for_workspace(&context.store, workspace_id)? {
         let authored_minute = row.created_at_ms / UNIX_MINUTE_MS;
         if authored_minute < target_floor {
             messages_below_floor += 1;
         }
     }
-    for row in message_schema::list_sealed_for_workspace(&context.store, workspace_id)? {
+    for row in message_queries::list_sealed_for_workspace(&context.store, workspace_id)? {
         let authored_minute = row.created_at_ms / UNIX_MINUTE_MS;
         if authored_minute < target_floor {
             messages_below_floor += 1;
@@ -1000,7 +1000,7 @@ fn run_disappearing_compact_command(
     )?
     .ok_or_else(|| "local user is not an admin in this workspace".to_string())?;
 
-    let active = disappearing_messages_setting::schema::active_for_workspace(
+    let active = disappearing_messages_setting::queries::active_for_workspace(
         &context.store,
         workspace_id,
     )?
@@ -1066,7 +1066,7 @@ fn run_chop_now_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliO
     // mirrors what the dispatcher's per-frontier loop reaches today, but
     // surfaces the choice explicitly so an operator can verify which
     // frontier got chopped.
-    let frontiers = removal_frontier::schema::list_for_workspace(&context.store, workspace_id)?;
+    let frontiers = removal_frontier::queries::list_for_workspace(&context.store, workspace_id)?;
     let target = frontiers
         .into_iter()
         .max_by_key(|row| (row.created_at_ms, row.removal_frontier_id))
@@ -1175,7 +1175,7 @@ fn admin_for_user(
 
 fn next_timestamp(store: &Store) -> Result<u64, String> {
     let max_timestamp =
-        event_schema::max_timestamp(store).map_err(|err| format!("load max timestamp: {err}"))?;
+        event_queries::max_timestamp(store).map_err(|err| format!("load max timestamp: {err}"))?;
     logical_clock::next_timestamp(store, max_timestamp)
 }
 

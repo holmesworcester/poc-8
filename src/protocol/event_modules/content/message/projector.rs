@@ -745,7 +745,7 @@ mod tests {
         });
 
         assert_eq!(
-            crate::protocol::event_modules::record_from_bytes(payload)
+            crate::protocol::event_modules::event_from_bytes(payload)
                 .expect_err("raw message must fail"),
             "message must be signed"
         );

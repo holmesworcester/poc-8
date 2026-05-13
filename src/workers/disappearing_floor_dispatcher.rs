@@ -2,7 +2,7 @@
 //!
 //! Inputs:
 //! - the latest admitted `disappearing_messages_setting` per workspace
-//!   (read from `disappearing_messages_setting::schema::active_for_workspace`),
+//!   (read from `disappearing_messages_setting::queries::active_for_workspace`),
 //!   whose `expires_at_or_before_minute` is the admin-tightened deletion floor;
 //! - the local logical clock, which feeds the cover-horizon floor
 //!   `now_minute - COVER_HORIZON_MINUTES`;
@@ -48,10 +48,11 @@ use crate::core::daemon::{StepContext, Worker};
 use crate::core::logical_clock;
 use crate::core::store::Store;
 use crate::protocol::event_modules::content::message::types::UNIX_MINUTE_MS;
+use crate::protocol::event_modules::encryption::disappearing_messages_setting::queries as setting_queries;
 use crate::protocol::event_modules::encryption::disappearing_messages_setting::schema as setting_schema;
 use crate::protocol::event_modules::encryption::disappearing_messages_setting::types::COVER_HORIZON_MINUTES;
-use crate::protocol::event_modules::encryption::removal_frontier::schema as frontier_schema;
-use crate::protocol::event_modules::identity::workspace::schema as workspace_schema;
+use crate::protocol::event_modules::encryption::removal_frontier::queries as frontier_queries;
+use crate::protocol::event_modules::identity::workspace::queries as workspace_queries;
 use crate::protocol::event_modules::types::EventId;
 use crate::workers::encryption as encryption_worker;
 use crate::workers::pipeline_helpers::event_pipeline::EventRegistry;
@@ -143,14 +144,14 @@ where
     let now_minute = now_ms / UNIX_MINUTE_MS;
     let horizon_floor = now_minute.saturating_sub(COVER_HORIZON_MINUTES);
 
-    let workspaces = workspace_schema::list_all(store)?;
+    let workspaces = workspace_queries::list_all(store)?;
     'workspaces: for workspace in workspaces {
-        let setting_floor = setting_schema::active_for_workspace(store, workspace.workspace_id)?
+        let setting_floor = setting_queries::active_for_workspace(store, workspace.workspace_id)?
             .map(|row| row.expires_at_or_before_minute)
             .unwrap_or(0);
         let effective_floor = max(setting_floor, horizon_floor);
 
-        for frontier in frontier_schema::list_for_workspace(store, workspace.workspace_id)? {
+        for frontier in frontier_queries::list_for_workspace(store, workspace.workspace_id)? {
             if report.chops_issued >= limit {
                 // Bound work per tick. The next tick picks up where we left
                 // off because the floor is monotonic and `last_chopped_floor`
@@ -158,7 +159,7 @@ where
                 break 'workspaces;
             }
             report.frontiers_visited += 1;
-            let last_chopped = setting_schema::get_last_chopped_floor(
+            let last_chopped = setting_queries::get_last_chopped_floor(
                 store,
                 workspace.workspace_id,
                 frontier.removal_frontier_id,
@@ -208,12 +209,30 @@ fn chop_one<R: EventRegistry>(
     report.right_side_siblings_materialized += chop.right_side_siblings_materialized;
     report.purged_event_bytes += chop.purged_event_bytes;
 
-    setting_schema::upsert_last_chopped_floor(
-        store,
-        workspace_id,
-        removal_frontier_id,
-        floor_minute,
-    )?;
+    upsert_last_chopped_floor(store, workspace_id, removal_frontier_id, floor_minute)?;
+    Ok(())
+}
+
+/// Persist a new `last_chopped_floor` for this workspace + frontier.
+/// Idempotent in `floor_minute` because `drain` guards
+/// `effective_floor > last_chopped` before invoking the chop, but uses
+/// replace semantics so a same-value write is a no-op rather than a
+/// duplicate-row error.
+fn upsert_last_chopped_floor(
+    store: &Store,
+    workspace_id: EventId,
+    removal_frontier_id: EventId,
+    last_chopped_floor: u64,
+) -> Result<(), String> {
+    store
+        .write_transaction(|tx_store| {
+            tx_store.replace_table_rows_in_tx(vec![setting_schema::chop_floor_row(
+                workspace_id,
+                removal_frontier_id,
+                last_chopped_floor,
+            )])
+        })
+        .map_err(|err| format!("upsert workspace chop floor: {err}"))?;
     Ok(())
 }
 
@@ -221,6 +240,7 @@ fn chop_one<R: EventRegistry>(
 mod tests {
     use crate::core::crypto::{self as core_crypto, Ed25519PrivateKey};
     use crate::core::store::Store;
+    use crate::protocol::event_modules::encryption::disappearing_messages_setting::queries as setting_queries;
     use crate::protocol::event_modules::encryption::disappearing_messages_setting::schema as setting_schema;
     use crate::protocol::event_modules::encryption::local_history_node_secret;
     use crate::protocol::event_modules::encryption::local_key_secret;
@@ -299,7 +319,7 @@ mod tests {
     }
 
     /// Insert a workspace projection row (without going through the codec /
-    /// projector) so the dispatcher's `workspace_schema::list_all` finds it.
+    /// projector) so the dispatcher's `workspace_queries::list_all` finds it.
     fn seed_workspace_row(store: &Store) {
         let row = workspace_schema::workspace_row(
             WORKSPACE,
@@ -367,7 +387,7 @@ mod tests {
         assert_eq!(report.chops_issued, 1);
         assert_eq!(report.frontiers_visited, 1);
 
-        let last = setting_schema::get_last_chopped_floor(&store, WORKSPACE, frontier_id)
+        let last = setting_queries::get_last_chopped_floor(&store, WORKSPACE, frontier_id)
             .expect("get last chopped");
         assert_eq!(
             last,
@@ -402,13 +422,13 @@ mod tests {
         .expect("dispatch");
         assert_eq!(report.chops_issued, 1);
         assert_eq!(
-            setting_schema::get_last_chopped_floor(&store, WORKSPACE, frontier_id)
+            setting_queries::get_last_chopped_floor(&store, WORKSPACE, frontier_id)
                 .expect("get last chopped"),
             Some(100)
         );
         // F must be wiped after a non-zero chop (the chop primitive's contract).
         assert!(
-            local_key_secret::schema::get(&store, WORKSPACE, frontier_id)
+            local_key_secret::queries::get(&store, WORKSPACE, frontier_id)
                 .expect("look up F")
                 .is_none(),
             "F's row must be wiped by the dispatcher-issued chop"
@@ -437,7 +457,7 @@ mod tests {
         )
         .expect("dispatch");
         assert_eq!(report.chops_issued, 1);
-        let last = setting_schema::get_last_chopped_floor(&store, WORKSPACE, frontier_id)
+        let last = setting_queries::get_last_chopped_floor(&store, WORKSPACE, frontier_id)
             .expect("get last chopped");
         assert_eq!(
             last,
@@ -466,7 +486,7 @@ mod tests {
         assert_eq!(first.chops_issued, 1);
 
         let pre_tombstones =
-            local_history_node_secret::schema::list_tombstones_for_workspace(&store, WORKSPACE)
+            local_history_node_secret::queries::list_tombstones_for_workspace(&store, WORKSPACE)
                 .expect("pre tombstones")
                 .len();
 
@@ -480,7 +500,7 @@ mod tests {
         assert_eq!(second.frontiers_visited, 1);
 
         let post_tombstones =
-            local_history_node_secret::schema::list_tombstones_for_workspace(&store, WORKSPACE)
+            local_history_node_secret::queries::list_tombstones_for_workspace(&store, WORKSPACE)
                 .expect("post tombstones")
                 .len();
         assert_eq!(
@@ -488,7 +508,7 @@ mod tests {
             "no tombstones may be added on the no-op second tick"
         );
         assert_eq!(
-            setting_schema::get_last_chopped_floor(&store, WORKSPACE, frontier_id)
+            setting_queries::get_last_chopped_floor(&store, WORKSPACE, frontier_id)
                 .expect("get last chopped"),
             Some(100)
         );
@@ -518,7 +538,7 @@ mod tests {
             .expect("dispatch");
             assert_eq!(report.chops_issued, 1, "advancing clock must chop");
 
-            let new_last = setting_schema::get_last_chopped_floor(&store, WORKSPACE, frontier_id)
+            let new_last = setting_queries::get_last_chopped_floor(&store, WORKSPACE, frontier_id)
                 .expect("get last chopped")
                 .expect("row exists after chop");
             assert!(
@@ -553,7 +573,7 @@ mod tests {
         assert_eq!(report.chops_issued, 0);
         assert_eq!(report.frontiers_visited, 0);
         assert_eq!(
-            setting_schema::get_last_chopped_floor(&store, WORKSPACE, frontier_id)
+            setting_queries::get_last_chopped_floor(&store, WORKSPACE, frontier_id)
                 .expect("get last chopped"),
             None,
             "no chop ⇒ no last-chopped row"

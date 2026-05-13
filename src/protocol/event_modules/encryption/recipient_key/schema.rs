@@ -6,7 +6,7 @@
 //! `local_recipient_key`.
 
 use crate::core::crypto::X25519PublicKey;
-use crate::core::store::{Schema, Store, TableName, TableRow};
+use crate::core::store::{Schema, TableName, TableRow};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::wire::{Reader, Writer};
 
@@ -59,18 +59,6 @@ pub fn decode_recipient_key_row(key: &[u8], value: &[u8]) -> Result<RecipientKey
         endpoint_shared_id,
         recipient_key,
     })
-}
-
-pub fn list_for_workspace(
-    store: &Store,
-    workspace_id: EventId,
-) -> Result<Vec<RecipientKeyRow>, String> {
-    store
-        .table_rows_with_key_prefix(RECIPIENT_KEYS, &workspace_id, usize::MAX)
-        .map_err(|err| format!("load recipient keys: {err}"))?
-        .into_iter()
-        .map(|(key, value)| decode_recipient_key_row(&key, &value))
-        .collect()
 }
 
 fn encode_value(event: &RecipientKeyEvent) -> Result<Vec<u8>, String> {

@@ -25,7 +25,6 @@ pub mod disappearing_minute_expiry;
 pub mod encryption;
 pub mod event_admission;
 pub mod event_projection;
-pub mod negentropy_purge_drainer;
 pub(crate) mod pipeline_helpers;
 pub mod schema;
 pub mod sync;
@@ -46,7 +45,7 @@ pub fn drain_post_admission_purge_pending<R>(store: &Store, registry: &R) -> Res
 where
     R: pipeline_helpers::event_pipeline::EventRegistry,
 {
-    if !message_deletion::schema::has_purge_pending(store)? {
+    if !message_deletion::queries::has_purge_pending(store)? {
         return Ok(());
     }
     content_purge::run(
@@ -82,11 +81,11 @@ where
         // state.
         disappearing_minute_expiry::daemon_worker(),
         disappearing_floor_dispatcher::daemon_worker(),
-        // Drain the negentropy purge queue before sync runs so the
-        // response-producing comparisons in the same tick read an index
-        // that no longer references purged ids.
-        negentropy_purge_drainer::daemon_worker(),
         connection::daemon_worker(),
+        // The sync tick drains the negentropy pending-purge queue as its
+        // first step (one place owns every `SyncIndex` mutation), then
+        // does its response-producing work over an index that no longer
+        // references purged ids.
         sync::daemon_worker(),
         transit_out::daemon_worker(),
     ]
@@ -107,12 +106,19 @@ mod tests {
         assert!(names.contains(&"encryption"));
         assert!(names.contains(&"sync_tick"));
         assert!(names.contains(&"transit_out"));
-        assert!(names.contains(&"negentropy_purge_drainer"));
+        // The negentropy purge drainer is folded into the sync tick as
+        // an internal step, so the catalog no longer enumerates it as a
+        // separate worker.
+        assert!(!names.contains(&"negentropy_purge_drainer"));
         assert!(!names.contains(&"peer_supervisor"));
     }
 
     #[test]
-    fn negentropy_purge_drainer_runs_after_disappearing_floor_dispatcher_and_before_sync() {
+    fn sync_tick_runs_after_disappearing_floor_dispatcher() {
+        // The sync tick's first step drains the negentropy pending
+        // purge queue, so the dispatcher (which writes purge rows
+        // during a chop) must run before sync to keep the same
+        // schedule property the standalone drainer used to provide.
         let names: Vec<&'static str> = daemon_workers::<TestContext>()
             .iter()
             .map(|w| w.name)
@@ -121,21 +127,13 @@ mod tests {
             .iter()
             .position(|n| *n == "disappearing_floor_dispatcher")
             .expect("disappearing_floor_dispatcher in catalog");
-        let drainer = names
-            .iter()
-            .position(|n| *n == "negentropy_purge_drainer")
-            .expect("negentropy_purge_drainer in catalog");
         let sync = names
             .iter()
             .position(|n| *n == "sync_tick")
             .expect("sync_tick in catalog");
         assert!(
-            floor < drainer,
-            "drainer must run after the chop dispatcher so chop-emitted purge rows are visible"
-        );
-        assert!(
-            drainer < sync,
-            "drainer must run before sync_tick so the response-producing summary reads a clean index"
+            floor < sync,
+            "sync_tick must run after the chop dispatcher so chop-emitted purge rows are drained from a single SyncIndex-owning worker"
         );
     }
 
@@ -144,7 +142,7 @@ mod tests {
     struct TestContext;
 
     impl crate::workers::pipeline_helpers::event_pipeline::EventRegistry for TestContext {
-        fn record_from_bytes(
+        fn event_from_bytes(
             &self,
             _bytes: Vec<u8>,
         ) -> Result<crate::protocol::event_modules::types::EventRecord, String> {

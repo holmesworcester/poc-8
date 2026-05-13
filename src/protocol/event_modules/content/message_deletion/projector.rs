@@ -278,7 +278,7 @@ mod tests {
             author_user_id: [3; 32],
         });
         assert_eq!(
-            crate::protocol::event_modules::record_from_bytes(payload)
+            crate::protocol::event_modules::event_from_bytes(payload)
                 .expect_err("raw deletion must fail"),
             "message deletion must be signed"
         );

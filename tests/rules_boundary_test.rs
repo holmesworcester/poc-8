@@ -121,14 +121,26 @@ fn event_modules_do_not_use_event_rs() {
 #[test]
 fn event_modules_are_directories() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/protocol/event_modules");
+    // event_from_bytes.rs and modules.rs are registry plumbing for the
+    // event_modules root, not event modules of their own. They are
+    // pub(crate)/pub re-exported through mod.rs; their behavior is dispatch,
+    // not event syntax.
+    let registry_plumbing = ["event_from_bytes.rs", "modules.rs"];
     let offenders = std::fs::read_dir(root)
         .expect("read event modules")
         .map(|entry| entry.expect("dir entry").path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
         .filter(|path| {
-            path.file_name()
-                .is_none_or(|name| name != "mod.rs" && name != "worker.rs" && name != "schema.rs")
+            path.file_name().is_none_or(|name| {
+                name != "mod.rs"
+                    && name != "worker.rs"
+                    && name != "schema.rs"
+                    && name != "queries.rs"
+            })
                 && path.file_name().is_none_or(|name| name != "types.rs")
+                && path
+                    .file_name()
+                    .is_none_or(|name| !registry_plumbing.iter().any(|allowed| *allowed == name))
         })
         .collect::<Vec<_>>();
     assert!(
@@ -535,13 +547,25 @@ fn event_module_files_use_only_standard_concern_names() {
         "types.rs",
         "worker.rs",
     ];
+    // Registry plumbing at the event_modules root. These split the
+    // routing/registry layer out of mod.rs; they are not event-module
+    // concerns of their own and are only allowed at the immediate root,
+    // not inside a domain.
+    let registry_plumbing = ["event_from_bytes.rs", "modules.rs"];
     let offenders = rust_files(&event_root)
         .into_iter()
         .filter(|path| {
-            !path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| allowed.contains(&name))
+            let name = path.file_name().and_then(|n| n.to_str());
+            if name.is_some_and(|n| allowed.contains(&n)) {
+                return false;
+            }
+            // Allow registry plumbing only at the immediate event_modules root.
+            if name.is_some_and(|n| registry_plumbing.contains(&n))
+                && path.parent() == Some(event_root.as_path())
+            {
+                return false;
+            }
+            true
         })
         .map(|path| path.strip_prefix(root).unwrap().display().to_string())
         .collect::<Vec<_>>();
@@ -774,14 +798,17 @@ fn codec_files_use_shared_binary_helpers_and_finish_reads() {
             "bytes.len() <",
             "bytes.len() !=",
         ];
-        let uses_shared_helpers =
-            text.contains("Reader::new") || text.contains("SCHEMA.parse") || text.contains("WireSchema");
+        let uses_shared_helpers = text.contains("Reader::new")
+            || text.contains("SCHEMA.parse")
+            || text.contains("WireSchema");
         if manual_parse_needles
             .iter()
             .any(|needle| text.contains(needle))
             && !uses_shared_helpers
         {
-            violations.push(format!("{relative} parses bytes without Reader or WireSchema"));
+            violations.push(format!(
+                "{relative} parses bytes without Reader or WireSchema"
+            ));
         }
         if text.contains("Reader::new") && !text.contains(".finish()?") {
             violations.push(format!("{relative} uses Reader without finish"));

@@ -11,7 +11,7 @@ use crate::core::logical_clock;
 use crate::core::store::Store;
 use crate::protocol::cli::Context;
 use crate::protocol::event_modules::identity::{endpoint, endpoint_shared, invite, user};
-use crate::protocol::event_modules::schema as event_schema;
+use crate::protocol::event_modules::queries as event_queries;
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker;
 
@@ -118,7 +118,7 @@ fn admin_for_user(
 
 fn next_timestamp(store: &Store) -> Result<u64, String> {
     let max_timestamp =
-        event_schema::max_timestamp(store).map_err(|err| format!("load max timestamp: {err}"))?;
+        event_queries::max_timestamp(store).map_err(|err| format!("load max timestamp: {err}"))?;
     logical_clock::next_timestamp(store, max_timestamp)
 }
 

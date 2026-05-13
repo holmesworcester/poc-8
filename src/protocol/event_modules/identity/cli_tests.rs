@@ -2,7 +2,7 @@ use crate::core::crypto;
 use crate::protocol::event_modules::identity::{
     admin, device_invite, endpoint, endpoint_shared, signed, user, user_invite, workspace,
 };
-use crate::protocol::event_modules::schema as event_schema;
+use crate::protocol::event_modules::queries as event_queries;
 use crate::protocol::event_modules::types::{EventId, EventRecord};
 use crate::protocol::event_modules::worker::{self, CommandOutput};
 use crate::protocol::Protocol;
@@ -99,7 +99,7 @@ fn unknown_signed_identity_payloads_are_rejected_at_admission() {
     let signed = signed::commands::sign_payload([1; 32], &[2; 32], vec![250, 1, 2, 3])
         .expect("sign unknown payload");
 
-    let err = crate::protocol::event_modules::record_from_bytes(
+    let err = crate::protocol::event_modules::event_from_bytes(
         signed.events[0].record().canonical_bytes.clone(),
     )
     .expect_err("unknown signed payload must not be admitted");
@@ -261,7 +261,7 @@ fn bootstrap_two_users_and_two_endpoints_replay_without_daemon() {
     .expect("drain ready identity graph");
     assert_eq!(drained.applied_events, inserted - 1);
 
-    let statuses = event_schema::status_counts(&receiver).expect("status counts");
+    let statuses = event_queries::status_counts(&receiver).expect("status counts");
     assert_eq!(statuses.applied, inserted);
     assert_eq!(statuses.blocked, 0);
     assert_eq!(statuses.rejected, 0);
@@ -464,7 +464,7 @@ fn unsigned_device_invite_bytes_are_not_admissible_protocol_events() {
         public_key: crypto::ed25519_public_key(&[4; 32]),
     };
 
-    let err = crate::protocol::event_modules::record_from_bytes(device_invite::codec::encode(&raw))
+    let err = crate::protocol::event_modules::event_from_bytes(device_invite::codec::encode(&raw))
         .expect_err("unsigned device_invite must not decode as a protocol event");
 
     assert_eq!(err, "device_invite must be signed");

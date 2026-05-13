@@ -52,7 +52,7 @@ window and bounds steady-state storage.
   (`b"topo trie split v1"`).
 - `core::crypto::hkdf_sha256_key` exists for purpose-keyed key derivation
   but the leaf chain is BLAKE3-keyed; HKDF-SHA256 is the helper available
-  for non-leaf purposes (e.g. wrap-secret derivation in `x25519_*`).
+for non-leaf purposes (e.g. wrap-secret derivation in `x25519_*`). <!-- I don't understand this last sentence-->
 - Time tree root width: `TIME_TREE_ROOT_WIDTH = 1u64 << 63` (see
   `src/workers/encryption.rs:90`). The implicit root covers
   `(range_start=0, range_width=TIME_TREE_ROOT_WIDTH)` at

@@ -4,7 +4,7 @@
 //! event id of the workspace event. Values are fixed-width where possible and
 //! reuse the workspace name slot from the canonical event.
 
-use crate::core::store::{Schema, Store, TableName, TableRow};
+use crate::core::store::{Schema, TableName, TableRow};
 use crate::protocol::wire::{Reader, Writer};
 
 use super::codec;
@@ -18,15 +18,6 @@ pub const SCHEMAS: &[Schema] = &[Schema::durable_row_table(
 )];
 
 const WORKSPACE_VALUE_BYTES: usize = 8 + 32 + 4 + WORKSPACE_NAME_BYTES;
-
-pub fn list_all(store: &Store) -> Result<Vec<WorkspaceRow>, String> {
-    store
-        .table_rows_with_key_prefix(WORKSPACES, &[], usize::MAX)
-        .map_err(|err| format!("load workspaces: {err}"))?
-        .into_iter()
-        .map(|(key, value)| decode_workspace_row(&key, &value))
-        .collect()
-}
 
 pub fn workspace_row(
     workspace_id: WorkspaceId,

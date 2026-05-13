@@ -566,7 +566,7 @@ impl HookCountingRegistry {
 }
 
 impl EventRegistry for HookCountingRegistry {
-    fn record_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
+    fn event_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
         self.record_for(bytes)
     }
 
@@ -608,7 +608,7 @@ impl BatchHookRegistry {
 }
 
 impl EventRegistry for BatchHookRegistry {
-    fn record_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
+    fn event_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
         self.record_for(bytes)
     }
 
@@ -789,7 +789,7 @@ impl RejectThenAcceptRegistry {
 }
 
 impl EventRegistry for ContextRegistry {
-    fn record_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
+    fn event_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
         self.record_for(bytes)
     }
 
@@ -822,7 +822,7 @@ impl EventRegistry for ContextRegistry {
 }
 
 impl EventRegistry for BatchRegistry {
-    fn record_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
+    fn event_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
         self.record_for(bytes)
     }
 
@@ -844,7 +844,7 @@ impl EventRegistry for BatchRegistry {
 }
 
 impl EventRegistry for ValidDependencyContextRegistry {
-    fn record_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
+    fn event_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
         self.record_for(bytes)
     }
 
@@ -877,7 +877,7 @@ impl EventRegistry for ValidDependencyContextRegistry {
 }
 
 impl EventRegistry for RejectThenAcceptRegistry {
-    fn record_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
+    fn event_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
         self.record_for(bytes)
     }
 

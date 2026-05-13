@@ -1,12 +1,12 @@
-//! CLI tests for the negentropy purge drainer.
+//! CLI tests for the sync worker's pending-purge drain step.
 //!
 //! Exercises the deferred sync-vs-purge interaction noted in
 //! `tests/disappearing_messages_cli_test.rs::cli_disappearing_messages_two_peer_convergence`:
 //!
 //!   * Two peers that purge the same set of admitted shared event ids
 //!     reach byte-identical negentropy `root_fingerprint` values.
-//!   * The pending-purge queue empties after the daemon's
-//!     `negentropy_purge_drainer` step runs.
+//!   * The pending-purge queue empties after the sync worker's tick
+//!     drains it (folded in as the tick's first step).
 //!
 //! All assertions go through public CLI surface — `sync-status`,
 //! `keys`, and `messages` — so these tests do not poke at the in-memory
@@ -498,7 +498,7 @@ fn cli_negentropy_drainer_is_noop_when_nothing_pending() {
 // and then expire them all must converge on byte-identical fingerprints
 // after both drain. The XOR-fold construction makes drain order
 // irrelevant by design; this test pins that property at the CLI level
-// in addition to the in-process unit test in `negentropy_purge_drainer`.
+// in addition to the in-process unit test in the sync worker.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -607,12 +607,13 @@ fn cli_negentropy_drain_order_independence_two_peers_distinct_authoring_order() 
 // Pin a TTL=1 workspace at a pre-expiry clock. Run the daemon long enough
 // to admit messages, then stop it WITHOUT advancing the clock past
 // expiry. Restart the daemon and only THEN advance the clock past the
-// TTL horizon. Because the daemon's worker schedule includes
-// `disappearing_minute_expiry → negentropy_purge_drainer`, the post-
-// restart tick must do both in order, ending at `pending_purges == 0`.
-// This pins down: (a) the drainer worker survives a clean restart, and
-// (b) the drainer correctly handles the case where the in-memory index
-// was rebuilt from durable rows on startup (no double-remove panics).
+// TTL horizon. The daemon's worker schedule runs
+// `disappearing_minute_expiry` and then `sync_tick` (which drains the
+// pending-purge queue as its first step), so the post-restart tick must
+// do both in order, ending at `pending_purges == 0`. This pins down:
+// (a) the drain step survives a clean restart, and (b) it correctly
+// handles the case where the in-memory index was rebuilt from durable
+// rows on startup (no double-remove panics).
 // ---------------------------------------------------------------------------
 
 #[test]

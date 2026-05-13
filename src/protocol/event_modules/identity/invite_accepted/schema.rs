@@ -73,15 +73,15 @@ pub fn decode_invite_accepted_row(key: &[u8], value: &[u8]) -> Result<InviteAcce
     })
 }
 
-pub fn invite_accepted_count(store: &Store) -> Result<usize, String> {
-    store
-        .table_row_count(INVITES_ACCEPTED)
-        .map_err(|err| format!("count invite_accepted rows: {err}"))
-}
-
+/// Per-endpoint accepted-workspace list.
+///
+/// This view is duplicated in `queries.rs` for CLI/reporting callers
+/// but stays here for the connection transit projector, which the
+/// boundary rule excludes from the projector-pure constraint but still
+/// forbids from calling `queries::` directly.
 pub fn accepted_workspace_ids(
     store: &Store,
-    accepted_endpoint_id: EndpointId,
+    accepted_endpoint_id: crate::protocol::event_modules::identity::endpoint::types::EndpointId,
 ) -> Result<Vec<EventId>, String> {
     store
         .table_rows_with_key_prefix(INVITES_ACCEPTED, &accepted_endpoint_id, usize::MAX)

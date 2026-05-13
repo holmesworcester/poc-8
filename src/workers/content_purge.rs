@@ -23,7 +23,7 @@ use crate::core::store::Store;
 use crate::protocol::event_modules::content::{
     file, file_deletion, file_slice, message, message_deletion, reaction,
 };
-use crate::protocol::event_modules::schema as event_schema;
+use crate::protocol::event_modules::queries as event_queries;
 use crate::protocol::event_modules::types::EventId;
 use crate::workers::encryption as encryption_worker;
 use crate::workers::pipeline_helpers::event_pipeline::EventRegistry;
@@ -134,12 +134,12 @@ fn drain<R: EventRegistry>(
 }
 
 fn drain_in_tx(store: &Store, limit: usize) -> Result<(PurgeReport, Vec<RetireLeafJob>), String> {
-    let entries = event_schema::event_index_entries_in_timestamp_range(store, 0, u64::MAX)
+    let entries = event_queries::event_index_entries_in_timestamp_range(store, 0, u64::MAX)
         .map_err(|err| format!("load event index: {err}"))?;
     let mut report = PurgeReport::default();
     let mut retire_jobs = Vec::new();
     for entry in entries.into_iter().take(limit) {
-        let Some(bytes) = event_schema::event_bytes(store, &entry.event_id)
+        let Some(bytes) = event_queries::event_bytes(store, &entry.event_id)
             .map_err(|err| format!("load event bytes: {err}"))?
         else {
             continue;
@@ -176,7 +176,7 @@ fn drain_in_tx(store: &Store, limit: usize) -> Result<(PurgeReport, Vec<RetireLe
     // The drain ran a full scan, so the purge_pending trigger queue is now
     // satisfied for whatever projection wrote into it. Clearing it keeps the
     // post-admission hook from looping on the same trigger forever.
-    message_deletion_schema::delete_all_purge_pending_in_tx(store)
+    drain_purge_pending(store)
         .map_err(|err| format!("clear purge pending: {err}"))?;
     Ok((report, retire_jobs))
 }
@@ -232,7 +232,7 @@ fn purge_reaction_for_deleted_message(
 ) -> Result<(), String> {
     let envelope = reaction::codec::decode_signed(bytes)?;
     let event = reaction::codec::decode(&envelope.payload)?;
-    if !message::schema::message_tombstone_exists(
+    if !message::queries::message_tombstone_exists(
         store,
         event.workspace_id,
         event.target_message_id,
@@ -277,7 +277,7 @@ fn purge_file_for_deleted_message_or_file_deletion(
     let envelope = file::codec::decode_signed(bytes)?;
     let event = file::codec::decode(&envelope.payload)?;
     let parent_deleted =
-        message::schema::message_tombstone_exists(store, event.workspace_id, event.message_id)?;
+        message::queries::message_tombstone_exists(store, event.workspace_id, event.message_id)?;
     let file_self_deleted = has_file_deletion_label(store, &file_event_id, &event.author_user_id)?;
     if !parent_deleted && !file_self_deleted {
         return Ok(());
@@ -338,20 +338,20 @@ fn purge_file_slice_for_deleted_file(
 ) -> Result<(), String> {
     let envelope = file_slice::codec::decode_signed(bytes)?;
     let (slice, file_event_id) = file_slice::codec::decode(&envelope.payload)?;
-    let descriptor_purged = event_schema::event_bytes(store, &file_event_id)
+    let descriptor_purged = event_queries::event_bytes(store, &file_event_id)
         .map_err(|err| format!("load descriptor bytes: {err}"))?
         .is_none();
     let message_id_tombstoned = if descriptor_purged {
         // The descriptor was already purged. We rely on the file_id index
         // also being gone: confirm by looking up by file_id; if the
         // descriptor row is still present we honor it as live.
-        file::schema::file_event_id_for_file_id(store, slice.workspace_id, slice.file_id)?.is_none()
+        file::queries::file_event_id_for_file_id(store, slice.workspace_id, slice.file_id)?.is_none()
     } else {
         // Descriptor still exists. Look up its message_id and check whether
         // that message has a tombstone; if yes, this slice should also be
         // purged on the next scan-after-descriptor path. If the descriptor
         // exists and message has no tombstone, the slice is live.
-        let Some(descriptor_bytes) = event_schema::event_bytes(store, &file_event_id)
+        let Some(descriptor_bytes) = event_queries::event_bytes(store, &file_event_id)
             .map_err(|err| format!("load descriptor bytes: {err}"))?
         else {
             // Race: descriptor was purged between checks. Treat as deleted.
@@ -359,7 +359,7 @@ fn purge_file_slice_for_deleted_file(
         };
         let descriptor_envelope = file::codec::decode_signed(&descriptor_bytes)?;
         let descriptor = file::codec::decode(&descriptor_envelope.payload)?;
-        message::schema::message_tombstone_exists(
+        message::queries::message_tombstone_exists(
             store,
             descriptor.workspace_id,
             descriptor.message_id,
@@ -395,7 +395,7 @@ fn has_author_deletion_label(
     message_id: &EventId,
     author_user_id: &EventId,
 ) -> Result<bool, String> {
-    let labels = event_schema::event_labels(store, message_id)
+    let labels = event_queries::event_labels(store, message_id)
         .map_err(|err| format!("load deletion labels: {err}"))?;
     Ok(labels.iter().any(|label| {
         message_deletion::types::deletion_label_author(label)
@@ -409,7 +409,7 @@ fn has_file_deletion_label(
     file_event_id: &EventId,
     author_user_id: &EventId,
 ) -> Result<bool, String> {
-    let labels = event_schema::event_labels(store, file_event_id)
+    let labels = event_queries::event_labels(store, file_event_id)
         .map_err(|err| format!("load file deletion labels: {err}"))?;
     Ok(labels.iter().any(|label| {
         file_deletion::types::deletion_label_author(label)
@@ -422,11 +422,26 @@ fn table_error(err: String) -> rusqlite::Error {
     rusqlite::Error::InvalidParameterName(err)
 }
 
+/// Drain all queued purge markers in the current transaction. Called once
+/// the content-purge scan has run, so a successful drain leaves the
+/// trigger queue empty.
+fn drain_purge_pending(store: &Store) -> rusqlite::Result<usize> {
+    let keys: Vec<Vec<u8>> = store
+        .table_rows_with_key_prefix(message_deletion_schema::CONTENT_PURGE_PENDING, &[], usize::MAX)?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    store.delete_table_rows_in_tx(message_deletion_schema::CONTENT_PURGE_PENDING, keys)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::protocol::event_modules::content::message::types::MessagePlaintext;
     use crate::protocol::event_modules::content::reaction::types::ReactionPlaintext;
-    use crate::protocol::event_modules::schema::EventLabel;
+    use crate::protocol::event_modules::schema::{self as event_schema, EventLabel};
     use crate::protocol::event_modules::types::{event_id, EventStatus};
     use crate::protocol::Protocol;
     use crate::workers::pipeline_helpers::event_lifecycle;
@@ -533,23 +548,23 @@ mod tests {
 
         assert_eq!(report.tombstones_written, 1);
         assert_eq!(report.event_bytes_purged, 2);
-        assert!(event_schema::event_bytes(&store, &message_id)
+        assert!(event_queries::event_bytes(&store, &message_id)
             .expect("message bytes")
             .is_none());
-        assert!(event_schema::event_bytes(&store, &reaction_id)
+        assert!(event_queries::event_bytes(&store, &reaction_id)
             .expect("reaction bytes")
             .is_none());
         assert!(
-            message::schema::message_tombstone_exists(&store, WORKSPACE, message_id)
+            message::queries::message_tombstone_exists(&store, WORKSPACE, message_id)
                 .expect("tombstone")
         );
         assert!(
-            message::schema::message_by_id(&store, WORKSPACE, message_id)
+            message::queries::message_by_id(&store, WORKSPACE, message_id)
                 .expect("message row")
                 .is_none()
         );
         assert_eq!(
-            reaction::schema::list_for_workspace(&store, WORKSPACE)
+            reaction::queries::list_for_workspace(&store, WORKSPACE)
                 .expect("reactions")
                 .len(),
             0
@@ -574,11 +589,11 @@ mod tests {
         let report = run(&store, &protocol, Work::Drain { limit: 10 }).expect("purge");
 
         assert_eq!(report.event_bytes_purged, 0);
-        assert!(event_schema::event_bytes(&store, &message_id)
+        assert!(event_queries::event_bytes(&store, &message_id)
             .expect("message bytes")
             .is_some());
         assert!(
-            !message::schema::message_tombstone_exists(&store, WORKSPACE, message_id)
+            !message::queries::message_tombstone_exists(&store, WORKSPACE, message_id)
                 .expect("tombstone")
         );
     }

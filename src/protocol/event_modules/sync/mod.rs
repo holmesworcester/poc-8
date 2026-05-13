@@ -15,6 +15,7 @@ pub mod commands;
 pub mod compare;
 pub mod have_id;
 pub mod need_id;
+pub mod queries;
 pub mod schema;
 pub use crate::workers::sync as worker;
 pub use crate::workers::sync::SyncIndex;
@@ -43,7 +44,11 @@ pub fn is_connection_scoped_event(bytes: &[u8]) -> bool {
         || need_id::codec::is_event(bytes)
 }
 
-pub fn record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
+/// Decode a connection-scoped sync event into an `EventRecord`.
+///
+/// Sync events use a single leading type tag and are gated by
+/// `is_connection_scoped_event` at the top-level dispatcher.
+pub fn event_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
     if compare::codec::is_event(&bytes) {
         return compare::codec::record_from_bytes(bytes);
     }

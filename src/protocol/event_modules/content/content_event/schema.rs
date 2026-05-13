@@ -4,7 +4,7 @@
 //! workers can inspect content by workspace without decoding the common event
 //! store or relying on global counts.
 
-use crate::core::store::{Schema, Store, TableName, TableRow};
+use crate::core::store::{Schema, TableName, TableRow};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::wire::{Reader, Writer};
 
@@ -31,33 +31,6 @@ pub fn content_event_row(event_id: EventId, event: &ContentEvent) -> TableRow {
         key: content_event_key(event.workspace_id, event_id),
         value: encode_content_event_value(event.timestamp, event.payload.len()),
     }
-}
-
-pub fn count_for_workspace(store: &Store, workspace_id: EventId) -> Result<usize, String> {
-    store
-        .table_rows_with_key_prefix(CONTENT_EVENTS, &workspace_id, usize::MAX)
-        .map(|rows| rows.len())
-        .map_err(|err| format!("count content events: {err}"))
-}
-
-pub fn payload_bytes_for_workspace(store: &Store, workspace_id: EventId) -> Result<usize, String> {
-    store
-        .table_rows_with_key_prefix(CONTENT_EVENTS, &workspace_id, usize::MAX)
-        .map_err(|err| format!("load content events: {err}"))?
-        .into_iter()
-        .map(|(key, value)| decode_content_event_row(&key, &value).map(|row| row.payload_bytes))
-        .sum()
-}
-
-pub fn max_timestamp_for_workspace(store: &Store, workspace_id: EventId) -> Result<u64, String> {
-    store
-        .table_rows_with_key_prefix(CONTENT_EVENTS, &workspace_id, usize::MAX)
-        .map_err(|err| format!("load content events: {err}"))?
-        .into_iter()
-        .map(|(key, value)| decode_content_event_row(&key, &value).map(|row| row.timestamp))
-        .try_fold(0, |max, timestamp| {
-            timestamp.map(|timestamp| max.max(timestamp))
-        })
 }
 
 pub fn decode_content_event_row(key: &[u8], value: &[u8]) -> Result<ContentEventRow, String> {
@@ -125,13 +98,13 @@ mod tests {
             .insert_table_rows(vec![row_a.clone(), row_b])
             .expect("insert content rows");
 
-        assert_eq!(count_for_workspace(&store, [1; 32]).expect("count"), 1);
+        assert_eq!(super::super::queries::count_for_workspace(&store, [1; 32]).expect("count"), 1);
         assert_eq!(
-            payload_bytes_for_workspace(&store, [1; 32]).expect("bytes"),
+            super::super::queries::payload_bytes_for_workspace(&store, [1; 32]).expect("bytes"),
             3
         );
         assert_eq!(
-            max_timestamp_for_workspace(&store, [1; 32]).expect("max timestamp"),
+            super::super::queries::max_timestamp_for_workspace(&store, [1; 32]).expect("max timestamp"),
             9
         );
         assert_eq!(

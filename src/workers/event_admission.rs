@@ -68,7 +68,7 @@ mod tests {
     use crate::protocol::event_modules::connection::{self, types};
     use crate::protocol::event_modules::content::content_event;
     use crate::protocol::event_modules::identity::{endpoint, endpoint_shared};
-    use crate::protocol::event_modules::schema as event_schema;
+use crate::protocol::event_modules::queries as event_queries;
     use crate::protocol::event_modules::types::event_id;
     use crate::protocol::Protocol;
     use crate::workers::schema as worker_schema;
@@ -190,7 +190,7 @@ mod tests {
             "rejected inner bytes must not poison canonical admission"
         );
         assert!(
-            !event_schema::has_event(&store, &local_only_id).expect("check event table"),
+            !event_queries::has_event(&store, &local_only_id).expect("check event table"),
             "rejected local-only event must not be stored"
         );
     }
@@ -215,7 +215,7 @@ mod tests {
             "{err}"
         );
         assert!(
-            !event_schema::has_event(&store, &local_only_id).expect("check event table"),
+            !event_queries::has_event(&store, &local_only_id).expect("check event table"),
             "bootstrap transit must not admit unrelated local facts"
         );
     }
@@ -244,7 +244,7 @@ mod tests {
 
         assert_eq!(admitted.blocked_events, 1);
         assert!(
-            event_schema::has_event(&store, &content_id).expect("check event table"),
+            event_queries::has_event(&store, &content_id).expect("check event table"),
             "shared remote event should enter durable admission"
         );
     }
@@ -273,7 +273,7 @@ mod tests {
             "{err}"
         );
         assert!(
-            !event_schema::has_event(&store, &content_id).expect("check event table"),
+            !event_queries::has_event(&store, &content_id).expect("check event table"),
             "out-of-scope remote event must not be stored"
         );
     }
@@ -311,7 +311,7 @@ mod tests {
 
         assert_eq!(report.inserted_events, 1);
         assert!(
-            event_schema::has_event(&store, &content_id).expect("check event table"),
+            event_queries::has_event(&store, &content_id).expect("check event table"),
             "other mutual workspace event should enter normal dependency admission"
         );
     }

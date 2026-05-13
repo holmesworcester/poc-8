@@ -242,7 +242,7 @@ pub(crate) fn record_from_transit_canonical_in(
     let TransitEventType::Connection { connection_id } = provenance.event_type() else {
         return Err("transit provenance cannot admit this event".to_string());
     };
-    let record = crate::protocol::event_modules::record_from_bytes(bytes)?;
+    let record = crate::protocol::event_modules::event_from_bytes(bytes)?;
     if !record.scope.is_shared() {
         return Err(
             "connection transit only accepts shared or connection-scoped events".to_string(),

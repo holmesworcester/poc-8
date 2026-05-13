@@ -1585,6 +1585,80 @@ accepts a complete frame, the protocol runner deletes the corresponding
 ids from `present`, leaves `outbox` rows pending, and backs off the target. No
 database transaction is held while writing to the socket.
 
+# Schema-Driven Wire Format
+
+Every event's `codec.rs` now drives `encode`/`decode` through a static
+`pub const SCHEMA: WireSchema` declared in the codec file. The schema knows
+the event's tag and an ordered list of fixed-size fields; the codec body is a
+thin chain of `SCHEMA.encoder().id(...).u64(...)...finish()` writes and a
+matching `SCHEMA.parse(bytes)?.id("name")?` reader. Per-event boilerplate
+shrinks; the wire format is what the schema declares.
+
+The schema only models layout. Record metadata (scope, deps, timestamp,
+workspace), signing, AEAD seal/open, and dependency dedup stay as ordinary
+per-event functions in the same `codec.rs` file. AEAD events use empty AAD;
+the signature already binds canonical bytes (which include the ciphertext)
+to the signer, so the historical AAD projection is redundant.
+
+The wire format ships these simplifications:
+
+- Connection events drop the 10-byte `EVENT_MAGIC` prefix; tags 132/133/138
+  go through the ordinary tag-byte dispatch like every other event.
+- Per-event signed envelopes (content/*, encryption/*) drop their
+  `sized_bytes(payload)` indirection. The decoder reads exactly
+  `INNER_WIRE_SIZE` bytes for the inner.
+- The transit outer envelope drops `sized_bytes(ciphertext)` — ciphertext is
+  rest-of-frame, and the TCP frame length prefix supplies the outer
+  boundary.
+- The transit inner-events batch drops its leading `TOPOINNER1` magic — it
+  lives inside an authenticated ciphertext, so the AEAD tag already proves
+  the bytes are this protocol's.
+
+The outermost `TOPOTRANS1` magic stays as the protocol-version probe in
+front of unverified TCP bytes. Per-element `sized_bytes` inside the
+inner-events batch stays for now (needs a unified tag→size table across
+sync, shared, and local event types). The `identity/signed` universal
+envelope keeps `sized_bytes(payload)` and an `inner_type` byte because it
+dispatches across six different inner sizes and existing tests use it as a
+public-key derivation hack with arbitrary payload bytes.
+
+## Direction: flatten signatures and encryption into each event type
+
+The `identity/signed` universal envelope is the last remaining nested-event
+shape. The intended direction is to remove it entirely by folding the
+signing surface into each event module:
+
+- Each currently-wrapped event (admin, user, user_invite, invite_server,
+  device_invite, endpoint_shared) gets its own `TYPE_SIGNED_X` flat tag and
+  declares `signer_event_id`, `signer_public_key`, and `signature` as
+  ordinary fields in its own `SCHEMA`. The per-event `commands::sign_grant`
+  builds and signs the event directly; there is no shared envelope codec
+  to dispatch through.
+- Once every signed identity event owns its own signing surface,
+  `identity/signed/` and its `TYPE_SIGNED` envelope tag go away. The
+  arbitrary-payload tests that currently abuse `sign_payload` for public-key
+  derivation get a dedicated `derive_signer_public_key(&private_key)` helper
+  so they stop coupling test fixtures to wire format.
+- Encryption follows the same shape: AEAD seal/open lives in the codec's
+  own module instead of behind a separate `signed`-style indirection.
+  Empty AAD is already the policy, so per-event seal/open is just
+  `xchacha20poly1305_encrypt(key, &[], &nonce, plaintext)` next to the
+  schema declaration.
+
+This collapses the protocol's nesting story to a single layer per event:
+one `SCHEMA` declares the wire bytes; one `commands` module owns the
+sign/encrypt path; one `projector` validates. The two-step
+"build inner → wrap in signed envelope" pattern disappears.
+
+Transit stays out of the flatten direction. The transit envelope isn't an
+event — it's a wire-framer with variant cases (Bootstrap /
+ConnectionHandshakeResponse / Connection) and a rest-of-frame ciphertext.
+The schema language models fixed-shape events, not variants with trailing
+opaque bytes, and bringing transit under the schema would require inventing
+variant + rest-of-frame primitives for a single customer. Keep it
+hand-coded as the protocol's on-wire framer; the boundary mirrors what any
+TCP-framed binary protocol ends up with anyway.
+
 # Protocol source references
 
 Use poc-6 for the event-based networking shape. Its `events/network/` tree is

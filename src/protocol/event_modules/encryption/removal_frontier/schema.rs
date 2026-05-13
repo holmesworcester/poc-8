@@ -7,7 +7,7 @@
 //! complete event-history index. This module declares row shape only; it does
 //! not decide rotation policy or perform key cleanup.
 
-use crate::core::store::{Schema, Store, TableName, TableRow};
+use crate::core::store::{Schema, TableName, TableRow};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::wire::{Reader, Writer};
 
@@ -36,31 +36,6 @@ pub fn removal_frontier_key(workspace_id: EventId, removal_frontier_id: EventId)
     key.extend_from_slice(&workspace_id);
     key.extend_from_slice(&removal_frontier_id);
     key
-}
-
-pub fn get(
-    store: &Store,
-    workspace_id: EventId,
-    removal_frontier_id: EventId,
-) -> Result<Option<RemovalFrontierRow>, String> {
-    let key = removal_frontier_key(workspace_id, removal_frontier_id);
-    store
-        .table_row(REMOVAL_FRONTIERS, &key)
-        .map_err(|err| format!("load removal frontier: {err}"))?
-        .map(|value| decode_removal_frontier_row(&key, &value))
-        .transpose()
-}
-
-pub fn list_for_workspace(
-    store: &Store,
-    workspace_id: EventId,
-) -> Result<Vec<RemovalFrontierRow>, String> {
-    store
-        .table_rows_with_key_prefix(REMOVAL_FRONTIERS, &workspace_id, usize::MAX)
-        .map_err(|err| format!("load removal frontiers: {err}"))?
-        .into_iter()
-        .map(|(key, value)| decode_removal_frontier_row(&key, &value))
-        .collect()
 }
 
 pub fn decode_removal_frontier_row(key: &[u8], value: &[u8]) -> Result<RemovalFrontierRow, String> {

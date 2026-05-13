@@ -67,3 +67,61 @@ pub fn admit_check_received(
         _ => Ok(AdmitDecision::Admit),
     }
 }
+
+/// Tags owned by this domain. Used by the top-level dispatcher to route
+/// ordinary tag-leading event bytes to `event_from_bytes`.
+pub fn is_content_tag(tag: u8) -> bool {
+    matches!(
+        tag,
+        content_event::codec::TYPE_CONTENT
+            | content_event::codec::TYPE_SIGNED_CONTENT
+            | message::codec::TYPE_MESSAGE
+            | message::codec::TYPE_SIGNED_MESSAGE
+            | reaction::codec::TYPE_REACTION
+            | reaction::codec::TYPE_SIGNED_REACTION
+            | message_deletion::codec::TYPE_MESSAGE_DELETION
+            | message_deletion::codec::TYPE_SIGNED_MESSAGE_DELETION
+            | file::codec::TYPE_FILE
+            | file::codec::TYPE_SIGNED_FILE
+            | file_slice::codec::TYPE_FILE_SLICE
+            | file_slice::codec::TYPE_SIGNED_FILE_SLICE
+            | file_deletion::codec::TYPE_FILE_DELETION
+            | file_deletion::codec::TYPE_SIGNED_FILE_DELETION
+    )
+}
+
+/// Decode a tag-leading content event into an `EventRecord`. Unsigned
+/// content tags are rejected: every content event must arrive in its signed
+/// envelope form.
+pub fn event_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
+    let tag = bytes
+        .first()
+        .ok_or_else(|| "empty content event bytes".to_string())?;
+    match *tag {
+        content_event::codec::TYPE_CONTENT => Err("content must be signed".to_string()),
+        content_event::codec::TYPE_SIGNED_CONTENT => {
+            content_event::codec::signed_record_from_bytes(bytes)
+        }
+        message::codec::TYPE_MESSAGE => Err("message must be signed".to_string()),
+        message::codec::TYPE_SIGNED_MESSAGE => message::codec::signed_record_from_bytes(bytes),
+        reaction::codec::TYPE_REACTION => Err("reaction must be signed".to_string()),
+        reaction::codec::TYPE_SIGNED_REACTION => reaction::codec::signed_record_from_bytes(bytes),
+        message_deletion::codec::TYPE_MESSAGE_DELETION => {
+            Err("message deletion must be signed".to_string())
+        }
+        message_deletion::codec::TYPE_SIGNED_MESSAGE_DELETION => {
+            message_deletion::codec::signed_record_from_bytes(bytes)
+        }
+        file::codec::TYPE_FILE => Err("file must be signed".to_string()),
+        file::codec::TYPE_SIGNED_FILE => file::codec::signed_record_from_bytes(bytes),
+        file_slice::codec::TYPE_FILE_SLICE => Err("file slice must be signed".to_string()),
+        file_slice::codec::TYPE_SIGNED_FILE_SLICE => {
+            file_slice::codec::signed_record_from_bytes(bytes)
+        }
+        file_deletion::codec::TYPE_FILE_DELETION => Err("file deletion must be signed".to_string()),
+        file_deletion::codec::TYPE_SIGNED_FILE_DELETION => {
+            file_deletion::codec::signed_record_from_bytes(bytes)
+        }
+        other => Err(format!("unknown content event type {other}")),
+    }
+}

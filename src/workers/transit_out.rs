@@ -21,7 +21,7 @@ use crate::core::tcp;
 use crate::protocol::event_modules::connection::{schema, transit, types};
 use crate::protocol::event_modules::identity::endpoint;
 use crate::protocol::event_modules::identity::endpoint::types::EndpointId;
-use crate::protocol::event_modules::schema as event_schema;
+use crate::protocol::event_modules::queries as event_queries;
 use crate::protocol::event_modules::sync::SyncIndex;
 use crate::workers::schema as worker_schema;
 use crate::workers::DaemonWorkerContext;
@@ -470,7 +470,7 @@ fn resolve_transit_out_event_bytes(
     store: &Store,
     event_id: &[u8; 32],
 ) -> Result<Option<Vec<u8>>, String> {
-    if let Some(bytes) = event_schema::event_bytes(store, event_id)
+    if let Some(bytes) = event_queries::event_bytes(store, event_id)
         .map_err(|err| format!("load durable out event: {err}"))?
     {
         return Ok(Some(bytes));

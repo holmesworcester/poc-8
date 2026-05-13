@@ -467,7 +467,7 @@ fn run_view_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutpu
             }
             if let Some(file_rows) = files_by_message.get(&msg.message_id) {
                 for file_row in file_rows {
-                    let slices = file_slice::schema::list_for_file(
+                    let slices = file_slice::queries::list_for_file(
                         &context.store,
                         workspace_id,
                         file_row.file_id,

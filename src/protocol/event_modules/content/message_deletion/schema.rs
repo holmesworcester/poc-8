@@ -13,7 +13,7 @@
 //! daemon's belt-and-suspenders content_purge worker still runs a full scan to
 //! handle any deletion admitted before this binary was deployed.
 
-use crate::core::store::{Schema, Store, TableName, TableRow};
+use crate::core::store::{Schema, TableName, TableRow};
 use crate::protocol::event_modules::types::EventId;
 
 pub const CONTENT_PURGE_PENDING: TableName = TableName::new("content.purge_pending");
@@ -33,35 +33,11 @@ pub fn purge_pending_row(target_message_id: EventId) -> TableRow {
     }
 }
 
-/// Returns true if any deletion admitted since the last purge drain has not
-/// yet been consumed by the worker. The post-admission hook uses this as a
-/// fast check before spending a full content scan.
-pub fn has_purge_pending(store: &Store) -> Result<bool, String> {
-    let any = store
-        .table_rows_with_key_prefix(CONTENT_PURGE_PENDING, &[], 1)
-        .map_err(|err| format!("load purge pending: {err}"))?;
-    Ok(!any.is_empty())
-}
-
-/// Drain all queued purge markers in the current transaction. Called by the
-/// content purge worker once its scan has run, so a successful drain leaves the
-/// trigger queue empty.
-pub fn delete_all_purge_pending_in_tx(store: &Store) -> rusqlite::Result<usize> {
-    let keys: Vec<Vec<u8>> = store
-        .table_rows_with_key_prefix(CONTENT_PURGE_PENDING, &[], usize::MAX)?
-        .into_iter()
-        .map(|(key, _)| key)
-        .collect();
-    if keys.is_empty() {
-        return Ok(0);
-    }
-    store.delete_table_rows_in_tx(CONTENT_PURGE_PENDING, keys)
-}
-
 #[cfg(test)]
 mod tests {
     use crate::protocol::Protocol;
 
+    use super::super::queries::has_purge_pending;
     use super::*;
 
     #[test]
@@ -73,19 +49,13 @@ mod tests {
     }
 
     #[test]
-    fn has_purge_pending_reflects_inserted_and_deleted_rows() {
+    fn purge_pending_round_trips_through_has_query() {
         let store = Protocol::open_memory_store().expect("store");
         assert!(!has_purge_pending(&store).expect("empty"));
         store
             .insert_table_rows(vec![purge_pending_row([3; 32])])
             .expect("insert pending row");
         assert!(has_purge_pending(&store).expect("populated"));
-
-        let deleted = store
-            .write_transaction(delete_all_purge_pending_in_tx)
-            .expect("drain pending");
-        assert_eq!(deleted, 1);
-        assert!(!has_purge_pending(&store).expect("drained"));
     }
 
     #[test]

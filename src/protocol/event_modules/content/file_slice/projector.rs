@@ -427,7 +427,7 @@ mod tests {
         };
         let payload = codec::encode(&event, &[12; 32]).expect("encode");
         assert_eq!(
-            crate::protocol::event_modules::record_from_bytes(payload)
+            crate::protocol::event_modules::event_from_bytes(payload)
                 .expect_err("raw slice must fail"),
             "file slice must be signed"
         );

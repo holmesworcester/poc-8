@@ -44,8 +44,56 @@ pub const SCHEMAS: &[Schema] = &[
     Schema::durable_row_table("event_modules.labels.v1", EVENT_LABELS),
 ];
 
+// Read-only views over the common event-pipeline tables.
+//
+// These functions are duplicated in `queries.rs` for callers outside
+// `event_modules/`. They stay here too because admission, transit
+// projector, and the sibling content admit-gates inside `event_modules/`
+// cannot route through `queries::` (the boundary rule forbids
+// `queries::` in `projector.rs` and sibling schema files import other
+// schema modules' queries via this stable path).
+
+pub fn max_timestamp(store: &Store) -> rusqlite::Result<u64> {
+    super::queries::max_timestamp(store)
+}
+
+pub fn event_count(store: &Store) -> rusqlite::Result<usize> {
+    super::queries::event_count(store)
+}
+
+pub fn status_counts(store: &Store) -> rusqlite::Result<EventStatusCounts> {
+    super::queries::status_counts(store)
+}
+
+pub fn body_bytes(store: &Store) -> rusqlite::Result<usize> {
+    super::queries::body_bytes(store)
+}
+
+pub fn has_shared_event_in_workspaces(
+    store: &Store,
+    event_id: &EventId,
+    workspace_ids: &[EventId],
+) -> rusqlite::Result<bool> {
+    super::queries::has_shared_event_in_workspaces(store, event_id, workspace_ids)
+}
+
+pub fn has_event(store: &Store, event_id: &EventId) -> rusqlite::Result<bool> {
+    super::queries::has_event(store, event_id)
+}
+
+pub fn has_shared_event(store: &Store, event_id: &EventId) -> rusqlite::Result<bool> {
+    super::queries::has_shared_event(store, event_id)
+}
+
+pub fn event_bytes(store: &Store, event_id: &EventId) -> rusqlite::Result<Option<Vec<u8>>> {
+    super::queries::event_bytes(store, event_id)
+}
+
+pub fn event_labels(store: &Store, event_id: &EventId) -> Result<Vec<Vec<u8>>, String> {
+    super::queries::event_labels(store, event_id)
+}
+
 const EVENT_ROW_HEADER_BYTES: usize = 8 + 8 + 1 + 1 + 1 + 1 + 32;
-const MAX_LABELS_PER_EVENT: usize = 4096;
 pub(crate) const MAX_DEPENDENCY_ROWS_PER_EVENT: usize = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,39 +119,6 @@ pub(crate) struct StoredEventIndex {
     pub scope: EventScope,
     pub status: EventStatus,
     pub workspace_id: Option<EventId>,
-}
-
-pub fn max_timestamp(store: &Store) -> rusqlite::Result<u64> {
-    Ok(shared_events(store)?
-        .into_iter()
-        .map(|(_, event)| event.timestamp)
-        .max()
-        .unwrap_or(0))
-}
-
-pub fn event_count(store: &Store) -> rusqlite::Result<usize> {
-    shared_events(store).map(|events| events.len())
-}
-
-pub fn status_counts(store: &Store) -> rusqlite::Result<EventStatusCounts> {
-    let mut counts = EventStatusCounts::default();
-    for (_, event) in shared_events(store)? {
-        match event.status {
-            EventStatus::Ready => counts.ready += 1,
-            EventStatus::Blocked => counts.blocked += 1,
-            EventStatus::Applied => counts.applied += 1,
-            EventStatus::Rejected => counts.rejected += 1,
-        }
-    }
-    counts.blocked_edges = store.table_row_count(BLOCKED_EVENTS_BY_MISSING_DEP)?;
-    Ok(counts)
-}
-
-pub fn body_bytes(store: &Store) -> rusqlite::Result<usize> {
-    Ok(shared_events(store)?
-        .into_iter()
-        .map(|(_, event)| event.body_len)
-        .sum())
 }
 
 pub fn event_index_entries_in_timestamp_range(
@@ -133,33 +148,6 @@ pub fn event_index_entries_in_timestamp_range(
         .collect()
 }
 
-pub fn has_shared_event_in_workspaces(
-    store: &Store,
-    event_id: &EventId,
-    workspace_ids: &[EventId],
-) -> rusqlite::Result<bool> {
-    let Some(event) = read_event(store, event_id)? else {
-        return Ok(false);
-    };
-    Ok(event.scope.is_shared()
-        && event.workspace_id.is_some_and(|workspace_id| {
-            workspace_ids.iter().any(|allowed| allowed == &workspace_id)
-        }))
-}
-
-pub fn has_event(store: &Store, event_id: &EventId) -> rusqlite::Result<bool> {
-    store.table_row(EVENTS, event_id).map(|row| row.is_some())
-}
-
-pub fn has_shared_event(store: &Store, event_id: &EventId) -> rusqlite::Result<bool> {
-    read_event(store, event_id)
-        .map(|event| event.map(|event| event.scope.is_shared()).unwrap_or(false))
-}
-
-pub fn event_bytes(store: &Store, event_id: &EventId) -> rusqlite::Result<Option<Vec<u8>>> {
-    read_event(store, event_id).map(|event| event.map(|event| event.canonical_bytes))
-}
-
 pub fn event_label_rows(labels: Vec<EventLabel>) -> Vec<TableRow> {
     labels
         .into_iter()
@@ -180,23 +168,15 @@ pub(crate) fn decode_stored_event_index(value: &[u8]) -> rusqlite::Result<Stored
     })
 }
 
-pub fn event_labels(store: &Store, event_id: &EventId) -> Result<Vec<Vec<u8>>, String> {
-    store
-        .table_rows_with_key_prefix(EVENT_LABELS, event_id, MAX_LABELS_PER_EVENT)
-        .map_err(|err| format!("load event labels: {err}"))
-        .map(|rows| rows.into_iter().map(|(_, label)| label).collect())
-}
-
-fn shared_events(store: &Store) -> rusqlite::Result<Vec<(EventId, StoredEvent)>> {
-    store
-        .table_rows(EVENTS)?
-        .into_iter()
-        .filter_map(|(key, value)| match decode_event_row_value(&value) {
-            Ok(event) if event.scope.is_shared() => Some(vec_to_id(key).map(|id| (id, event))),
-            Ok(_) => None,
-            Err(err) => Some(Err(err)),
-        })
-        .collect()
+pub(crate) fn shared_body_bytes(store: &Store) -> rusqlite::Result<usize> {
+    let mut total = 0;
+    for (_, value) in store.table_rows(EVENTS)? {
+        let event = decode_event_row_value(&value)?;
+        if event.scope.is_shared() {
+            total += event.body_len;
+        }
+    }
+    Ok(total)
 }
 
 pub(crate) fn read_event(

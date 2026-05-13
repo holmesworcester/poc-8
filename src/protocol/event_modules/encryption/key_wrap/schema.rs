@@ -9,7 +9,7 @@
 //! worker drains it to create the local-only key-secret event.
 
 use crate::core::crypto::XCHACHA20_POLY1305_NONCE_BYTES;
-use crate::core::store::{Schema, Store, TableName, TableRow};
+use crate::core::store::{Schema, TableName, TableRow};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::wire::{Reader, Writer};
 
@@ -87,56 +87,6 @@ pub fn key_secret_commitment_key(workspace_id: EventId, removal_frontier_id: Eve
     key.extend_from_slice(&workspace_id);
     key.extend_from_slice(&removal_frontier_id);
     key
-}
-
-pub fn list_all(store: &Store) -> Result<Vec<KeyWrapRow>, String> {
-    store
-        .table_rows_with_key_prefix(KEY_WRAPS, &[], usize::MAX)
-        .map_err(|err| format!("load key wraps: {err}"))?
-        .into_iter()
-        .map(|(key, value)| decode_key_wrap_row(&key, &value))
-        .collect()
-}
-
-pub fn list_for_workspace(store: &Store, workspace_id: EventId) -> Result<Vec<KeyWrapRow>, String> {
-    store
-        .table_rows_with_key_prefix(KEY_WRAPS, &workspace_id, usize::MAX)
-        .map_err(|err| format!("load key wraps: {err}"))?
-        .into_iter()
-        .map(|(key, value)| decode_key_wrap_row(&key, &value))
-        .collect()
-}
-
-pub fn list_pending_unwraps(
-    store: &Store,
-    limit: usize,
-) -> Result<Vec<PendingKeyUnwrapRow>, String> {
-    store
-        .table_rows_with_key_prefix(PENDING_KEY_UNWRAPS, &[], limit)
-        .map_err(|err| format!("load pending key unwraps: {err}"))?
-        .into_iter()
-        .map(|(key, value)| decode_pending_key_unwrap_row(key, &value))
-        .collect()
-}
-
-pub fn key_wrap_for_pending(
-    store: &Store,
-    pending: &PendingKeyUnwrapRow,
-) -> Result<Option<KeyWrapRow>, String> {
-    store
-        .table_row(KEY_WRAPS, &pending.key)
-        .map_err(|err| format!("load pending key wrap: {err}"))?
-        .map(|value| decode_key_wrap_row(&pending.key, &value))
-        .transpose()
-}
-
-pub fn delete_pending_unwraps(store: &Store, pending_keys: Vec<Vec<u8>>) -> Result<usize, String> {
-    if pending_keys.is_empty() {
-        return Ok(0);
-    }
-    store
-        .delete_table_rows(PENDING_KEY_UNWRAPS, pending_keys)
-        .map_err(|err| format!("delete pending key unwraps: {err}"))
 }
 
 pub fn decode_key_wrap_row(key: &[u8], value: &[u8]) -> Result<KeyWrapRow, String> {

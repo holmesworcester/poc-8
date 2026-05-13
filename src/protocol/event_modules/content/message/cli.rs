@@ -25,7 +25,7 @@ use crate::workers::encryption as encryption_worker;
 
 use super::types::message_event_id_in_minute;
 
-use super::{commands, schema};
+use super::{commands, queries, schema};
 
 const SEND_USAGE: &str = "send WORKSPACE_ID_HEX TEXT";
 const MESSAGES_USAGE: &str = "messages WORKSPACE_ID_HEX [LIMIT]";
@@ -242,7 +242,7 @@ fn visible_message_rows(
     workspace_id: EventId,
 ) -> Result<Vec<super::types::MessageRow>, String> {
     let mut by_id = BTreeMap::new();
-    for row in schema::list_for_workspace(store, workspace_id)? {
+    for row in queries::list_for_workspace(store, workspace_id)? {
         by_id.insert(row.message_id, row);
     }
     for sealed in sealed_message_rows_for_workspace(store, workspace_id)? {
@@ -290,7 +290,7 @@ fn open_sealed_message_row(
         &row.removal_frontier_id,
         row.created_at_ms,
     );
-    let Some(leaf) = local_history_node_secret::schema::get_leaf(
+    let Some(leaf) = local_history_node_secret::queries::get_leaf(
         store,
         row.workspace_id,
         row.removal_frontier_id,
@@ -373,7 +373,7 @@ pub fn visible_reaction_rows(
     workspace_id: EventId,
 ) -> Result<Vec<reaction::types::ReactionRow>, String> {
     let mut by_id = BTreeMap::new();
-    for row in reaction::schema::list_for_workspace(store, workspace_id)? {
+    for row in reaction::queries::list_for_workspace(store, workspace_id)? {
         by_id.insert(row.reaction_id, row);
     }
     for sealed in sealed_reaction_rows_for_workspace(store, workspace_id)? {
@@ -419,7 +419,7 @@ fn open_sealed_reaction_row(
         &row.removal_frontier_id,
         row.created_at_ms,
     );
-    let Some(leaf) = local_history_node_secret::schema::get_leaf(
+    let Some(leaf) = local_history_node_secret::queries::get_leaf(
         store,
         row.workspace_id,
         row.removal_frontier_id,
@@ -528,12 +528,12 @@ pub(crate) fn require_active_frontier_id(
     workspace_id: EventId,
 ) -> Result<EventId, String> {
     let mut candidates = Vec::new();
-    for frontier in removal_frontier::schema::list_for_workspace(store, workspace_id)? {
+    for frontier in removal_frontier::queries::list_for_workspace(store, workspace_id)? {
         let root_present =
-            local_key_secret::schema::get(store, workspace_id, frontier.removal_frontier_id)?
+            local_key_secret::queries::get(store, workspace_id, frontier.removal_frontier_id)?
                 .is_some();
         let has_siblings = !root_present
-            && !local_history_node_secret::schema::list_for_frontier(
+            && !local_history_node_secret::queries::list_for_frontier(
                 store,
                 workspace_id,
                 frontier.removal_frontier_id,
@@ -605,7 +605,7 @@ where
 pub(crate) fn next_timestamp(store: &Store, workspace_id: EventId) -> Result<u64, String> {
     let from_messages = max_timestamp_for_messages(store, workspace_id)?;
     let from_content =
-        super::super::content_event::schema::max_timestamp_for_workspace(store, workspace_id)?;
+        super::super::content_event::queries::max_timestamp_for_workspace(store, workspace_id)?;
     logical_clock::next_timestamp(store, from_messages.max(from_content))
 }
 
@@ -635,11 +635,11 @@ pub(crate) fn workspace_expires_at_minute(
     created_at_ms: u64,
 ) -> Result<(u64, EventId), String> {
     use crate::protocol::event_modules::content::message::types::{EXPIRES_NEVER, UNIX_MINUTE_MS};
-    use crate::protocol::event_modules::encryption::disappearing_messages_setting::schema as setting_schema;
+    use crate::protocol::event_modules::encryption::disappearing_messages_setting::queries as setting_queries;
     use crate::protocol::event_modules::identity::workspace::schema as workspace_schema;
 
     let (ttl_minutes, reference) =
-        if let Some(active) = setting_schema::active_for_workspace(store, workspace_id)? {
+        if let Some(active) = setting_queries::active_for_workspace(store, workspace_id)? {
             (active.ttl_minutes, active.setting_event_id)
         } else {
             let key = workspace_id;

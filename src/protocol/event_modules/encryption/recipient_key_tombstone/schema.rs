@@ -5,7 +5,7 @@
 //! endpoint membership, and replacement key id. This schema records the shared
 //! fact only; it does not erase local recipient private material.
 
-use crate::core::store::{Schema, Store, TableName, TableRow};
+use crate::core::store::{Schema, TableName, TableRow};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::wire::{Reader, Writer};
 
@@ -38,31 +38,6 @@ pub fn recipient_key_tombstone_key(
     key.extend_from_slice(&workspace_id);
     key.extend_from_slice(&old_recipient_key_id);
     key
-}
-
-pub fn get(
-    store: &Store,
-    workspace_id: EventId,
-    old_recipient_key_id: EventId,
-) -> Result<Option<RecipientKeyTombstoneRow>, String> {
-    let key = recipient_key_tombstone_key(workspace_id, old_recipient_key_id);
-    store
-        .table_row(RECIPIENT_KEY_TOMBSTONES, &key)
-        .map_err(|err| format!("load recipient key tombstone: {err}"))?
-        .map(|value| decode_recipient_key_tombstone_row(&key, &value))
-        .transpose()
-}
-
-pub fn list_for_workspace(
-    store: &Store,
-    workspace_id: EventId,
-) -> Result<Vec<RecipientKeyTombstoneRow>, String> {
-    store
-        .table_rows_with_key_prefix(RECIPIENT_KEY_TOMBSTONES, &workspace_id, usize::MAX)
-        .map_err(|err| format!("load recipient key tombstones: {err}"))?
-        .into_iter()
-        .map(|(key, value)| decode_recipient_key_tombstone_row(&key, &value))
-        .collect()
 }
 
 pub fn decode_recipient_key_tombstone_row(

@@ -22,7 +22,7 @@
 //!     deletion label so re-arrivals can't resurrect them.
 //!
 //! Known gaps these tests do NOT close (covered by future work or
-//! documented as out of scope in `disappearing_messages_plan.md` §6):
+//! documented as out of scope in `encryption.md`):
 //!   * Latest-setting enforcement — peers can pick any admitted setting
 //!     as the per-message reference, including older more-permissive
 //!     ones. Honest authors always pick the latest; closing the gap
@@ -313,7 +313,7 @@ fn cli_disappearing_messages_two_peer_convergence() {
 // `disappearing-set` does NOT retroactively rewrite already-stamped
 // messages, but DOES change the TTL stamped into subsequent messages.
 //
-// This is the load-bearing slice-2 invariant from `disappearing_messages_plan.md`:
+// This is the load-bearing slice-2 invariant from `encryption.md`:
 // "Late arrivals do not retroactively change message expiry."
 // ---------------------------------------------------------------------------
 

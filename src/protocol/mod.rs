@@ -23,6 +23,7 @@ pub mod wire;
 pub mod wire_schema;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::core::{
     app::ProtocolSpec,
@@ -32,18 +33,22 @@ use crate::core::{
     store::{Schema, Store},
 };
 use event_modules::types::{EventRecord, ReceiveMetadata};
-use event_modules::worker::{EventRegistry, EventWithContext, ProjectionOutput, ReceivedRecord};
+use event_modules::worker::{
+    AdmitDecision, EventRegistry, EventWithContext, ProjectionOutput, ReceivedRecord,
+};
 use event_modules::Modules;
 
 #[derive(Debug, Clone, Default)]
 pub struct Protocol {
     modules: Modules,
+    sync_index: Arc<event_modules::sync::SyncIndex>,
 }
 
 impl Protocol {
     pub fn new() -> Self {
         Self {
             modules: Modules::new(),
+            sync_index: Arc::new(event_modules::sync::SyncIndex::default()),
         }
     }
 
@@ -55,8 +60,12 @@ impl Protocol {
         Store::open_memory_with_schemas(&schemas())
     }
 
-    pub(crate) fn sync_index(&self) -> &event_modules::sync::SyncIndex {
-        self.modules.sync_index()
+    /// Protocol-wide negentropy sync index. Exposed so callers running the
+    /// protocol directly (without a `cli::Context`) can pass it into the
+    /// sync/transit workers; the daemon path obtains the same kind of
+    /// reference through `DaemonWorkerContext::sync_index` on `Context`.
+    pub fn sync_index(&self) -> &event_modules::sync::SyncIndex {
+        &self.sync_index
     }
 }
 
@@ -73,8 +82,8 @@ pub fn schemas() -> Vec<Schema> {
 // Workers use this trait boundary to decode/project events without depending
 // on the concrete module registry layout.
 impl EventRegistry for Protocol {
-    fn record_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
-        self.modules.record_from_bytes(bytes)
+    fn event_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
+        self.modules.event_from_bytes(bytes)
     }
 
     fn project_network_in(
@@ -102,6 +111,14 @@ impl EventRegistry for Protocol {
         event: &EventWithContext<'_>,
     ) -> Result<ProjectionOutput, String> {
         self.modules.project_record(store, event)
+    }
+
+    fn admit_received_record(
+        &self,
+        store: &Store,
+        record: &EventRecord,
+    ) -> Result<AdmitDecision, String> {
+        self.modules.admit_received_record(store, record)
     }
 
     fn post_admission_hook(&self, store: &Store) -> Result<(), String> {

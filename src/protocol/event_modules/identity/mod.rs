@@ -83,3 +83,39 @@ pub fn signed_record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
         )),
     }
 }
+
+/// Tags owned by this domain. Used by the top-level dispatcher to route
+/// ordinary tag-leading event bytes to `event_from_bytes`.
+pub fn is_identity_tag(tag: u8) -> bool {
+    matches!(
+        tag,
+        admin::codec::TYPE_ADMIN
+            | device_invite::codec::TYPE_DEVICE_INVITE
+            | endpoint::codec::TYPE_LOCAL_ENDPOINT
+            | signed::codec::TYPE_SIGNED
+            | invite::codec::TYPE_INVITE_SECRET
+            | invite_accepted::codec::TYPE_INVITE_ACCEPTED
+            | workspace::codec::TYPE_WORKSPACE
+    )
+}
+
+/// Decode a tag-leading identity event into an `EventRecord`. Inner-only
+/// types (admin/device_invite) are rejected: they must be wrapped in a
+/// `signed` envelope to admit.
+pub fn event_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
+    let tag = bytes
+        .first()
+        .ok_or_else(|| "empty identity event bytes".to_string())?;
+    match *tag {
+        admin::codec::TYPE_ADMIN => Err("admin must be signed".to_string()),
+        device_invite::codec::TYPE_DEVICE_INVITE => Err("device_invite must be signed".to_string()),
+        endpoint::codec::TYPE_LOCAL_ENDPOINT => endpoint::codec::record_from_bytes(bytes),
+        signed::codec::TYPE_SIGNED => signed_record_from_bytes(bytes),
+        invite::codec::TYPE_INVITE_SECRET => invite::codec::record_from_bytes(bytes),
+        invite_accepted::codec::TYPE_INVITE_ACCEPTED => {
+            invite_accepted::codec::record_from_bytes(bytes)
+        }
+        workspace::codec::TYPE_WORKSPACE => workspace::codec::record_from_bytes(bytes),
+        other => Err(format!("unknown identity event type {other}")),
+    }
+}

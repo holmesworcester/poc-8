@@ -18,7 +18,7 @@ use crate::protocol::event_modules::encryption::local_history_node_secret;
 use crate::protocol::event_modules::types::EventId;
 
 use super::codec;
-use super::schema;
+use super::queries;
 use super::types::{FileRow, SealedFileRow};
 
 const FILES_USAGE: &str = "files WORKSPACE_ID_HEX [LIMIT]";
@@ -161,7 +161,7 @@ fn run_save_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
     )?;
     let out_path = PathBuf::from(args.get(2).expect("length checked"));
 
-    let sealed = schema::sealed_file_row_by_id(&context.store, workspace_id, file_event_id)?
+    let sealed = queries::sealed_file_row_by_id(&context.store, workspace_id, file_event_id)?
         .ok_or_else(|| "file does not exist".to_string())?;
     if message::cli::is_deleted_by_author(
         &context.store,
@@ -172,7 +172,7 @@ fn run_save_file_command(context: &mut Context, args: CliArgs<'_>) -> Result<Cli
     }
     let row = open_sealed_file_row(&context.store, &sealed)?
         .ok_or_else(|| "file local content key is missing; cannot decode".to_string())?;
-    let slices = file_slice::schema::list_for_file(&context.store, workspace_id, row.file_id)?;
+    let slices = file_slice::queries::list_for_file(&context.store, workspace_id, row.file_id)?;
     if slices.len() < row.total_slices as usize {
         return Err(format!(
             "file incomplete: have {}/{} slices",
@@ -237,7 +237,7 @@ pub fn list_summaries(
     rows.drain(..start);
     let mut summaries = Vec::with_capacity(rows.len());
     for (idx, row) in rows.into_iter().enumerate() {
-        let slices = file_slice::schema::list_for_file(store, workspace_id, row.file_id)?;
+        let slices = file_slice::queries::list_for_file(store, workspace_id, row.file_id)?;
         let slices_received = u32::try_from(slices.len()).unwrap_or(u32::MAX);
         let bytes_received: u64 = slices.iter().map(|slice| slice.plaintext_len as u64).sum();
         summaries.push(FileSummary {
@@ -260,7 +260,7 @@ pub(crate) fn visible_file_rows(
     store: &Store,
     workspace_id: EventId,
 ) -> Result<Vec<FileRow>, String> {
-    let sealed_rows = schema::list_sealed_for_workspace(store, workspace_id)?;
+    let sealed_rows = queries::list_sealed_for_workspace(store, workspace_id)?;
     let mut out = Vec::with_capacity(sealed_rows.len());
     for sealed in sealed_rows {
         if message::cli::is_deleted_by_author(store, &sealed.message_id, &sealed.author_user_id)? {
@@ -359,7 +359,7 @@ fn lookup_content_key_secret(
     _removal_frontier_id: EventId,
     local_history_node_secret_id: EventId,
 ) -> Result<Option<crate::core::crypto::XChaCha20Poly1305Key>, String> {
-    for row in local_history_node_secret::schema::list_for_workspace(store, workspace_id)? {
+    for row in local_history_node_secret::queries::list_for_workspace(store, workspace_id)? {
         if row.local_history_node_secret_id == local_history_node_secret_id {
             return Ok(Some(row.node_secret));
         }

@@ -12,7 +12,7 @@ use crate::protocol::event_modules::identity::{endpoint, endpoint_shared};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::event_modules::worker;
 
-use super::schema;
+use super::queries;
 
 const GENERATE_USAGE: &str = "generate WORKSPACE_ID_HEX NUM_EVENTS EVENT_SIZE_BYTES";
 const CONTENT_COUNT_USAGE: &str = "content-count WORKSPACE_ID_HEX";
@@ -82,7 +82,7 @@ fn run_generate_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliO
 
     let start = logical_clock::next_timestamp(
         &context.store,
-        schema::max_timestamp_for_workspace(&context.store, workspace_id)?,
+        queries::max_timestamp_for_workspace(&context.store, workspace_id)?,
     )?;
     let output = super::commands::generate(
         workspace_id,
@@ -120,8 +120,8 @@ fn run_content_count_command(
 ) -> Result<CliOutput, String> {
     args.require_len(1, CONTENT_COUNT_USAGE)?;
     let workspace_id = parse_hex_id(args.get(0).expect("length checked"), CONTENT_COUNT_USAGE)?;
-    let events = schema::count_for_workspace(&context.store, workspace_id)?;
-    let payload_bytes = schema::payload_bytes_for_workspace(&context.store, workspace_id)?;
+    let events = queries::count_for_workspace(&context.store, workspace_id)?;
+    let payload_bytes = queries::payload_bytes_for_workspace(&context.store, workspace_id)?;
     Ok(CliOutput::lines(vec![
         format!("workspace_id: {}", args.get(0).expect("length checked")),
         format!("content_events: {events}"),

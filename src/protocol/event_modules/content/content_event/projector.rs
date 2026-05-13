@@ -214,7 +214,7 @@ mod tests {
         });
 
         assert_eq!(
-            crate::protocol::event_modules::record_from_bytes(raw)
+            crate::protocol::event_modules::event_from_bytes(raw)
                 .expect_err("raw content must fail"),
             "content must be signed"
         );

@@ -11,12 +11,13 @@
 //! behavior starts appearing here, move it back to the owning module.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::core::cli::{CliArgs, CliCommand, CliOutput};
 use crate::core::logical_clock;
 use crate::core::network_queues::InboundNetworkRow;
 use crate::core::store::Store;
-use crate::protocol::event_modules::schema as event_schema;
+use crate::protocol::event_modules::queries as event_queries;
 use crate::protocol::event_modules::types::{EventRecord, ReceiveMetadata};
 use crate::protocol::event_modules::worker::{
     AdmitDecision, EventRegistry, EventWithContext, ProjectionOutput, ReceivedRecord,
@@ -34,6 +35,7 @@ pub struct Context {
     pub db_path: std::path::PathBuf,
     pub store: Store,
     pub protocol: Protocol,
+    sync_index: Arc<event_modules::sync::SyncIndex>,
 }
 
 impl Context {
@@ -42,6 +44,7 @@ impl Context {
         Ok(Self {
             store: Protocol::open_store(&db_path).map_err(|err| format!("open store: {err}"))?,
             protocol: Protocol::new(),
+            sync_index: Arc::new(event_modules::sync::SyncIndex::default()),
             db_path,
         })
     }
@@ -50,8 +53,8 @@ impl Context {
 // The shared CLI/daemon context delegates protocol behavior to `Protocol` while
 // exposing the store and persistent worker state required by the generic runner.
 impl EventRegistry for Context {
-    fn record_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
-        self.protocol.record_from_bytes(bytes)
+    fn event_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String> {
+        self.protocol.event_from_bytes(bytes)
     }
 
     fn project_network_in(
@@ -96,7 +99,7 @@ impl DaemonWorkerContext for Context {
     }
 
     fn sync_index(&self) -> &event_modules::sync::SyncIndex {
-        self.protocol.sync_index()
+        &self.sync_index
     }
 }
 
@@ -170,15 +173,15 @@ fn count_command(name: &'static str, usage: &'static str) -> CliCommand<Context>
 fn run_count_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutput, String> {
     args.require_len(0, COUNT_USAGE)?;
     let events =
-        event_schema::event_count(&context.store).map_err(|err| format!("count events: {err}"))?;
+        event_queries::event_count(&context.store).map_err(|err| format!("count events: {err}"))?;
     let payload_bytes =
-        event_schema::body_bytes(&context.store).map_err(|err| format!("count bytes: {err}"))?;
+        event_queries::body_bytes(&context.store).map_err(|err| format!("count bytes: {err}"))?;
     let connections = event_modules::connection::queries::connection_count(&context.store)?;
     let connection_events =
         event_modules::connection::queries::connection_event_count(&context.store)?;
     let invite_accepted =
-        event_modules::identity::invite_accepted::schema::invite_accepted_count(&context.store)?;
-    let statuses = event_schema::status_counts(&context.store)
+        event_modules::identity::invite_accepted::queries::invite_accepted_count(&context.store)?;
+    let statuses = event_queries::status_counts(&context.store)
         .map_err(|err| format!("count event statuses: {err}"))?;
     Ok(CliOutput::lines(
         CountSummary {
@@ -226,7 +229,7 @@ fn run_clock_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutp
 fn clock_output(store: &Store) -> Result<CliOutput, String> {
     let logical_time = logical_clock::logical_time(store)?;
     let max_event_timestamp =
-        event_schema::max_timestamp(store).map_err(|err| format!("load max timestamp: {err}"))?;
+        event_queries::max_timestamp(store).map_err(|err| format!("load max timestamp: {err}"))?;
     let next_timestamp = logical_clock::next_timestamp(store, max_event_timestamp)?;
     Ok(CliOutput::lines(vec![
         format!(
@@ -272,28 +275,28 @@ fn run_sync_status_command(
     args: CliArgs<'_>,
 ) -> Result<CliOutput, String> {
     args.require_len(0, SYNC_STATUS_USAGE)?;
-    let index = context.protocol.sync_index();
+    let index = context.sync_index();
     // Catch the in-memory index up from durable rows so a fresh CLI
     // invocation (no running daemon) sees the same state the daemon
-    // would after one `sync_tick` step. Then run the negentropy purge
-    // drainer so pending purge rows are applied to the index — that
-    // way `root_fingerprint` reflects the post-purge state on a
-    // CLI-only inspection, not just the post-purge state on a
-    // running daemon.
+    // would after one `sync_tick` step. Then drain the negentropy
+    // pending-purge queue through the sync worker's `DrainPendingPurges`
+    // step so pending purge rows are applied to the index — that way
+    // `root_fingerprint` reflects the post-purge state on a CLI-only
+    // inspection, not just on a running daemon.
     index
         .catch_up(&context.store)
         .map_err(|err| format!("catch up sync index: {err}"))?;
-    let _ = crate::workers::negentropy_purge_drainer::run(
+    let _ = crate::workers::sync::run(
         &context.store,
         index,
-        crate::workers::negentropy_purge_drainer::Work::Drain {
+        crate::workers::sync::Work::DrainPendingPurges {
             limit: usize::MAX,
         },
     )
     .map_err(|err| format!("drain negentropy purges: {err}"))?;
     let summary = index.root_summary()?;
     let count = index.indexed_event_count()?;
-    let pending = event_modules::sync::schema::pending_purge_count(&context.store)
+    let pending = event_modules::sync::queries::pending_purge_count(&context.store)
         .map_err(|err| format!("count pending purges: {err}"))?;
     Ok(CliOutput::lines(vec![
         format!("indexed_events: {count}"),
@@ -311,10 +314,10 @@ fn hex_bytes(bytes: &[u8]) -> String {
     out
 }
 
-/// Manually invoke one tick of the `negentropy_purge_drainer` worker.
+/// Manually invoke the sync worker's pending-purge drain step.
 ///
 /// Useful for tests and operators who want to force a drain without
-/// waiting for the daemon's sync_tick. Output mirrors `sync-status`'s
+/// waiting for the daemon's `sync_tick`. Output mirrors `sync-status`'s
 /// post-drain shape so test callers can assert on the same fields:
 ///
 ///   * `drained: <count>` — rows pulled from `negentropy_pending_purges`
@@ -325,7 +328,7 @@ fn negentropy_drain_command() -> CliCommand<Context> {
     CliCommand {
         name: "negentropy-drain",
         usage: NEGENTROPY_DRAIN_USAGE,
-        help: "Manually run one tick of the negentropy purge drainer; \
+        help: "Manually run the sync worker's pending-purge drain step; \
                useful for forcing a drain in tests or after operator \
                intervention without waiting for the daemon.",
         run: run_negentropy_drain_command,
@@ -343,23 +346,27 @@ fn run_negentropy_drain_command(
         Some(value) => value
             .parse::<usize>()
             .map_err(|_| NEGENTROPY_DRAIN_USAGE.to_string())?,
-        None => crate::workers::negentropy_purge_drainer::DEFAULT_DRAIN_LIMIT,
+        None => crate::workers::sync::DEFAULT_PURGE_DRAIN_LIMIT,
     };
-    let index = context.protocol.sync_index();
+    let index = context.sync_index();
     // Same sequencing as `sync-status`: catch the in-memory index up
     // from durable rows so a CLI invocation outside the daemon sees
     // the same starting state the daemon would.
     index
         .catch_up(&context.store)
         .map_err(|err| format!("catch up sync index: {err}"))?;
-    let report = crate::workers::negentropy_purge_drainer::run(
+    let output = crate::workers::sync::run(
         &context.store,
         index,
-        crate::workers::negentropy_purge_drainer::Work::Drain { limit },
+        crate::workers::sync::Work::DrainPendingPurges { limit },
     )
     .map_err(|err| format!("drain negentropy purges: {err}"))?;
+    let report = match output {
+        crate::workers::sync::Output::DrainedPurges(report) => report,
+        _ => return Err("sync worker returned non-drain-pending-purges output".to_string()),
+    };
     let summary = index.root_summary()?;
-    let remaining = event_modules::sync::schema::pending_purge_count(&context.store)
+    let remaining = event_modules::sync::queries::pending_purge_count(&context.store)
         .map_err(|err| format!("count pending purges: {err}"))?;
     Ok(CliOutput::lines(vec![
         format!("drained: {}", report.drained_rows),

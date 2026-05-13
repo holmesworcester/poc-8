@@ -5,7 +5,7 @@
 //! workspaces.
 
 use crate::core::crypto::{self, X25519PrivateKey, X25519PublicKey};
-use crate::core::store::{Schema, Store, TableName, TableRow};
+use crate::core::store::{Schema, TableName, TableRow};
 use crate::protocol::event_modules::types::EventId;
 use crate::protocol::wire::{Reader, Writer};
 
@@ -64,18 +64,6 @@ pub fn decode_local_recipient_key_row(
         recipient_key,
         recipient_secret,
     })
-}
-
-pub fn list_for_workspace(
-    store: &Store,
-    workspace_id: EventId,
-) -> Result<Vec<LocalRecipientKeyRow>, String> {
-    store
-        .table_rows_with_key_prefix(LOCAL_RECIPIENT_KEYS, &workspace_id, usize::MAX)
-        .map_err(|err| format!("load local recipient keys: {err}"))?
-        .into_iter()
-        .map(|(key, value)| decode_local_recipient_key_row(&key, &value))
-        .collect()
 }
 
 fn encode_value(recipient_key: X25519PublicKey, recipient_secret: X25519PrivateKey) -> Vec<u8> {

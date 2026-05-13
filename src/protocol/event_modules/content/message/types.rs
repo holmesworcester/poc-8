@@ -98,8 +98,8 @@ pub struct MessageEvent {
     /// carries the slice-1 fallback `disappearing_ttl_minutes`). Added to
     /// the message's dependencies so the projector validates the stamped
     /// `expires_at_minute` against the policy the author claims to have
-    /// honored. See `disappearing_messages_plan.md` §6 for the trust
-    /// model and the latest-setting gap.
+    /// honored. See `encryption.md` for the trust model and the
+    /// latest-setting gap.
     pub disappearing_setting_id: EventId,
     pub nonce: XChaCha20Poly1305Nonce,
     pub ciphertext: MessageCiphertext,

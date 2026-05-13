@@ -345,13 +345,13 @@ pub enum AdmitDecision {
 /// Protocol registry used by the common worker.
 ///
 /// This trait is the only place where the generic admission/apply loop touches
-/// concrete event modules. `record_from_bytes` chooses the module codec.
+/// concrete event modules. `event_from_bytes` chooses the module codec.
 /// `project_record` chooses the module projector and receives the
 /// `EventWithContext` already loaded by this worker. Keeping those decisions
 /// behind the registry lets this worker enforce common mechanics without
 /// learning event-type vocabulary.
 pub trait EventRegistry {
-    fn record_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String>;
+    fn event_from_bytes(&self, bytes: Vec<u8>) -> Result<EventRecord, String>;
 
     /// Receive-side admission gate.
     ///
@@ -405,7 +405,7 @@ pub trait EventRegistry {
         if provenance.is_some() {
             return Err("event registry does not handle provenance".to_string());
         }
-        let record = self.record_from_bytes(bytes)?;
+        let record = self.event_from_bytes(bytes)?;
         Ok(ReceivedRecord { record, receive })
     }
 
@@ -1010,7 +1010,7 @@ fn project_ready_event_tx(
         // attempts idempotent when callers retry.
         let bytes =
             schema::event_bytes(store, event_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-        let record = modules.record_from_bytes(bytes).map_err(module_error)?;
+        let record = modules.event_from_bytes(bytes).map_err(module_error)?;
         let receive = worker_schema::event_receive_context(store, event_id)?;
         let changes = project_event_with_context_in_tx(store, modules, event_id, &record, receive)?;
         write_projection_output_in_tx(store, changes)?;
@@ -1093,7 +1093,7 @@ fn load_event_context_in_tx(
     for dependency in unique_dependencies(&record.dependencies) {
         let bytes =
             schema::event_bytes(store, &dependency)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-        let record = modules.record_from_bytes(bytes).map_err(module_error)?;
+        let record = modules.event_from_bytes(bytes).map_err(module_error)?;
         dependencies.push(DependencyContext {
             event_id: dependency,
             record,
