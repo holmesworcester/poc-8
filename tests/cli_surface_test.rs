@@ -11,14 +11,12 @@
 //!     rejects regressing the floor when `--floor` is supplied below
 //!     the previous value).
 //!   * `disappearing-status` round-trips the active setting,
-//!     dispatcher chop progress, message + tombstone counts, and the
-//!     pending negentropy purge queue size.
+//!     dispatcher chop progress, and message + tombstone counts.
 //!   * `disappearing-tighten --yes` advances the floor and the
 //!     dispatcher then deletes pre-floor messages.
 //!   * `disappearing-compact` advances the floor without touching the
 //!     TTL.
-//!   * `negentropy-drain` runs one drainer tick and reports how many
-//!     rows were drained + the post-drain root summary.
+//!   * `negentropy-drain` succeeds and reports the root summary.
 
 mod cli_harness;
 
@@ -179,8 +177,6 @@ fn cli_disappearing_status_round_trips_known_setup() {
     assert_eq!(line_value(&status, "leaf_tombstones"), "0");
     // No daemon ran ⇒ no chop has happened ⇒ "none".
     assert_eq!(line_value(&status, "last_chopped_floor"), "none");
-    // No expiries ⇒ no purge queue rows.
-    assert_eq!(line_value(&status, "pending_purges"), "0");
 }
 
 // ---------------------------------------------------------------------------
@@ -326,17 +322,16 @@ fn cli_disappearing_compact_advances_floor_without_changing_ttl() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 6: `negentropy-drain` after enqueueing purges drops
-// `pending_purges` to 0 and reports a non-zero `drained` count.
+// Test 6: `negentropy-drain` after expiry reports a changed root summary.
 //
 // Setup: author messages, then expire them by advancing the clock past
-// the TTL horizon. The minute-expiry worker enqueues purges; we then
-// call `negentropy-drain` directly (without the daemon's drainer
-// having run) to verify it pulls those rows.
+// the TTL horizon. We then call `negentropy-drain` directly to verify
+// the CLI command succeeds and the root summary reflects the disappeared
+// messages.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cli_negentropy_drain_empties_pending_purges() {
+fn cli_negentropy_drain_reports_changed_root_after_expiry() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
     let alice_port = free_port();
@@ -351,12 +346,8 @@ fn cli_negentropy_drain_empties_pending_purges() {
     }
     assert_eq!(message_lines(&alice, &workspace_id).len(), 3);
 
-    // Capture the pre-expiry root fingerprint via `negentropy-drain` on
-    // an empty queue. With no rows enqueued the drainer's `drained` is
-    // 0 and `new_root_count` reflects the indexed events.
+    // Capture the pre-expiry root fingerprint via `negentropy-drain`.
     let pre = assert_success(topo(&["--db", &alice, "negentropy-drain"]));
-    assert_eq!(line_value(&pre, "drained"), "0");
-    assert_eq!(line_value(&pre, "remaining_pending"), "0");
     let pre_fp = line_value(&pre, "new_root_fingerprint");
     let pre_count: u64 = line_value(&pre, "new_root_count").parse().expect("count");
     assert!(
@@ -364,41 +355,37 @@ fn cli_negentropy_drain_empties_pending_purges() {
         "indexed events must include at least the 3 authored messages: {pre_count}"
     );
 
-    // Spawn the daemon to advance the messages through expiry (which
-    // enqueues purge rows). Then immediately stop the daemon so the
-    // drainer doesn't run before our explicit invocation. Using
-    // `disappearing-minute-expiry`'s pipeline directly would be
-    // cleaner, but the CLI layer doesn't expose that worker, so we
-    // rely on the daemon to do the enqueueing.
+    // Spawn the daemon to advance the messages through expiry, then stop it
+    // before invoking the command explicitly.
     let daemon = spawn_daemon(&alice, alice_port);
     assert_success(topo(&["--db", &alice, "clock", "set", "6120000"]));
     wait_for_leaf_count(&alice, &workspace_id, "0");
+    wait_for_content_count(&alice, &workspace_id, "0");
     drop(daemon);
 
-    // After the daemon stops we may have already drained on the
-    // daemon's own ticks. The contract we care about is: any pending
-    // purges remaining can be drained by an explicit `negentropy-drain`
-    // call, and after that call the queue is empty AND the root
-    // fingerprint matches the post-drain state.
+    // After the daemon stops, the command must still succeed and report
+    // the post-expiry root summary.
     let post = assert_success(topo(&["--db", &alice, "negentropy-drain"]));
-    assert_eq!(
-        line_value(&post, "remaining_pending"),
-        "0",
-        "queue must be empty after explicit drain:\n{post}"
-    );
     let post_fp = line_value(&post, "new_root_fingerprint");
+    let post_count: u64 = line_value(&post, "new_root_count")
+        .parse()
+        .expect("post count");
     assert_ne!(
         pre_fp, post_fp,
-        "root fingerprint must change after the purge rows are drained:\n\
+        "root fingerprint must change after expired messages disappear:\n\
          pre={pre_fp}\npost={post_fp}"
+    );
+    assert!(
+        post_count + 3 <= pre_count,
+        "root count must drop by at least the 3 expired messages: pre={pre_count}, post={post_count}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Test 7: `chop-now` directly invokes the encryption worker's
-// ChopTimeTreePrefix on the workspace's most recent frontier and prints
-// the report. We verify that supplying a non-zero floor produces at
-// least one tombstone (subtree or boundary descend).
+// Test 7: `chop-now` runs ChopTimeTreePrefix on the workspace's most
+// recent frontier and prints the report. We verify that supplying a
+// non-zero floor produces at least one tombstone (subtree or boundary
+// descend).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -494,6 +481,24 @@ fn wait_for_leaf_count(db: &str, workspace_id: &str, expected: &str) {
         thread::sleep(Duration::from_millis(100));
     }
     panic!("leaf count did not reach {expected}:\n{last}");
+}
+
+fn wait_for_content_count(db: &str, workspace_id: &str, expected: &str) {
+    let mut last = String::new();
+    for _ in 0..300 {
+        let output = topo(&["--db", db, "content-count", workspace_id]);
+        if output.status.success() {
+            let out = stdout(&output);
+            if line_value(&out, "content_events") == expected {
+                return;
+            }
+            last = out;
+        } else {
+            last = stderr(&output);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("content count did not reach {expected}:\n{last}");
 }
 
 struct RunningDaemon {

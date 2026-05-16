@@ -3,8 +3,8 @@
 //! Setup goes through the real `topo` binary: workspace creation, invite
 //! listening, invite acceptance, transport connection learning, sync, key
 //! publication, wrap creation, and automatic derivation. The tests intentionally
-//! do not seed protocol rows or call workers directly; the CLI boundary is the
-//! invariant under test.
+//! do not seed protocol rows or inspect private storage layout; the CLI boundary
+//! is the invariant under test.
 
 mod cli_harness;
 
@@ -124,14 +124,41 @@ fn cli_invite_server_syncs_but_cannot_be_a_key_recipient() {
 }
 
 #[test]
-fn cli_rotates_recipient_keys_and_tombstones_history_path_nodes() {
+fn cli_recipient_rotation_keeps_new_content_working_and_rejects_retired_recipient() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
     let workspace_id = create_workspace(&alice, "Fs Keys", "alice", "alice-laptop");
 
     let first_recipient = assert_success(topo(&["--db", &alice, "key-recipient", &workspace_id]));
     let first_recipient_id = line_value(&first_recipient, "recipient_key_id");
-    assert_success(topo(&["--db", &alice, "clock", "set", "70000"]));
+    let first_frontier = assert_success(topo(&["--db", &alice, "key-frontier", &workspace_id]));
+    let first_frontier_id = line_value(&first_frontier, "removal_frontier_id");
+    let first_wrap = assert_success(topo(&[
+        "--db",
+        &alice,
+        "key-wrap",
+        &workspace_id,
+        &first_frontier_id,
+        &first_recipient_id,
+    ]));
+    assert_eq!(
+        line_value(&first_wrap, "recipient_key_id"),
+        first_recipient_id
+    );
+    assert_eq!(
+        line_value(
+            &assert_success(topo(&[
+                "--db",
+                &alice,
+                "key-access",
+                &workspace_id,
+                &first_frontier_id,
+            ])),
+            "access",
+        ),
+        "yes"
+    );
+
     let rotated = assert_success(topo(&[
         "--db",
         &alice,
@@ -139,46 +166,22 @@ fn cli_rotates_recipient_keys_and_tombstones_history_path_nodes() {
         &workspace_id,
     ]));
     assert_eq!(line_value(&rotated, "old_active_recipient_keys"), "1");
-    // The refined FS rule (`RULES.md` § "Forward Secrecy Requires
-    // Recipient Key Rotation On Wrap-Bound Deletion") emits one signed
-    // `recipient_key` event with `previous_recipient_key_id` instead of
-    // a separate `recipient_key_tombstone`. The single event acts as
-    // both supersession and introduction; the projector exact-deletes
-    // the retired pubkey row in the same projection.
     assert_eq!(line_value(&rotated, "tombstoned_recipient_keys"), "1");
-    let clock = assert_success(topo(&["--db", &alice, "clock"]));
-    assert_eq!(line_value(&clock, "logical_time"), "70000");
-    // Only one shared event is authored by the rotation (the
-    // replacement `recipient_key`), so the maximum event timestamp
-    // matches the pinned logical time.
-    assert_eq!(line_value(&clock, "max_event_timestamp"), "70000");
+    let new_recipient_key_id = line_value(&rotated, "recipient_key_id");
 
-    let keys = assert_success(topo(&["--db", &alice, "keys", &workspace_id]));
-    assert_eq!(line_value(&keys, "recipient_keys"), "1");
-    // Supersession lives in the new `recipient_key`'s
-    // `previous_recipient_key_id` field; the old standalone
-    // `recipient_key_tombstone` mechanism has been removed.
-    // Rotation wipes the retired private key alongside the supersession.
-    assert_eq!(line_value(&keys, "local_recipient_keys"), "1");
-
-    let advanced = assert_success(topo(&["--db", &alice, "clock", "advance", "1000"]));
-    assert_eq!(line_value(&advanced, "next_timestamp"), "71000");
-    let frontier = assert_success(topo(&["--db", &alice, "key-frontier", &workspace_id]));
-    let clock = assert_success(topo(&["--db", &alice, "clock"]));
-    assert_eq!(line_value(&clock, "max_event_timestamp"), "71000");
-    let removal_frontier_id = line_value(&frontier, "removal_frontier_id");
-    let local_key_secret_id = line_value(&frontier, "local_key_secret_id");
+    let new_frontier = assert_success(topo(&["--db", &alice, "key-frontier", &workspace_id]));
+    let new_frontier_id = line_value(&new_frontier, "removal_frontier_id");
     let old_wrap = topo(&[
         "--db",
         &alice,
         "key-wrap",
         &workspace_id,
-        &removal_frontier_id,
+        &new_frontier_id,
         &first_recipient_id,
     ]);
     assert!(
         !old_wrap.status.success(),
-        "old recipient key should have been purged\nstdout={}\nstderr={}",
+        "retired recipient key should no longer be usable\nstdout={}\nstderr={}",
         stdout(&old_wrap),
         stderr(&old_wrap)
     );
@@ -188,67 +191,32 @@ fn cli_rotates_recipient_keys_and_tombstones_history_path_nodes() {
         stderr(&old_wrap)
     );
 
-    let root_node = assert_success(topo(&[
+    let new_wrap = assert_success(topo(&[
         "--db",
         &alice,
-        "key-node",
+        "key-wrap",
         &workspace_id,
-        &removal_frontier_id,
-        &local_key_secret_id,
-        "0",
-        "8",
+        &new_frontier_id,
+        &new_recipient_key_id,
     ]));
-    let root_node_id = line_value(&root_node, "local_history_node_secret_id");
-    let keys = assert_success(topo(&["--db", &alice, "keys", &workspace_id]));
-    assert_eq!(line_value(&keys, "local_history_node_secrets"), "1");
-    assert_eq!(line_value(&keys, "local_history_node_tombstones"), "0");
-
-    let sibling = assert_success(topo(&[
+    assert_eq!(
+        line_value(&new_wrap, "recipient_key_id"),
+        new_recipient_key_id
+    );
+    assert_success(topo(&[
         "--db",
         &alice,
-        "key-node",
+        "send",
         &workspace_id,
-        &removal_frontier_id,
-        &root_node_id,
-        "4",
-        "4",
-        &root_node_id,
+        "after rotation",
     ]));
-    assert_eq!(line_value(&sibling, "tombstoned_node_id"), root_node_id);
-    let keys = assert_success(topo(&["--db", &alice, "keys", &workspace_id]));
-    assert_eq!(line_value(&keys, "local_history_node_secrets"), "1");
-    assert_eq!(line_value(&keys, "local_history_node_tombstones"), "1");
-    assert!(keys.contains("start=4 width=4"), "{keys}");
-
-    let from_retired_root = topo(&[
-        "--db",
-        &alice,
-        "key-node",
-        &workspace_id,
-        &removal_frontier_id,
-        &root_node_id,
-        "0",
-        "4",
-    ]);
-    assert!(
-        !from_retired_root.status.success(),
-        "retired path node should not derive children\nstdout={}\nstderr={}",
-        stdout(&from_retired_root),
-        stderr(&from_retired_root)
-    );
-    // After the tombstone, the retired event's canonical bytes are purged
-    // entirely from event_modules.events for forward secrecy. `source_secret_material`
-    // therefore reports the source as missing instead of tombstoned; both
-    // outcomes correctly reject derivation from a retired path node.
-    assert!(
-        stderr(&from_retired_root).contains("history node source event is missing"),
-        "{}",
-        stderr(&from_retired_root)
-    );
+    let messages = messages_text(&alice, &workspace_id);
+    assert_eq!(line_value(&messages, "messages"), "1");
+    assert!(messages.contains("alice: after rotation"), "{messages}");
 }
 
 #[test]
-fn cli_history_node_tombstone_purges_retired_event_bytes() {
+fn cli_history_node_tombstone_rejects_derivation_from_retired_path() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
     let workspace_id = create_workspace(&alice, "Fs Keys", "alice", "alice-laptop");
@@ -269,19 +237,6 @@ fn cli_history_node_tombstone_purges_retired_event_bytes() {
         "8",
     ]));
     let root_node_id = line_value(&root_node, "local_history_node_secret_id");
-    assert_eq!(line_value(&root_node, "purged_event_bytes"), "0");
-
-    // Snapshot the parent's plaintext node_secret bytes BEFORE the tombstone is
-    // applied. The purge happens at the tombstone step; if the production code
-    // only exact-deletes the projection row, the secret bytes would remain in
-    // event_modules.events. The test must read those secret bytes through the
-    // SQLite layer because the public CLI never exposes raw key material.
-    let parent_secret = read_history_node_secret_bytes(&alice, &root_node_id);
-    assert_eq!(parent_secret.len(), 32);
-    assert!(
-        parent_secret.iter().any(|byte| *byte != 0),
-        "captured parent node secret should not be zero",
-    );
 
     let sibling = assert_success(topo(&[
         "--db",
@@ -295,236 +250,135 @@ fn cli_history_node_tombstone_purges_retired_event_bytes() {
         &root_node_id,
     ]));
     assert_eq!(line_value(&sibling, "tombstoned_node_id"), root_node_id);
-    assert_eq!(line_value(&sibling, "purged_event_bytes"), "1");
 
-    let keys = assert_success(topo(&["--db", &alice, "keys", &workspace_id]));
-    assert_eq!(line_value(&keys, "local_history_node_secrets"), "1");
-    assert_eq!(line_value(&keys, "local_history_node_tombstones"), "1");
-
-    // SQLite-level: the retired root's event id is gone from `event_modules.events`.
-    let root_event_id = decode_hex_id(&root_node_id);
+    let from_retired_root = topo(&[
+        "--db",
+        &alice,
+        "key-node",
+        &workspace_id,
+        &removal_frontier_id,
+        &root_node_id,
+        "0",
+        "4",
+    ]);
     assert!(
-        !event_id_present(&alice, &root_event_id),
-        "retired history node event id must be absent from event_modules.events",
+        !from_retired_root.status.success(),
+        "retired path node should not derive children\nstdout={}\nstderr={}",
+        stdout(&from_retired_root),
+        stderr(&from_retired_root)
     );
-
-    // SQLite-level: the parent's plaintext node_secret cannot be recovered from
-    // any row_value in event_modules.events.
-    let payloads = all_event_payloads(&alice);
     assert!(
-        !payloads.is_empty(),
-        "events table should still hold other rows"
+        stderr(&from_retired_root).contains("history node source event is missing"),
+        "{}",
+        stderr(&from_retired_root)
     );
-    for (key, value) in &payloads {
-        assert!(
-            !contains_subsequence(value, &parent_secret),
-            "no row_value should still embed the retired parent's plaintext node_secret (offending row_key={})",
-            hex(key),
-        );
-    }
-}
-
-fn read_history_node_secret_bytes(db: &str, hex_id: &str) -> Vec<u8> {
-    let event_id = decode_hex_id(hex_id);
-    let conn = rusqlite::Connection::open(db).expect("open db");
-    let bytes: Vec<u8> = conn
-        .query_row(
-            "SELECT row_value FROM \"event_modules.events\" WHERE row_key = ?1",
-            rusqlite::params![event_id],
-            |row| row.get(0),
-        )
-        .expect("event row");
-    // Decode the stored event-row value: timestamp(u64 BE) + body_len(u64 BE)
-    // + first_byte_id(1) + scope(1) + status(1) + workspace_present(1)
-    // + workspace(32 if present) + canonical_bytes(rest). The canonical bytes
-    // start with a 1-byte tag; the local_history_node_secret tag is 145 and
-    // the wire layout puts node_secret as the final 32 bytes of canonical
-    // bytes (per src/protocol/event_modules/encryption/local_history_node_secret/codec.rs).
-    let canonical = canonical_bytes_from_event_row(&bytes);
-    assert_eq!(
-        canonical.first().copied(),
-        Some(145u8),
-        "expected local_history_node_secret tag"
-    );
-    canonical[canonical.len() - 32..].to_vec()
-}
-
-fn canonical_bytes_from_event_row(value: &[u8]) -> Vec<u8> {
-    // The encoded event-row value layout is timestamp(8) + body_len(8) +
-    // first_byte_id(1) + scope(1) + status(1) + has_workspace(1) +
-    // workspace_id(32 if has_workspace) + canonical_bytes(rest). This test
-    // intentionally re-implements the layout decode rather than reaching into
-    // protocol internals: the rules-boundary test forbids those imports from
-    // black-box tests on purpose.
-    let mut offset = 0;
-    offset += 8; // timestamp
-    offset += 8; // body_len
-    offset += 1; // first byte of event id
-    offset += 1; // scope
-    offset += 1; // status
-    let has_workspace = value[offset] != 0;
-    offset += 1;
-    if has_workspace {
-        offset += 32;
-    }
-    value[offset..].to_vec()
-}
-
-fn event_id_present(db: &str, event_id: &[u8]) -> bool {
-    let conn = rusqlite::Connection::open(db).expect("open db");
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM \"event_modules.events\" WHERE row_key = ?1",
-            rusqlite::params![event_id],
-            |row| row.get(0),
-        )
-        .expect("count rows");
-    count > 0
+    // TODO(encryption-cli): add a public `topo key-audit-purge
+    // WORKSPACE_ID_HEX EVENT_ID_HEX` (or equivalent) that reports whether
+    // retired key-material bytes are still recoverable from durable storage.
+    // Until that exists, this black-box test can only assert the observable
+    // derivation refusal above, not the private byte-purge property.
 }
 
 #[test]
-fn cli_rotate_recipient_purges_old_local_private_key_and_wraps() {
+fn cli_peer_recipient_rotation_preserves_fresh_sharing_and_rejects_retired_wraps() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
+    let bob = temp_db(&tmp, "bob.db");
     let workspace_id = create_workspace(&alice, "FS Rotate", "alice", "alice-laptop");
+    let alice_port = free_port();
+    let bob_port = free_port();
 
-    // Build a complete frontier-with-wrap setup BEFORE rotation. The wrap is
-    // addressed to alice's own retired recipient key, so rotation must purge
-    // its row, its canonical bytes, the retired private-key row, and the two
-    // retired event-store entries.
-    let recipient = assert_success(topo(&["--db", &alice, "key-recipient", &workspace_id]));
+    let _alice_daemon = spawn_daemon(&alice, alice_port);
+    let _bob_daemon = spawn_daemon(&bob, bob_port);
+    join_workspace_on_daemons(&alice, &bob, &workspace_id, alice_port, "bob", "bob-phone");
+
+    let recipient = assert_success(topo(&["--db", &bob, "key-recipient", &workspace_id]));
     let retired_recipient_key_id = line_value(&recipient, "recipient_key_id");
-    let retired_local_recipient_key_id = line_value(&recipient, "local_recipient_key_id");
-
     let frontier = assert_success(topo(&["--db", &alice, "key-frontier", &workspace_id]));
-    let removal_frontier_id = line_value(&frontier, "removal_frontier_id");
-
-    let wrapped = assert_success(topo(&[
-        "--db",
+    let frontier_id = line_value(&frontier, "removal_frontier_id");
+    let wrapped = key_wrap_with_retry(
         &alice,
-        "key-wrap",
         &workspace_id,
-        &removal_frontier_id,
+        &frontier_id,
         &retired_recipient_key_id,
-    ]));
-    let retired_key_wrap_id = line_value(&wrapped, "key_wrap_id");
-
-    // Sanity: keys WS counts the pre-rotation rows we expect. If these change,
-    // the test below is checking the wrong baseline.
-    let pre = assert_success(topo(&["--db", &alice, "keys", &workspace_id]));
-    assert_eq!(line_value(&pre, "recipient_keys"), "1");
-    assert_eq!(line_value(&pre, "local_recipient_keys"), "1");
-    assert_eq!(line_value(&pre, "key_wraps"), "1");
-
-    // Pre-rotation SQLite check: the retired event ids are durably present.
-    assert!(
-        event_row_exists(&alice, &retired_recipient_key_id),
-        "expected retired recipient_key event row before rotation",
     );
-    assert!(
-        event_row_exists(&alice, &retired_local_recipient_key_id),
-        "expected retired local_recipient_key event row before rotation",
+    assert_eq!(
+        line_value(&wrapped, "recipient_key_id"),
+        retired_recipient_key_id
     );
-    assert!(
-        event_row_exists(&alice, &retired_key_wrap_id),
-        "expected retired key_wrap event row before rotation",
-    );
+    wait_for_key_access(&bob, &workspace_id, &frontier_id, "yes");
 
-    let rotated = assert_success(topo(&[
-        "--db",
-        &alice,
-        "key-rotate-recipient",
-        &workspace_id,
-    ]));
-    assert_eq!(line_value(&rotated, "old_active_recipient_keys"), "1");
-    assert_eq!(line_value(&rotated, "tombstoned_recipient_keys"), "1");
+    let rotated = assert_success(topo(&["--db", &bob, "key-rotate-recipient", &workspace_id]));
+    let old_active = line_value(&rotated, "old_active_recipient_keys")
+        .parse::<u64>()
+        .expect("parse old_active_recipient_keys");
+    let tombstoned = line_value(&rotated, "tombstoned_recipient_keys")
+        .parse::<u64>()
+        .expect("parse tombstoned_recipient_keys");
+    assert!(
+        old_active >= 1,
+        "rotation must retire at least one key:\n{rotated}"
+    );
+    assert_eq!(tombstoned, old_active);
     let new_recipient_key_id = line_value(&rotated, "recipient_key_id");
-    let new_local_recipient_key_id = line_value(&rotated, "local_recipient_key_id");
     assert_ne!(new_recipient_key_id, retired_recipient_key_id);
-    assert_ne!(new_local_recipient_key_id, retired_local_recipient_key_id);
 
-    // CLI surface: the retired private key is gone, the supersession
-    // event replaced the retired pubkey row, and the retired wrap row
-    // was deleted alongside the supersession. Under the refined FS rule
-    // (`RULES.md` § "Forward Secrecy Requires Recipient Key Rotation On
-    // Wrap-Bound Deletion") supersession lives in the new
-    // `recipient_key`'s `previous_recipient_key_id` field; the old
-    // standalone `recipient_key_tombstone` mechanism has been removed.
-    let post = assert_success(topo(&["--db", &alice, "keys", &workspace_id]));
-    assert_eq!(line_value(&post, "recipient_keys"), "1");
-    assert_eq!(line_value(&post, "local_recipient_keys"), "1");
-    assert_eq!(line_value(&post, "key_wraps"), "0");
-
-    // SQLite-level: the retired recipient_key, retired local_recipient_key,
-    // and retired key_wrap event rows are absent from event_modules.events.
-    // Forward secrecy depends on these canonical bytes being unrecoverable.
-    assert!(
-        !event_row_exists(&alice, &retired_recipient_key_id),
-        "retired recipient_key event canonical bytes must be purged",
-    );
-    assert!(
-        !event_row_exists(&alice, &retired_local_recipient_key_id),
-        "retired local_recipient_key event canonical bytes must be purged",
-    );
-    assert!(
-        !event_row_exists(&alice, &retired_key_wrap_id),
-        "retired key_wrap event canonical bytes must be purged",
-    );
-
-    // The new recipient material still works: a new frontier plus wrap targets
-    // the new recipient_key_id, so rotation did not break unrelated material.
     let new_frontier = assert_success(topo(&["--db", &alice, "key-frontier", &workspace_id]));
     let new_frontier_id = line_value(&new_frontier, "removal_frontier_id");
-    let new_wrap = assert_success(topo(&[
+    let new_wrap = key_wrap_with_retry(
+        &alice,
+        &workspace_id,
+        &new_frontier_id,
+        &new_recipient_key_id,
+    );
+    assert_eq!(
+        line_value(&new_wrap, "recipient_key_id"),
+        new_recipient_key_id
+    );
+    wait_for_key_access(&bob, &workspace_id, &new_frontier_id, "yes");
+
+    let old_wrap = topo(&[
         "--db",
         &alice,
         "key-wrap",
         &workspace_id,
         &new_frontier_id,
-        &new_recipient_key_id,
-    ]));
-    assert_eq!(
-        line_value(&new_wrap, "recipient_key_id"),
-        new_recipient_key_id
+        &retired_recipient_key_id,
+    ]);
+    assert!(
+        !old_wrap.status.success(),
+        "alice must not be able to share new frontiers to bob's retired key after using bob's replacement key\nstdout={}\nstderr={}",
+        stdout(&old_wrap),
+        stderr(&old_wrap)
     );
+
+    assert_success(topo(&[
+        "--db",
+        &alice,
+        "send",
+        &workspace_id,
+        "after bob rotation",
+    ]));
+    wait_for_messages_contains(&bob, &workspace_id, "alice: after bob rotation");
+
+    // TODO(encryption-cli): add a public observable that proves retired
+    // recipient private keys and old wraps are unrecoverable from durable
+    // storage after rotation. The CLI-visible contract covered here is that
+    // retired recipient ids cannot receive new wraps while the replacement key
+    // can still recover and display new messages.
 }
 
 #[test]
-fn cli_chop_wiping_f_rotates_local_recipient_key_for_forward_secrecy() {
-    // RULES.md § "Forward Secrecy Requires Recipient Key Rotation On
-    // Wrap-Bound Deletion" demands that any deletion that wipes a
-    // key-wrapped F also force every recipient of a `key_wrap` for that
-    // F to rotate: supersede the recipient pubkey (via the new
-    // `recipient_key`'s `previous_recipient_key_id` field), wipe the
-    // matching `local_recipient_key` private key, and generate a fresh
-    // keypair.
-    //
-    // This test proves the chop path. Alice publishes a recipient key,
-    // creates a frontier, wraps F to her own recipient key, then runs
-    // `chop-now` with a non-zero floor. Chop wipes F's row, and the
-    // forward-secrecy hook in the encryption worker must:
-    //   * Sign and admit a fresh `recipient_key` event whose
-    //     `previous_recipient_key_id` supersedes the retired pubkey
-    //     (the supersession projector exact-deletes the predecessor's
-    //     row and labels it).
-    //   * Exact-delete the old `LOCAL_RECIPIENT_KEYS` row + purge bytes.
-    //   * Exact-delete the old `KEY_WRAPS` row for the wiped F.
+fn cli_chop_revokes_frontier_rejects_old_wraps_and_allows_fresh_messages() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
     let workspace_id = create_workspace(&alice, "FS Chop Rotate", "alice", "alice-laptop");
 
-    // Build the full pre-rotation setup. The wrap is addressed to
-    // alice's own retired recipient key — the same arrangement
-    // cli_rotate_recipient_purges_old_local_private_key_and_wraps
-    // exercises for manual rotation.
     let recipient = assert_success(topo(&["--db", &alice, "key-recipient", &workspace_id]));
     let retired_recipient_key_id = line_value(&recipient, "recipient_key_id");
-    let retired_local_recipient_key_id = line_value(&recipient, "local_recipient_key_id");
-
     let frontier = assert_success(topo(&["--db", &alice, "key-frontier", &workspace_id]));
     let removal_frontier_id = line_value(&frontier, "removal_frontier_id");
-
-    let wrapped = assert_success(topo(&[
+    assert_success(topo(&[
         "--db",
         &alice,
         "key-wrap",
@@ -532,14 +386,6 @@ fn cli_chop_wiping_f_rotates_local_recipient_key_for_forward_secrecy() {
         &removal_frontier_id,
         &retired_recipient_key_id,
     ]));
-    let retired_key_wrap_id = line_value(&wrapped, "key_wrap_id");
-
-    // Sanity: pre-chop, alice has F's row, one recipient key, one
-    // local private key, and one key wrap.
-    let pre = assert_success(topo(&["--db", &alice, "keys", &workspace_id]));
-    assert_eq!(line_value(&pre, "recipient_keys"), "1");
-    assert_eq!(line_value(&pre, "local_recipient_keys"), "1");
-    assert_eq!(line_value(&pre, "key_wraps"), "1");
     let access_pre = assert_success(topo(&[
         "--db",
         &alice,
@@ -548,10 +394,15 @@ fn cli_chop_wiping_f_rotates_local_recipient_key_for_forward_secrecy() {
         &removal_frontier_id,
     ]));
     assert_eq!(line_value(&access_pre, "access"), "yes");
+    assert_success(topo(&[
+        "--db",
+        &alice,
+        "send",
+        &workspace_id,
+        "before chop",
+    ]));
+    assert!(messages_text(&alice, &workspace_id).contains("alice: before chop"));
 
-    // Chop with a non-zero floor. Because the frontier was just created
-    // (no minute_node materializations exist yet), chop walks F → leaf
-    // boundary and wipes F's row.
     let chop = assert_success(topo(&["--db", &alice, "chop-now", &workspace_id, "100"]));
     assert_eq!(line_value(&chop, "floor_minute"), "100");
     let subtree: u64 = line_value(&chop, "subtree_tombstones_written")
@@ -565,7 +416,6 @@ fn cli_chop_wiping_f_rotates_local_recipient_key_for_forward_secrecy() {
         "chop with non-zero floor must produce at least one tombstone:\n{chop}"
     );
 
-    // F is wiped on disk: key-access reports `no` for this frontier.
     let access_post = assert_success(topo(&[
         "--db",
         &alice,
@@ -578,100 +428,49 @@ fn cli_chop_wiping_f_rotates_local_recipient_key_for_forward_secrecy() {
         "no",
         "chop must wipe F's row"
     );
-
-    // The forward-secrecy rotation hook must have superseded the
-    // retired recipient key, published a fresh recipient key, and wiped
-    // the retired private rows + the wrap. Under the refined FS rule
-    // (`RULES.md` § "Forward Secrecy Requires Recipient Key Rotation On
-    // Wrap-Bound Deletion") supersession lives in the new
-    // `recipient_key`'s `previous_recipient_key_id` field; the old
-    // standalone `recipient_key_tombstone` mechanism has been removed.
-    let post = assert_success(topo(&["--db", &alice, "keys", &workspace_id]));
-    assert_eq!(
-        line_value(&post, "recipient_keys"),
-        "1",
-        "old recipient key row is exact-deleted by the supersession \
-         projector; a fresh recipient key replaces it"
-    );
-    assert_eq!(
-        line_value(&post, "local_recipient_keys"),
-        "1",
-        "old local private row is wiped; a fresh keypair takes its place"
-    );
-    assert_eq!(
-        line_value(&post, "key_wraps"),
-        "0",
-        "the retired wrap row must be exact-deleted alongside the retired pubkey"
-    );
-
-    // The canonical bytes for the retired recipient key, retired local
-    // private key, and retired wrap must be unrecoverable from disk —
-    // otherwise an on-disk attacker could still unwrap to F.
+    let post_messages = messages_text(&alice, &workspace_id);
     assert!(
-        !event_row_exists(&alice, &retired_recipient_key_id),
-        "retired recipient_key bytes must be purged for forward secrecy"
+        post_messages.contains("alice: before chop"),
+        "the current messages CLI lists the already-open local projection:\n{post_messages}"
+    );
+
+    let new_frontier = assert_success(topo(&["--db", &alice, "key-frontier", &workspace_id]));
+    let new_frontier_id = line_value(&new_frontier, "removal_frontier_id");
+    let old_wrap = topo(&[
+        "--db",
+        &alice,
+        "key-wrap",
+        &workspace_id,
+        &new_frontier_id,
+        &retired_recipient_key_id,
+    ]);
+    assert!(
+        !old_wrap.status.success(),
+        "chop must retire the recipient key that wrapped the deleted frontier\nstdout={}\nstderr={}",
+        stdout(&old_wrap),
+        stderr(&old_wrap)
+    );
+    assert_success(topo(&["--db", &alice, "send", &workspace_id, "after chop"]));
+    let fresh_messages = messages_text(&alice, &workspace_id);
+    assert!(
+        fresh_messages.contains("alice: after chop"),
+        "{fresh_messages}"
     );
     assert!(
-        !event_row_exists(&alice, &retired_local_recipient_key_id),
-        "retired local_recipient_key bytes must be purged for forward secrecy"
+        fresh_messages.contains("alice: before chop"),
+        "fresh authoring should not disturb the current local message listing:\n{fresh_messages}"
     );
-    assert!(
-        !event_row_exists(&alice, &retired_key_wrap_id),
-        "retired key_wrap bytes must be purged for forward secrecy"
-    );
-}
 
-fn event_row_exists(db_path: &str, event_id_hex: &str) -> bool {
-    event_id_present(db_path, &decode_hex_id(event_id_hex))
-}
-
-fn all_event_payloads(db: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let conn = rusqlite::Connection::open(db).expect("open db");
-    let mut stmt = conn
-        .prepare("SELECT row_key, row_value FROM \"event_modules.events\"")
-        .expect("prepare");
-    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .expect("query")
-        .map(|item| item.expect("row"))
-        .collect()
-}
-
-fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return false;
-    }
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
-}
-
-fn decode_hex_id(hex: &str) -> Vec<u8> {
-    assert_eq!(hex.len(), 64, "event ids are 32-byte hex strings");
-    let mut out = Vec::with_capacity(32);
-    let bytes = hex.as_bytes();
-    for chunk in 0..32 {
-        let high = decode_hex_nibble(bytes[chunk * 2]);
-        let low = decode_hex_nibble(bytes[chunk * 2 + 1]);
-        out.push((high << 4) | low);
-    }
-    out
-}
-
-fn decode_hex_nibble(byte: u8) -> u8 {
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        b'A'..=b'F' => byte - b'A' + 10,
-        _ => panic!("invalid hex digit: {byte}"),
-    }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push_str(&format!("{:02x}", byte));
-    }
-    out
+    // TODO(encryption-cli): add a public durable-storage audit for chop that
+    // proves retired recipient private keys, old wraps, and deleted frontier
+    // bytes are not recoverable.
+    // TODO(encryption-cli): add a public `topo message-open`/decrypt check
+    // whose result depends on live frontier access. `topo messages` lists an
+    // already-open local projection today, so message visibility is not a
+    // reliable observable for whether chopped key material can be recovered.
+    // The public behavior asserted here is loss of access to the chopped
+    // frontier, rejection of new wraps to the retired recipient, and successful
+    // fresh authoring.
 }
 
 fn create_workspace(db: &str, name: &str, username: &str, device_name: &str) -> String {
@@ -927,6 +726,53 @@ fn wait_for_key_access(
         thread::sleep(Duration::from_millis(100));
     }
     panic!("key access did not reach {expected}: {last}");
+}
+
+fn key_wrap_with_retry(
+    db: &str,
+    workspace_id: &str,
+    removal_frontier_id: &str,
+    recipient_key_id: &str,
+) -> String {
+    let mut last = String::new();
+    for _ in 0..300 {
+        let output = topo(&[
+            "--db",
+            db,
+            "key-wrap",
+            workspace_id,
+            removal_frontier_id,
+            recipient_key_id,
+        ]);
+        if output.status.success() {
+            return stdout(&output);
+        }
+        last = stderr(&output);
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("key-wrap never succeeded: {last}");
+}
+
+fn messages_text(db: &str, workspace_id: &str) -> String {
+    assert_success(topo(&["--db", db, "messages", workspace_id]))
+}
+
+fn wait_for_messages_contains(db: &str, workspace_id: &str, expected: &str) {
+    let mut last = String::new();
+    for _ in 0..300 {
+        let output = topo(&["--db", db, "messages", workspace_id]);
+        if output.status.success() {
+            let out = stdout(&output);
+            if out.contains(expected) {
+                return;
+            }
+            last = out;
+        } else {
+            last = stderr(&output);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("messages never contained `{expected}`: {last}");
 }
 
 fn wait_for_content_count(db: &str, workspace_id: &str, expected: &str) {

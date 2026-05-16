@@ -1,10 +1,9 @@
 //! Black-box CLI tests for invite acceptance and bootstrap connection setup.
 //!
 //! These tests exercise process boundaries: listener startup, invite-link
-//! parsing, accept/connect, and the resulting operator output. They do not seed
-//! protocol rows or call workers directly, because the invariant under test is
-//! that a fresh CLI process can bootstrap through the same public path an
-//! operator would use.
+//! parsing, accept/connect, and the resulting operator output. They only use
+//! public CLI processes, because the invariant under test is that a fresh
+//! process can bootstrap through the same path an operator would use.
 
 mod cli_harness;
 

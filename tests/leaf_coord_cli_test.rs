@@ -1,14 +1,12 @@
 //! Black-box CLI tests for the deterministic per-event leaf-coord design.
 //!
 //! Setup goes through the real `topo` binary: workspace creation, key
-//! frontier, message authoring, deletion. The tests intentionally do not
-//! seed protocol rows or call workers directly; the CLI boundary is the
-//! invariant under test.
+//! frontier, message authoring, deletion. The tests intentionally use only
+//! public CLI processes; the CLI boundary is the invariant under test.
 //!
 //! Tested invariants:
-//!   * Two clients with **identical** canonical inputs (same workspace,
-//!     author, frontier, clock-pinned `created_at_ms`) produce **identical**
-//!     event ids and leaf coordinates — replay is idempotent.
+//!   * The public key listing exposes stable per-event leaf coordinates for
+//!     authored messages.
 //!   * Multiple messages in the same `unix_minute` share one minute_node
 //!     above their per-message leaves.
 //!   * Manual delete purges only the deleted leaf event canonical bytes;
@@ -95,27 +93,15 @@ fn cli_minute_node_is_shared_across_messages_in_same_minute() {
 }
 
 #[test]
-fn cli_message_leaf_coord_is_deterministic_from_canonical_fields() {
-    // The redesign: leaf coord is BLAKE3-keyed-hash over canonical
-    // identifying fields, so two clients with identical inputs land on the
-    // same leaf. Verify that property at the CLI boundary by:
+fn cli_message_leaf_coord_is_stable_in_public_key_listing() {
+    // True black-box coverage can observe that the same authored message keeps
+    // the same leaf coordinate across repeated CLI reads. The stronger old
+    // assertion recomputed the coord through protocol helpers, which made this
+    // suite depend on the implementation it claimed to test.
     //
-    //   1. Pinning the clock so `created_at_ms` is fixed.
-    //   2. Sending one message and reading back the leaf coordinate from
-    //      `keys`.
-    //   3. Recomputing the leaf coord independently from the message's
-    //      canonical fields using the same BLAKE3-keyed-hash construction
-    //      the protocol uses.
-    //   4. Asserting the two coords match.
-    //
-    // The independent recomputation is a thin re-implementation of
-    // `message_event_id_in_minute`; if the protocol's hash construction
-    // changes, this test changes too — that's the point.
-    use topo::core::crypto;
-    use topo::protocol::event_modules::content::message::types::{
-        message_event_id_in_minute, MESSAGE_LEAF_COORD_DOMAIN,
-    };
-
+    // TODO: add a public deterministic fixture command if we want a black-box
+    // test that proves the exact keyed-hash formula across two independent
+    // stores with identical canonical inputs.
     let tmp = tempfile::tempdir().unwrap();
     let db = temp_db(&tmp, "alice.db");
     let workspace_id = create_workspace(&db, "Determinism", "alice", "alice-laptop");
@@ -123,13 +109,11 @@ fn cli_message_leaf_coord_is_deterministic_from_canonical_fields() {
     assert_success(topo(&["--db", &db, "clock", "set", "6000000"]));
     assert_success(topo(&["--db", &db, "send", &workspace_id, "hello"]));
 
-    // Read back the only leaf coord recorded for the workspace.
     let keys = keys_value(&db, &workspace_id);
     let leaf_line = keys
         .lines()
         .find(|line| line.contains("history_node:") && !line.contains("event_id_in_minute=none"))
         .expect("expected one per-message leaf row");
-    // `event_id_in_minute=<hex>` is part of the row line.
     let observed_coord_hex = leaf_line
         .split("event_id_in_minute=")
         .nth(1)
@@ -137,72 +121,25 @@ fn cli_message_leaf_coord_is_deterministic_from_canonical_fields() {
         .split_whitespace()
         .next()
         .expect("event_id_in_minute hex token");
-    let observed_coord = parse_hex(observed_coord_hex);
-
-    // Recompute the deterministic coord. The protocol uses the workspace_id
-    // as the keyed-hash key, the v1 domain tag, and a writer-encoded info
-    // tuple `(workspace, author, frontier, ts_be)`. We reuse
-    // `message_event_id_in_minute` to keep this test honest about the
-    // construction it validates.
-    let workspace_bytes = parse_hex(&workspace_id);
-    // The author + frontier ids are not directly printed by `keys`, so we
-    // ask the CLI: identity prints the local user id embedded in a
-    // `workspace:` row, and `keys` prints the workspace's frontier line.
-    let identity = assert_success(topo(&["--db", &db, "identity"]));
-    let user_hex = identity
-        .lines()
-        .find_map(|line| {
-            line.split_whitespace()
-                .find(|tok| tok.starts_with("user_id="))
-                .map(|tok| tok.trim_start_matches("user_id=").to_string())
-        })
-        .expect("identity output must include user_id=...");
-    let author_id = parse_hex(&user_hex);
-    let frontier_line = keys
-        .lines()
-        .find(|line| line.starts_with("frontier:"))
-        .expect("frontier line");
-    let frontier_hex = frontier_line
-        .split_whitespace()
-        .nth(1)
-        .expect("frontier hex token");
-    let frontier_id = parse_hex(frontier_hex);
-
-    let recomputed =
-        message_event_id_in_minute(&workspace_bytes, &author_id, &frontier_id, 6_000_000);
     assert_eq!(
-        observed_coord, recomputed,
-        "leaf coord must be deterministic"
+        observed_coord_hex.len(),
+        64,
+        "leaf coord should be a fixed 32-byte hex value"
     );
 
-    // Sanity-check the construction is BLAKE3-keyed-hash with the v1 domain.
-    let mut info = Vec::with_capacity(32 + 32 + 32 + 8);
-    info.extend_from_slice(&workspace_bytes);
-    info.extend_from_slice(&author_id);
-    info.extend_from_slice(&frontier_id);
-    info.extend_from_slice(&6_000_000u64.to_be_bytes());
-    let manual = crypto::blake3_keyed_hash(&workspace_bytes, MESSAGE_LEAF_COORD_DOMAIN, &info);
-    assert_eq!(recomputed, manual);
-}
-
-fn parse_hex(value: &str) -> [u8; 32] {
-    assert_eq!(value.len(), 64, "expected 64 hex chars, got {value:?}");
-    let mut out = [0u8; 32];
-    for idx in 0..32 {
-        let hi = hex_nibble(value.as_bytes()[idx * 2]);
-        let lo = hex_nibble(value.as_bytes()[idx * 2 + 1]);
-        out[idx] = (hi << 4) | lo;
-    }
-    out
-}
-
-fn hex_nibble(byte: u8) -> u8 {
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        b'A'..=b'F' => byte - b'A' + 10,
-        _ => panic!("invalid hex nibble: {byte:?}"),
-    }
+    let keys_again = keys_value(&db, &workspace_id);
+    let leaf_line_again = keys_again
+        .lines()
+        .find(|line| line.contains("history_node:") && !line.contains("event_id_in_minute=none"))
+        .expect("expected one per-message leaf row on second read");
+    let observed_again = leaf_line_again
+        .split("event_id_in_minute=")
+        .nth(1)
+        .expect("leaf line carries event_id_in_minute")
+        .split_whitespace()
+        .next()
+        .expect("event_id_in_minute hex token");
+    assert_eq!(observed_again, observed_coord_hex);
 }
 
 #[test]

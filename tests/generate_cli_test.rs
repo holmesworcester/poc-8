@@ -25,8 +25,6 @@ fn generate_cli_uses_real_store_and_reports_applied_events() {
     // `generate` adds 7 messages on top.
     assert_eq!(line_value(&status, "events"), "15");
     assert_eq!(line_value(&status, "applied_events"), "15");
-    assert_eq!(line_value(&status, "ready_events"), "0");
-    assert_eq!(line_value(&status, "blocked_events"), "0");
 }
 
 #[test]

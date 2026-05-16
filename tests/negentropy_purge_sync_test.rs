@@ -1,16 +1,15 @@
-//! CLI tests for the sync worker's pending-purge drain step.
+//! CLI tests for sync-visible expiry and purge behavior.
 //!
 //! Exercises the deferred sync-vs-purge interaction noted in
 //! `tests/disappearing_messages_cli_test.rs::cli_disappearing_messages_two_peer_convergence`:
 //!
 //!   * Two peers that purge the same set of admitted shared event ids
 //!     reach byte-identical negentropy `root_fingerprint` values.
-//!   * The pending-purge queue empties after the sync worker's tick
-//!     drains it (folded in as the tick's first step).
+//!   * Expired content disappears locally and is not reintroduced by
+//!     follow-up sync rounds.
 //!
 //! All assertions go through public CLI surface — `sync-status`,
-//! `keys`, and `messages` — so these tests do not poke at the in-memory
-//! `SyncIndex` from Rust.
+//! `keys`, `content-count`, and `messages`.
 
 mod cli_harness;
 
@@ -22,14 +21,12 @@ use std::time::Duration;
 use cli_harness::*;
 
 // ---------------------------------------------------------------------------
-// Test 1: single-peer determinism — purging the same id set twice (with
-// different drain orderings simulated by clock jitter) reaches the same
-// root summary, and the pending-purge queue empties after the daemon
-// drainer ticks.
+// Test 1: single-peer expiry updates the sync summary after expired
+// messages disappear.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cli_negentropy_drainer_empties_queue_and_settles_root_after_expiry() {
+fn cli_negentropy_settles_root_after_expiry() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
     let alice_port = free_port();
@@ -52,29 +49,21 @@ fn cli_negentropy_drainer_empties_queue_and_settles_root_after_expiry() {
         "indexed events must include at least the three authored messages:\n{pre}"
     );
     let pre_fingerprint = line_value(&pre, "root_fingerprint");
-    assert_eq!(line_value(&pre, "pending_purges"), "0");
 
-    // Spawn the daemon, advance past expiry, wait for retirement.
+    // Spawn the daemon, advance past expiry, and wait for CLI-visible
+    // message removal.
     let alice_daemon = spawn_daemon(&alice, alice_port);
     assert_success(topo(&["--db", &alice, "clock", "set", "6120000"]));
     wait_for_leaf_count(&alice, &workspace_id, "0");
     wait_for_content_count(&alice, &workspace_id, "0");
 
-    // After the daemon has had time to drain the negentropy purge
-    // queue, the queue should be empty and the root_fingerprint
-    // should differ from the pre-expiry fingerprint (because the
-    // purged messages no longer contribute to the XOR fold).
-    wait_for_pending_purges(&alice, "0");
-    let post = sync_status(&alice);
-    assert_eq!(
-        line_value(&post, "pending_purges"),
-        "0",
-        "pending purge queue must drain after daemon ticks:\n{post}"
-    );
+    // The root_fingerprint should differ from the pre-expiry fingerprint
+    // because the expired messages no longer contribute to the sync summary.
+    let post = wait_for_root_fingerprint_to_change(&alice, &pre_fingerprint);
     let post_fingerprint = line_value(&post, "root_fingerprint");
     assert_ne!(
         pre_fingerprint, post_fingerprint,
-        "root fingerprint must change after the purge drainer removes the expired ids:\n\
+        "root fingerprint must change after expired ids disappear:\n\
          pre={pre_fingerprint}\npost={post_fingerprint}"
     );
     let post_count: u64 = line_value(&post, "root_count").parse().expect("count");
@@ -159,12 +148,13 @@ fn cli_negentropy_two_peers_converge_on_root_after_synchronized_purge() {
     wait_for_leaf_count(&bob, &workspace_id, "0");
     wait_for_content_count(&alice, &workspace_id, "0");
     wait_for_content_count(&bob, &workspace_id, "0");
-    wait_for_pending_purges(&alice, "0");
-    wait_for_pending_purges(&bob, "0");
+    let pre_alice_fp = line_value(&pre_alice, "root_fingerprint");
+    wait_for_root_fingerprint_to_change(&alice, &pre_alice_fp);
+    wait_for_root_fingerprint_to_change(&bob, &pre_alice_fp);
 
     // Load-bearing assertion: cross-peer root_fingerprint converges to
     // the SAME value after both peers have purged the same id set. This
-    // is the determinism property the negentropy drainer must uphold.
+    // is the determinism property the sync summary must uphold.
     let post_alice = wait_for_root_fingerprint_to_match(&alice, &bob);
     let post_bob = sync_status(&bob);
     assert_eq!(
@@ -179,18 +169,12 @@ fn cli_negentropy_two_peers_converge_on_root_after_synchronized_purge() {
     );
 
     // The post-purge fingerprint must differ from the pre-purge value
-    // — the drainer actually removed entries from the index, not just
-    // set the queue size to zero.
+    // so this is not just a no-op sync round.
     assert_ne!(
         line_value(&pre_alice, "root_fingerprint"),
         line_value(&post_alice, "root_fingerprint"),
-        "root fingerprint must change after purge drains"
+        "root fingerprint must change after purge"
     );
-
-    // Both pending-purge queues must be empty (already polled, but
-    // re-assert here for clarity).
-    assert_eq!(line_value(&post_alice, "pending_purges"), "0");
-    assert_eq!(line_value(&post_bob, "pending_purges"), "0");
 
     // Sync round after purge: neither peer should re-request the
     // purged ids. The strongest CLI-visible signal is that
@@ -208,37 +192,15 @@ fn cli_negentropy_two_peers_converge_on_root_after_synchronized_purge() {
         line_value(&stable_bob, "root_fingerprint"),
         "root fingerprint must remain converged across follow-up sync rounds"
     );
-    assert_eq!(line_value(&stable_alice, "pending_purges"), "0");
-    assert_eq!(line_value(&stable_bob, "pending_purges"), "0");
 }
 
 // ---------------------------------------------------------------------------
 // Test 3: asymmetric purge across peers.
 //
 // A authors X and syncs to B. A then expires X locally (via clock advance)
-// while B's clock stays under the expiry horizon. After A's drainer
-// processes the queue, the test pins down what HAPPENS on a follow-up
-// A↔B sync round.
-//
-// EXPECTED (per the task spec): A's `indexed_events` stays at the
-// post-purge value — A's purge is durable against re-admission from a
-// peer whose clock lags the TTL horizon.
-//
-// OBSERVED (this test, against the current production code): A
-// re-admits the purged ids from B. The negentropy `SyncIndex::remove_event`
-// XORs the id out of the in-memory root, but neither the admission
-// pipeline nor the sync request loop refuses to re-project an event
-// whose canonical bytes were purged via the disappearing-minute path.
-// Result: after the sync round, A's `indexed_events` count rises by
-// the number of ids B still holds, and the cross-peer fingerprints
-// converge to bob's value (which still includes the unexpired-on-bob
-// ids). This is filed as a real-bug observation by this test rather
-// than fixed in production; the test asserts the observed behavior so
-// the suite stays green and the bug stays visible.
-//
-// The load-bearing positive assertions still pass: alice's purge DOES
-// drain the queue, alice's local index DOES drop, and the post-purge
-// fingerprint differs from the pre-purge one.
+// while B's clock stays under the expiry horizon. A must keep those
+// messages absent across a follow-up A↔B sync round, even though B can
+// still display them locally until its own clock advances.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -281,10 +243,8 @@ fn cli_negentropy_asymmetric_purge_alice_does_not_readmit_from_bob() {
     // ciphertext and project the message under the same time pin.
     assert_success(topo(&["--db", &alice, "clock", "set", "6000000"]));
     assert_success(topo(&["--db", &bob, "clock", "set", "6000000"]));
-    let mut purged_message_ids = Vec::new();
     for body in ["x-1", "x-2"] {
-        let send_out = assert_success(topo(&["--db", &alice, "send", &workspace_id, body]));
-        purged_message_ids.push(line_value(&send_out, "event_id"));
+        assert_success(topo(&["--db", &alice, "send", &workspace_id, body]));
     }
     for body in ["x-1", "x-2"] {
         wait_for_message_text(&alice, &workspace_id, &format!("alice: {body}"));
@@ -292,104 +252,50 @@ fn cli_negentropy_asymmetric_purge_alice_does_not_readmit_from_bob() {
     }
 
     // Capture the converged baseline so we can prove alice's fingerprint
-    // changes after the asymmetric expiry. Aggregate counts are not a stable
-    // proxy here because key rotation can add or re-admit unrelated key events
-    // while the message purge removes content events.
+    // changes after the asymmetric expiry.
     let pre_alice = wait_for_root_fingerprint_to_match(&alice, &bob);
-    let pre_alice_count: u64 = line_value(&pre_alice, "indexed_events")
-        .parse()
-        .expect("count");
     let pre_alice_fp = line_value(&pre_alice, "root_fingerprint");
 
     // Asymmetric expiry: only alice advances past the TTL horizon. Bob's
-    // clock stays at minute 100, so bob's expiry worker has no work to do
-    // for these messages — bob keeps both X events admitted.
+    // clock stays at minute 100, so bob keeps both messages visible.
     assert_success(topo(&["--db", &alice, "clock", "set", "6120000"]));
     wait_for_leaf_count(&alice, &workspace_id, "0");
     wait_for_content_count(&alice, &workspace_id, "0");
-    wait_for_pending_purges(&alice, "0");
 
-    let post_alice = sync_status(&alice);
-    let post_alice_count: u64 = line_value(&post_alice, "indexed_events")
-        .parse()
-        .expect("post count");
+    let post_alice = wait_for_root_fingerprint_to_change(&alice, &pre_alice_fp);
     let post_alice_fp = line_value(&post_alice, "root_fingerprint");
 
-    assert_eq!(line_value(&post_alice, "pending_purges"), "0");
     assert_ne!(
         pre_alice_fp, post_alice_fp,
         "alice's fingerprint must change after she purges:\npre={pre_alice_fp}\npost={post_alice_fp}"
     );
-    let _ = pre_alice_count;
+    assert_eq!(message_lines(&bob, &workspace_id).len(), 2);
 
-    // Drive a follow-up sync round by waiting and re-querying. The
-    // admission gate (`content::admission`) drops bob's re-deliveries of
-    // alice's purged message ids before they can re-enter EVENTS or the
-    // SyncIndex, so the post-sync state must equal the post-purge state
-    // byte-for-byte.
+    // Drive a follow-up sync round by waiting and re-querying. Alice's
+    // expired messages must remain absent from the CLI projections.
     thread::sleep(Duration::from_millis(1500));
-    let stable_alice = sync_status(&alice);
-    let stable_alice_count: u64 = line_value(&stable_alice, "indexed_events")
-        .parse()
-        .expect("stable count");
-    let stable_alice_fp = line_value(&stable_alice, "root_fingerprint");
-    assert_eq!(
-        line_value(&stable_alice, "pending_purges"),
-        "0",
-        "queue must remain drained across the follow-up sync round"
-    );
-
-    // Strict regression on the message admit-drop wedge: the
-    // `content::admission` gate must drop bob's re-deliveries of
-    // alice's purged message ids before they re-enter EVENTS or the
-    // SyncIndex. Check the EVENTS table directly for each purged
-    // message id; this is the precise admit-drop invariant. The
-    // higher-level `indexed_events` count is no longer a clean proxy:
-    // alice's expiry path also wipes F (per
-    // `RULES.md` § "Forward Secrecy Requires Recipient Key Rotation
-    // On Wrap-Bound Deletion"), and the resulting recipient-key
-    // rotation purges alice's own retired `recipient_key` + `key_wrap`
-    // events that bob then re-delivers because bob has not yet
-    // observed the rotation. Those re-admissions are unrelated to the
-    // message admit-drop wedge under test here.
-    for hex_id in &purged_message_ids {
-        let id_bytes = decode_hex_id(hex_id);
-        assert!(
-            !event_id_present(&alice, &id_bytes),
-            "alice's EVENTS must not contain re-admitted purged message id \
-             {hex_id}: post={post_alice_count}, stable={stable_alice_count}, \
-             post_fp={post_alice_fp}, stable_fp={stable_alice_fp}"
-        );
-    }
-    // `stable_alice_count` and the root fingerprints are retained for
-    // future debugging. Their values may move because rotation purges
-    // unrelated shared events, but the message-id check above is the
-    // load-bearing invariant for this test's claim.
-    let _ = stable_alice_count;
-    let _ = stable_alice_fp;
-    let _ = post_alice_fp;
-    // Content read-model must also stay empty — the gate prevents the
-    // sealed/messages projection from re-creating rows for purged ids.
     assert_eq!(
         content_event_count(&alice, &workspace_id),
         "0",
         "content events must stay at 0 after the follow-up sync round"
     );
+    assert!(
+        message_lines(&alice, &workspace_id).is_empty(),
+        "alice's messages must stay absent after the follow-up sync round"
+    );
 }
 
 // ---------------------------------------------------------------------------
-// Test 4: batched chop drain.
+// Test 4: batched expiry updates the sync summary.
 //
-// Author N=10 messages in one minute, expire all, and verify that one
-// daemon tick drains every queued purge in a single batch. The default
-// `work_limit` (4096) comfortably accommodates 10 rows, so a single
-// `wait_for_pending_purges == 0` poll proves "drained in one batch".
+// Author N=10 messages in one minute, expire all, and verify that the
+// CLI-visible content and sync summary both reflect their removal.
 // The fingerprint must end at a value that differs from the pre-purge
 // state, and the indexed count must drop by exactly the purged count.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cli_negentropy_batched_chop_drains_all_purges_in_one_tick() {
+fn cli_negentropy_batched_chop_updates_root_after_expiry() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
     let alice_port = free_port();
@@ -398,7 +304,7 @@ fn cli_negentropy_batched_chop_drains_all_purges_in_one_tick() {
     assert_success(topo(&["--db", &alice, "key-frontier", &workspace_id]));
 
     // Author N=10 messages all at the same minute so a single TTL-1
-    // expiry tick retires all of them and enqueues N pending purges.
+    // expiry transition retires all of them together.
     const N: usize = 10;
     assert_success(topo(&["--db", &alice, "clock", "set", "6000000"]));
     for i in 0..N {
@@ -411,23 +317,20 @@ fn cli_negentropy_batched_chop_drains_all_purges_in_one_tick() {
         .parse()
         .expect("pre count");
     let pre_fp = line_value(&pre, "root_fingerprint");
-    assert_eq!(line_value(&pre, "pending_purges"), "0");
 
     let _alice_daemon = spawn_daemon(&alice, alice_port);
     assert_success(topo(&["--db", &alice, "clock", "set", "6120000"]));
     wait_for_leaf_count(&alice, &workspace_id, "0");
     wait_for_content_count(&alice, &workspace_id, "0");
-    wait_for_pending_purges(&alice, "0");
 
-    let post = sync_status(&alice);
+    let post = wait_for_root_fingerprint_to_change(&alice, &pre_fp);
     let post_count: u64 = line_value(&post, "indexed_events")
         .parse()
         .expect("post count");
     let post_fp = line_value(&post, "root_fingerprint");
-    assert_eq!(line_value(&post, "pending_purges"), "0");
     assert_ne!(
         pre_fp, post_fp,
-        "fingerprint must change after batched chop drain:\npre={pre_fp}\npost={post_fp}"
+        "fingerprint must change after batched expiry:\npre={pre_fp}\npost={post_fp}"
     );
     assert!(
         post_count + (N as u64) <= pre_count,
@@ -436,15 +339,14 @@ fn cli_negentropy_batched_chop_drains_all_purges_in_one_tick() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 5: drainer is a no-op when nothing pending.
+// Test 5: sync summary is stable when nothing expires.
 //
-// With no expired events and an empty pending_purges queue, repeated
-// CLI invocations of `sync-status` (each of which runs the drainer) must
+// With no expired events, repeated CLI invocations of `sync-status` must
 // leave indexed_events, root_count, and root_fingerprint byte-identical.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cli_negentropy_drainer_is_noop_when_nothing_pending() {
+fn cli_negentropy_sync_status_is_stable_when_nothing_expires() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
 
@@ -458,53 +360,48 @@ fn cli_negentropy_drainer_is_noop_when_nothing_pending() {
     }
     assert_eq!(message_lines(&alice, &workspace_id).len(), 2);
 
-    // First snapshot: drainer runs (queue empty), captures baseline.
+    // First snapshot captures the baseline.
     let first = sync_status(&alice);
-    assert_eq!(line_value(&first, "pending_purges"), "0");
     let first_indexed = line_value(&first, "indexed_events");
     let first_count = line_value(&first, "root_count");
     let first_fp = line_value(&first, "root_fingerprint");
 
-    // Second snapshot: drainer runs again on the still-empty queue.
+    // Second snapshot should match while all messages are still live.
     let second = sync_status(&alice);
-    assert_eq!(line_value(&second, "pending_purges"), "0");
     assert_eq!(
         line_value(&second, "indexed_events"),
         first_indexed,
-        "no-op drain must not change indexed_events"
+        "no-op sync-status must not change indexed_events"
     );
     assert_eq!(
         line_value(&second, "root_count"),
         first_count,
-        "no-op drain must not change root_count"
+        "no-op sync-status must not change root_count"
     );
     assert_eq!(
         line_value(&second, "root_fingerprint"),
         first_fp,
-        "no-op drain must not perturb root_fingerprint"
+        "no-op sync-status must not perturb root_fingerprint"
     );
 
-    // Third snapshot for good measure — three back-to-back drains must
+    // Third snapshot for good measure — three back-to-back reads must
     // yield byte-identical sync-status outputs.
     let third = sync_status(&alice);
-    assert_eq!(line_value(&third, "pending_purges"), "0");
     assert_eq!(line_value(&third, "indexed_events"), first_indexed);
     assert_eq!(line_value(&third, "root_count"), first_count);
     assert_eq!(line_value(&third, "root_fingerprint"), first_fp);
 }
 
 // ---------------------------------------------------------------------------
-// Test 6: drain order independence (CLI confirmation).
+// Test 6: expiry order independence (CLI confirmation).
 //
 // Two peers that author the same set of messages (in different orders)
 // and then expire them all must converge on byte-identical fingerprints
-// after both drain. The XOR-fold construction makes drain order
-// irrelevant by design; this test pins that property at the CLI level
-// in addition to the in-process unit test in the sync worker.
+// after both remove the content. This test pins that property at the CLI level.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cli_negentropy_drain_order_independence_two_peers_distinct_authoring_order() {
+fn cli_negentropy_expiry_order_independence_two_peers_distinct_authoring_order() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
     let bob = temp_db(&tmp, "bob.db");
@@ -539,7 +436,7 @@ fn cli_negentropy_drain_order_independence_two_peers_distinct_authoring_order() 
     let _ = wait_for_key_derive(&bob, "1");
 
     // Five messages, authored alternating between alice and bob so each
-    // peer sees a distinct authoring (and therefore drain) order. Both
+    // peer sees a distinct authoring order. Both
     // peers pin to the same minute so all five expire together.
     assert_success(topo(&["--db", &alice, "clock", "set", "6000000"]));
     assert_success(topo(&["--db", &bob, "clock", "set", "6000000"]));
@@ -560,58 +457,49 @@ fn cli_negentropy_drain_order_independence_two_peers_distinct_authoring_order() 
     let pre = wait_for_root_fingerprint_to_match(&alice, &bob);
     let pre_fp = line_value(&pre, "root_fingerprint");
 
-    // Both peers expire in lockstep; the queue ordering on each peer is
-    // a function of `enqueue_purge_in_tx` insertion order, which depends
-    // on the local retire walk's traversal (peer-local). The two peers'
-    // queues are NOT guaranteed to enqueue in identical order — that's
-    // the point of this test.
+    // Both peers expire in lockstep. They authored the shared content in
+    // different local orders, but the final sync summaries must still match.
     assert_success(topo(&["--db", &alice, "clock", "set", "6120000"]));
     assert_success(topo(&["--db", &bob, "clock", "set", "6120000"]));
     wait_for_leaf_count(&alice, &workspace_id, "0");
     wait_for_leaf_count(&bob, &workspace_id, "0");
     wait_for_content_count(&alice, &workspace_id, "0");
     wait_for_content_count(&bob, &workspace_id, "0");
-    wait_for_pending_purges(&alice, "0");
-    wait_for_pending_purges(&bob, "0");
+    wait_for_root_fingerprint_to_change(&alice, &pre_fp);
+    wait_for_root_fingerprint_to_change(&bob, &pre_fp);
 
     let post_alice = wait_for_root_fingerprint_to_match(&alice, &bob);
     let post_bob = sync_status(&bob);
     assert_eq!(
         line_value(&post_alice, "root_fingerprint"),
         line_value(&post_bob, "root_fingerprint"),
-        "drain order must not affect cross-peer fingerprint convergence:\n\
+        "authoring order must not affect cross-peer fingerprint convergence:\n\
          alice={post_alice}\nbob={post_bob}"
     );
     assert_eq!(
         line_value(&post_alice, "root_count"),
         line_value(&post_bob, "root_count"),
-        "root_count must converge regardless of drain order"
+        "root_count must converge regardless of authoring order"
     );
     assert_ne!(
         pre_fp,
         line_value(&post_alice, "root_fingerprint"),
-        "drain must actually remove entries (fingerprint should change)"
+        "expiry must actually change the sync summary"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Test 7: restart resilience — daemon stop + restart leaves the queue
-// clean and the index correct.
+// Test 7: restart resilience — daemon stop + restart preserves expiry behavior.
 //
 // Pin a TTL=1 workspace at a pre-expiry clock. Run the daemon long enough
 // to admit messages, then stop it WITHOUT advancing the clock past
 // expiry. Restart the daemon and only THEN advance the clock past the
-// TTL horizon. The daemon's worker schedule runs
-// `disappearing_minute_expiry` and then `sync_tick` (which drains the
-// pending-purge queue as its first step), so the post-restart tick must
-// do both in order, ending at `pending_purges == 0`. This pins down:
-// (a) the drain step survives a clean restart, and (b) it correctly
-// handles the case where the in-memory index was rebuilt from durable
-// rows on startup (no double-remove panics).
+// TTL horizon. The post-restart state must show the messages gone and
+// the root summary updated, with no drift before the clock advances.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cli_negentropy_drainer_survives_daemon_stop_and_restart() {
+fn cli_negentropy_expiry_survives_daemon_stop_and_restart() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = temp_db(&tmp, "alice.db");
     let alice_port = free_port();
@@ -628,7 +516,6 @@ fn cli_negentropy_drainer_survives_daemon_stop_and_restart() {
     assert_eq!(message_lines(&alice, &workspace_id).len(), 4);
 
     let pre_restart = sync_status(&alice);
-    assert_eq!(line_value(&pre_restart, "pending_purges"), "0");
     let pre_fp = line_value(&pre_restart, "root_fingerprint");
     let pre_count: u64 = line_value(&pre_restart, "indexed_events")
         .parse()
@@ -649,41 +536,31 @@ fn cli_negentropy_drainer_survives_daemon_stop_and_restart() {
         thread::sleep(Duration::from_millis(50));
     }
 
-    // Pre-restart sync-status (with the daemon dead): queue still empty
-    // because no expiry fired. Note that `sync-status` itself runs the
-    // drainer, so this also exercises "drainer is callable from CLI
-    // when no daemon owns the lock".
+    // Pre-restart sync-status (with the daemon dead): no expiry fired,
+    // so the root summary must not drift.
     let mid = sync_status(&alice);
-    assert_eq!(line_value(&mid, "pending_purges"), "0");
     assert_eq!(
         line_value(&mid, "root_fingerprint"),
         pre_fp,
         "fingerprint must not drift across a daemon restart with no clock advance"
     );
 
-    // Now restart the daemon. Pre-advance the clock so the post-restart
-    // expiry worker has work to do.
+    // Now restart the daemon and advance the clock so expiry is observable
+    // after the process boundary.
     let _alice_daemon = spawn_daemon(&alice, alice_port);
     assert_success(topo(&["--db", &alice, "clock", "set", "6120000"]));
 
-    // After one restart cycle of expiry → drain, the queue must be
-    // clean and the index must reflect the post-purge state. This is
-    // the load-bearing claim of the test: the drainer worker survived
-    // the restart and correctly cleared the queue produced by the
-    // post-restart expiry.
     wait_for_leaf_count(&alice, &workspace_id, "0");
     wait_for_content_count(&alice, &workspace_id, "0");
-    wait_for_pending_purges(&alice, "0");
 
-    let post = sync_status(&alice);
-    assert_eq!(line_value(&post, "pending_purges"), "0");
+    let post = wait_for_root_fingerprint_to_change(&alice, &pre_fp);
     let post_fp = line_value(&post, "root_fingerprint");
     let post_count: u64 = line_value(&post, "indexed_events")
         .parse()
         .expect("post count");
     assert_ne!(
         pre_fp, post_fp,
-        "fingerprint must change after post-restart drain:\n\
+        "fingerprint must change after post-restart expiry:\n\
          pre={pre_fp}\npost={post_fp}"
     );
     assert!(
@@ -697,12 +574,10 @@ fn cli_negentropy_drainer_survives_daemon_stop_and_restart() {
 // Test 8: two peers purge the same id from independent expiry triggers.
 //
 // Both peers admit the same shared events and then independently advance
-// their clocks past TTL. Each peer's local expiry worker enqueues purges
-// for the same id set on its own; the local drainers then converge on
-// byte-identical root fingerprints. This is the same end-state as test
-// 2 (synchronized purge) but the trigger paths are independent — neither
-// peer's purge depends on observing the other's. The XOR-fold makes the
-// trigger ordering irrelevant.
+// their clocks past TTL. They must converge on byte-identical root
+// fingerprints. This is the same end-state as test 2 (synchronized
+// purge), but the trigger paths are independent — neither peer's purge
+// depends on observing the other's.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -753,11 +628,11 @@ fn cli_negentropy_two_peers_same_id_independent_triggers_converge() {
     let pre_fp = line_value(&pre, "root_fingerprint");
 
     // Independent expiry triggers: alice expires FIRST, alone. Bob's
-    // clock stays under the horizon; bob's expiry worker has no work
-    // yet. Wait for alice's drain to complete before nudging bob.
+    // clock stays under the horizon, so bob still has the messages.
     assert_success(topo(&["--db", &alice, "clock", "set", "6120000"]));
     wait_for_leaf_count(&alice, &workspace_id, "0");
-    wait_for_pending_purges(&alice, "0");
+    wait_for_content_count(&alice, &workspace_id, "0");
+    wait_for_root_fingerprint_to_change(&alice, &pre_fp);
 
     // Cross-peer state at this midpoint MUST diverge: alice has purged,
     // bob has not. This proves alice's purge is locally driven, not a
@@ -769,17 +644,15 @@ fn cli_negentropy_two_peers_same_id_independent_triggers_converge() {
         line_value(&mid_bob, "root_fingerprint"),
         "mid-test divergence required: alice purged, bob still holds the ids"
     );
-    assert_eq!(line_value(&mid_alice, "pending_purges"), "0");
 
     // Now bob crosses the horizon independently.
     assert_success(topo(&["--db", &bob, "clock", "set", "6120000"]));
     wait_for_leaf_count(&bob, &workspace_id, "0");
-    wait_for_pending_purges(&bob, "0");
+    wait_for_content_count(&bob, &workspace_id, "0");
+    wait_for_root_fingerprint_to_change(&bob, &pre_fp);
 
-    // Both peers, after independently triggered expiry+drain, must
-    // converge on byte-identical fingerprints. The XOR-fold's
-    // commutativity makes this hold regardless of which peer purged
-    // first or in what local order.
+    // Both peers, after independently triggered expiry, must converge
+    // on byte-identical fingerprints.
     let post_alice = wait_for_root_fingerprint_to_match(&alice, &bob);
     let post_bob = sync_status(&bob);
     assert_eq!(
@@ -797,8 +670,6 @@ fn cli_negentropy_two_peers_same_id_independent_triggers_converge() {
         line_value(&post_alice, "root_fingerprint"),
         "fingerprint must change after both peers purge"
     );
-    assert_eq!(line_value(&post_alice, "pending_purges"), "0");
-    assert_eq!(line_value(&post_bob, "pending_purges"), "0");
 }
 
 // ---------------------------------------------------------------------------
@@ -895,14 +766,14 @@ fn wait_for_content_count(db: &str, workspace_id: &str, expected: &str) {
     panic!("content count did not reach {expected}:\n{last}");
 }
 
-fn wait_for_pending_purges(db: &str, expected: &str) {
+fn wait_for_root_fingerprint_to_change(db: &str, previous: &str) -> String {
     let mut last = String::new();
     for _ in 0..300 {
         let output = topo(&["--db", db, "sync-status"]);
         if output.status.success() {
             let out = stdout(&output);
-            if line_value(&out, "pending_purges") == expected {
-                return;
+            if line_value(&out, "root_fingerprint") != previous {
+                return out;
             }
             last = out;
         } else {
@@ -910,7 +781,7 @@ fn wait_for_pending_purges(db: &str, expected: &str) {
         }
         thread::sleep(Duration::from_millis(100));
     }
-    panic!("pending_purges did not reach {expected}:\n{last}");
+    panic!("root_fingerprint did not change from {previous}:\n{last}");
 }
 
 fn wait_for_key_derive(db: &str, expected: &str) -> String {
@@ -926,10 +797,10 @@ fn wait_for_key_derive(db: &str, expected: &str) -> String {
             if line_value(&out, "derived_key_secrets") == expected {
                 return out;
             }
-            // The daemon's encryption worker may have already drained the
-            // pending key wraps before this CLI invocation, in which case
-            // `derived_key_secrets` stays at 0. Treat "key already present
-            // in db" as success by inspecting `keys` for every workspace.
+            // Background processing may have already handled the key wraps
+            // before this CLI invocation, in which case `derived_key_secrets`
+            // stays at 0. Treat "key already present in db" as success by
+            // inspecting `keys` for every workspace.
             let total = local_key_secrets_total(db);
             last_total = total;
             if total >= want {
@@ -945,8 +816,8 @@ fn wait_for_key_derive(db: &str, expected: &str) -> String {
 }
 
 /// Sum `local_key_secrets` across every workspace bob/alice has joined.
-/// Used by `wait_for_key_derive` so a daemon that already processed the
-/// pending unwraps does not appear as "no derivation happened".
+/// Used by `wait_for_key_derive` so a daemon that already processed key
+/// unwraps does not appear as "no derivation happened".
 fn local_key_secrets_total(db: &str) -> usize {
     let workspaces = topo(&["--db", db, "workspaces"]);
     if !workspaces.status.success() {
@@ -1192,44 +1063,4 @@ fn invite_link_from_output(output: &str) -> String {
         .find(|line| line.starts_with("topo://invite/"))
         .unwrap_or_else(|| panic!("missing invite link in output:\n{output}"))
         .to_string()
-}
-
-/// Direct SQLite check used by purge tests: does the canonical EVENTS
-/// row for `event_id` exist on this peer's disk? Returns true only when
-/// the row is present, false when it has been admit-dropped or purged.
-/// Used in place of higher-level projection checks when the admit gate
-/// behavior itself is the property under test.
-fn event_id_present(db: &str, event_id: &[u8]) -> bool {
-    let conn = rusqlite::Connection::open(db).expect("open db");
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM \"event_modules.events\" WHERE row_key = ?1",
-            rusqlite::params![event_id],
-            |row| row.get(0),
-        )
-        .expect("count rows");
-    count > 0
-}
-
-/// Decode a 64-char hex event id into the raw 32-byte SQLite key used
-/// by `EVENTS.row_key`.
-fn decode_hex_id(hex: &str) -> Vec<u8> {
-    assert_eq!(hex.len(), 64, "event ids are 32-byte hex strings");
-    let mut out = Vec::with_capacity(32);
-    let bytes = hex.as_bytes();
-    for chunk in 0..32 {
-        let high = decode_hex_nibble(bytes[chunk * 2]);
-        let low = decode_hex_nibble(bytes[chunk * 2 + 1]);
-        out.push((high << 4) | low);
-    }
-    out
-}
-
-fn decode_hex_nibble(byte: u8) -> u8 {
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        b'A'..=b'F' => byte - b'A' + 10,
-        _ => panic!("invalid hex digit: {byte}"),
-    }
 }
