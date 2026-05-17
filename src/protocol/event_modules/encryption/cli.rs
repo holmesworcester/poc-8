@@ -8,7 +8,7 @@
 
 use std::io::{self, BufRead};
 
-use crate::core::cli::{CliArgs, CliCommand, CliOutput};
+use crate::core::cli::{decode_hex_32, encode_hex, encode_hex_32, CliArgs, CliCommand, CliOutput};
 use crate::core::logical_clock;
 use crate::core::store::Store;
 use crate::protocol::cli::Context;
@@ -962,13 +962,7 @@ fn run_chop_now_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliO
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(DIGITS[(byte >> 4) as usize] as char);
-        out.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    out
+    encode_hex(bytes)
 }
 
 fn load_recipient_key(
@@ -1008,24 +1002,7 @@ fn next_timestamp(store: &Store) -> Result<u64, String> {
 }
 
 fn parse_hex_id(value: &str, usage: &str) -> Result<EventId, String> {
-    if value.len() != 64 {
-        return Err(usage.to_string());
-    }
-    let mut out = [0; 32];
-    let bytes = value.as_bytes();
-    for idx in 0..32 {
-        out[idx] = (hex_value(bytes[idx * 2], usage)? << 4) | hex_value(bytes[idx * 2 + 1], usage)?;
-    }
-    Ok(out)
-}
-
-fn hex_value(byte: u8, usage: &str) -> Result<u8, String> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(usage.to_string()),
-    }
+    decode_hex_32(value).map_err(|_| usage.to_string())
 }
 
 fn parse_u64(value: &str, usage: &str) -> Result<u64, String> {
@@ -1033,13 +1010,7 @@ fn parse_u64(value: &str, usage: &str) -> Result<u64, String> {
 }
 
 fn hex_id(id: EventId) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(64);
-    for byte in id {
-        out.push(DIGITS[(byte >> 4) as usize] as char);
-        out.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    out
+    encode_hex_32(&id)
 }
 
 fn optional_hex_id(id: Option<EventId>) -> String {

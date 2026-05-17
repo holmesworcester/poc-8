@@ -5,9 +5,10 @@
 //! in commands or the identity root CLI where their cross-leaf dependencies are
 //! visible.
 
-use crate::core::cli::{CliArgs, CliCommand, CliOutput};
+use crate::core::cli::{
+    decode_hex_32 as core_decode_hex_32, encode_hex_32, CliArgs, CliCommand, CliOutput,
+};
 use crate::protocol::cli::Context;
-use crate::protocol::event_modules::identity::invite;
 use crate::protocol::event_modules::types::EventId;
 
 const USERS_USAGE: &str = "users WORKSPACE_ID_HEX";
@@ -37,26 +38,9 @@ fn run_users_command(context: &mut Context, args: CliArgs<'_>) -> Result<CliOutp
 }
 
 fn encode_hex(bytes: &[u8; 32]) -> String {
-    invite::commands::encode_hex(bytes)
+    encode_hex_32(bytes)
 }
 
 fn decode_hex_32(value: &str) -> Result<EventId, String> {
-    if value.len() != 64 {
-        return Err(USERS_USAGE.to_string());
-    }
-    let mut out = [0; 32];
-    let bytes = value.as_bytes();
-    for idx in 0..32 {
-        out[idx] = (hex_value(bytes[idx * 2])? << 4) | hex_value(bytes[idx * 2 + 1])?;
-    }
-    Ok(out)
-}
-
-fn hex_value(byte: u8) -> Result<u8, String> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(USERS_USAGE.to_string()),
-    }
+    core_decode_hex_32(value).map_err(|_| USERS_USAGE.to_string())
 }

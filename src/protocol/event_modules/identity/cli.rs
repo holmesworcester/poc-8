@@ -10,7 +10,9 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::core::cli::{CliArgs, CliCommand, CliOutput};
+use crate::core::cli::{
+    decode_hex_32 as core_decode_hex_32, encode_hex_32, CliArgs, CliCommand, CliOutput,
+};
 use crate::core::logical_clock;
 use crate::core::store::Store;
 use crate::protocol::cli::Context;
@@ -1083,26 +1085,9 @@ fn print_line_now(line: &str) -> Result<(), String> {
 }
 
 fn encode_hex(bytes: &[u8; 32]) -> String {
-    invite::commands::encode_hex(bytes)
+    encode_hex_32(bytes)
 }
 
 fn decode_hex_32(value: &str, usage: &str) -> Result<[u8; 32], String> {
-    if value.len() != 64 {
-        return Err(usage.to_string());
-    }
-    let mut out = [0; 32];
-    let bytes = value.as_bytes();
-    for idx in 0..32 {
-        out[idx] = (hex_value(bytes[idx * 2], usage)? << 4) | hex_value(bytes[idx * 2 + 1], usage)?;
-    }
-    Ok(out)
-}
-
-fn hex_value(byte: u8, usage: &str) -> Result<u8, String> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(usage.to_string()),
-    }
+    core_decode_hex_32(value).map_err(|_| usage.to_string())
 }

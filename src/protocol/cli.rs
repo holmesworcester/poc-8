@@ -13,7 +13,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::core::cli::{CliArgs, CliCommand, CliOutput};
+use crate::core::cli::{encode_hex, CliArgs, CliCommand, CliOutput};
 use crate::core::logical_clock;
 use crate::core::network_queues::InboundNetworkRow;
 use crate::core::store::Store;
@@ -304,11 +304,7 @@ fn run_sync_status_command(context: &mut Context, args: CliArgs<'_>) -> Result<C
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
+    encode_hex(bytes)
 }
 
 /// Manually invoke the sync worker's pending-purge drain step.
