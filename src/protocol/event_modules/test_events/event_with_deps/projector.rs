@@ -64,6 +64,7 @@ mod tests {
     fn rejects_malformed_bytes() {
         let err = project(&[codec::TYPE_EVENT_WITH_DEPS]).expect_err("reject");
 
-        assert!(err.contains("length mismatch"));
+        assert!(err.contains("expected"));
+        assert!(err.contains("bytes"));
     }
 }

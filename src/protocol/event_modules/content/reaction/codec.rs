@@ -9,7 +9,7 @@ use crate::core::crypto::{
     self, Ed25519PrivateKey, ED25519_SIGNATURE_BYTES, XCHACHA20_POLY1305_NONCE_BYTES,
 };
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire::Writer;
 use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::{
@@ -37,6 +37,17 @@ pub const SCHEMA: WireSchema = WireSchema::new(
 );
 
 pub const REACTION_WIRE_SIZE: usize = SCHEMA.wire_size();
+
+pub const SIGNED_SCHEMA: WireSchema = WireSchema::new(
+    "signed reaction",
+    TYPE_SIGNED_REACTION,
+    &[
+        Field::id("signer_endpoint_shared_id"),
+        Field::id("signer_public_key"),
+        Field::bytes("payload", REACTION_WIRE_SIZE),
+        Field::bytes("signature", ED25519_SIGNATURE_BYTES),
+    ],
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReactionMetadata {
@@ -94,29 +105,22 @@ pub fn sign(
 }
 
 pub fn encode_signed(event: &SignedReactionEnvelope) -> Vec<u8> {
-    let mut out = Writer::with_capacity(signing_len(event.payload.len()) + ED25519_SIGNATURE_BYTES);
-    write_signing_fields(&mut out, event);
-    out.raw(&event.signature);
-    out.finish()
+    SIGNED_SCHEMA
+        .encoder()
+        .id(&event.signer_endpoint_shared_id)
+        .id(&event.signer_public_key)
+        .bytes(&event.payload)
+        .bytes(&event.signature)
+        .finish()
 }
 
 pub fn decode_signed(bytes: &[u8]) -> Result<SignedReactionEnvelope, String> {
-    let mut reader = Reader::new(bytes, "signed reaction envelope");
-    let tag = reader.u8()?;
-    if tag != TYPE_SIGNED_REACTION {
-        return Err("expected signed reaction envelope".to_string());
-    }
-    let signer_endpoint_shared_id = reader.id()?;
-    let signer_public_key = reader.id()?;
-    let payload = reader.bytes(REACTION_WIRE_SIZE)?;
-    let signature_bytes = reader.bytes(ED25519_SIGNATURE_BYTES)?;
-    reader.finish()?;
-
-    let signature = fixed_signature(signature_bytes)?;
+    let v = SIGNED_SCHEMA.parse(bytes)?;
+    let signature = fixed_signature(v.raw("signature")?.to_vec())?;
     let event = SignedReactionEnvelope {
-        signer_endpoint_shared_id,
-        signer_public_key,
-        payload,
+        signer_endpoint_shared_id: v.id("signer_endpoint_shared_id")?,
+        signer_public_key: v.id("signer_public_key")?,
+        payload: v.raw("payload")?.to_vec(),
         signature,
     };
     validate_signed_payload(&event)?;
@@ -131,9 +135,12 @@ pub fn decode_signed(bytes: &[u8]) -> Result<SignedReactionEnvelope, String> {
 }
 
 pub fn signing_bytes(event: &SignedReactionEnvelope) -> Vec<u8> {
-    let mut out = Writer::with_capacity(signing_len(event.payload.len()));
-    write_signing_fields(&mut out, event);
-    out.finish()
+    SIGNED_SCHEMA
+        .encoder()
+        .id(&event.signer_endpoint_shared_id)
+        .id(&event.signer_public_key)
+        .bytes(&event.payload)
+        .finish_without_trailing_fields(1)
 }
 
 pub fn signed_record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
@@ -157,27 +164,14 @@ pub fn signed_record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
 }
 
 fn metadata(bytes: &[u8]) -> Result<ReactionMetadata, String> {
-    let mut reader = Reader::new(bytes, "reaction event");
-    let tag = reader.u8()?;
-    if tag != TYPE_REACTION {
-        return Err("expected reaction event".to_string());
-    }
-    let workspace_id = reader.id()?;
-    let created_at_ms = reader.u64()?;
-    let target_message_id = reader.id()?;
-    let author_user_id = reader.id()?;
-    let removal_frontier_id = reader.id()?;
-    let local_history_node_secret_id = reader.id()?;
-    let _nonce = reader.bytes(XCHACHA20_POLY1305_NONCE_BYTES)?;
-    let _ciphertext = reader.bytes(REACTION_CIPHERTEXT_BYTES)?;
-    reader.finish()?;
+    let v = SCHEMA.parse(bytes)?;
     let metadata = ReactionMetadata {
-        workspace_id,
-        created_at_ms,
-        target_message_id,
-        author_user_id,
-        removal_frontier_id,
-        local_history_node_secret_id,
+        workspace_id: v.id("workspace_id")?,
+        created_at_ms: v.u64("created_at_ms")?,
+        target_message_id: v.id("target_message_id")?,
+        author_user_id: v.id("author_user_id")?,
+        removal_frontier_id: v.id("removal_frontier_id")?,
+        local_history_node_secret_id: v.id("local_history_node_secret_id")?,
     };
     validate_id("reaction workspace", &metadata.workspace_id)?;
     validate_id("reaction target_message_id", &metadata.target_message_id)?;
@@ -215,17 +209,6 @@ fn validate_signed_payload(event: &SignedReactionEnvelope) -> Result<(), String>
         return Err("signed reaction payload is not a reaction event".to_string());
     }
     metadata(&event.payload).map(|_| ())
-}
-
-fn write_signing_fields(out: &mut Writer, event: &SignedReactionEnvelope) {
-    out.u8(TYPE_SIGNED_REACTION);
-    out.id(&event.signer_endpoint_shared_id);
-    out.id(&event.signer_public_key);
-    out.raw(&event.payload);
-}
-
-fn signing_len(payload_len: usize) -> usize {
-    1 + 32 + 32 + payload_len
 }
 
 fn fixed_signature(bytes: Vec<u8>) -> Result<[u8; ED25519_SIGNATURE_BYTES], String> {

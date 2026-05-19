@@ -8,7 +8,6 @@
 
 use crate::core::crypto::{self, Ed25519PrivateKey, ED25519_SIGNATURE_BYTES};
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
 use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::{FileDeletionEvent, SignedFileDeletionEnvelope};
@@ -28,6 +27,17 @@ pub const SCHEMA: WireSchema = WireSchema::new(
 );
 
 pub const FILE_DELETION_WIRE_SIZE: usize = SCHEMA.wire_size();
+
+pub const SIGNED_SCHEMA: WireSchema = WireSchema::new(
+    "signed file_deletion",
+    TYPE_SIGNED_FILE_DELETION,
+    &[
+        Field::id("signer_endpoint_shared_id"),
+        Field::id("signer_public_key"),
+        Field::bytes("payload", FILE_DELETION_WIRE_SIZE),
+        Field::bytes("signature", ED25519_SIGNATURE_BYTES),
+    ],
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DeletionMetadata {
@@ -73,29 +83,22 @@ pub fn sign(
 }
 
 pub fn encode_signed(event: &SignedFileDeletionEnvelope) -> Vec<u8> {
-    let mut out = Writer::with_capacity(signing_len(event.payload.len()) + ED25519_SIGNATURE_BYTES);
-    write_signing_fields(&mut out, event);
-    out.raw(&event.signature);
-    out.finish()
+    SIGNED_SCHEMA
+        .encoder()
+        .id(&event.signer_endpoint_shared_id)
+        .id(&event.signer_public_key)
+        .bytes(&event.payload)
+        .bytes(&event.signature)
+        .finish()
 }
 
 pub fn decode_signed(bytes: &[u8]) -> Result<SignedFileDeletionEnvelope, String> {
-    let mut reader = Reader::new(bytes, "signed file deletion envelope");
-    let tag = reader.u8()?;
-    if tag != TYPE_SIGNED_FILE_DELETION {
-        return Err("expected signed file deletion envelope".to_string());
-    }
-    let signer_endpoint_shared_id = reader.id()?;
-    let signer_public_key = reader.id()?;
-    let payload = reader.bytes(FILE_DELETION_WIRE_SIZE)?;
-    let signature_bytes = reader.bytes(ED25519_SIGNATURE_BYTES)?;
-    reader.finish()?;
-
-    let signature = fixed_signature(signature_bytes)?;
+    let v = SIGNED_SCHEMA.parse(bytes)?;
+    let signature = fixed_signature(v.raw("signature")?.to_vec())?;
     let event = SignedFileDeletionEnvelope {
-        signer_endpoint_shared_id,
-        signer_public_key,
-        payload,
+        signer_endpoint_shared_id: v.id("signer_endpoint_shared_id")?,
+        signer_public_key: v.id("signer_public_key")?,
+        payload: v.raw("payload")?.to_vec(),
         signature,
     };
     validate_signed_payload(&event)?;
@@ -110,9 +113,12 @@ pub fn decode_signed(bytes: &[u8]) -> Result<SignedFileDeletionEnvelope, String>
 }
 
 pub fn signing_bytes(event: &SignedFileDeletionEnvelope) -> Vec<u8> {
-    let mut out = Writer::with_capacity(signing_len(event.payload.len()));
-    write_signing_fields(&mut out, event);
-    out.finish()
+    SIGNED_SCHEMA
+        .encoder()
+        .id(&event.signer_endpoint_shared_id)
+        .id(&event.signer_public_key)
+        .bytes(&event.payload)
+        .finish_without_trailing_fields(1)
 }
 
 pub fn signed_record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
@@ -137,21 +143,12 @@ pub fn signed_record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
 }
 
 fn metadata(bytes: &[u8]) -> Result<DeletionMetadata, String> {
-    let mut reader = Reader::new(bytes, "file deletion event");
-    let tag = reader.u8()?;
-    if tag != TYPE_FILE_DELETION {
-        return Err("expected file deletion event".to_string());
-    }
-    let workspace_id = reader.id()?;
-    let created_at_ms = reader.u64()?;
-    let target_file_event_id = reader.id()?;
-    let author_user_id = reader.id()?;
-    reader.finish()?;
+    let event = decode(bytes)?;
     Ok(DeletionMetadata {
-        workspace_id,
-        created_at_ms,
-        target_file_event_id,
-        author_user_id,
+        workspace_id: event.workspace_id,
+        created_at_ms: event.created_at_ms,
+        target_file_event_id: event.target_file_event_id,
+        author_user_id: event.author_user_id,
     })
 }
 
@@ -163,17 +160,6 @@ fn validate_signed_payload(event: &SignedFileDeletionEnvelope) -> Result<(), Str
         return Err("signed file deletion payload is not a deletion event".to_string());
     }
     metadata(&event.payload).map(|_| ())
-}
-
-fn write_signing_fields(out: &mut Writer, event: &SignedFileDeletionEnvelope) {
-    out.u8(TYPE_SIGNED_FILE_DELETION);
-    out.id(&event.signer_endpoint_shared_id);
-    out.id(&event.signer_public_key);
-    out.raw(&event.payload);
-}
-
-fn signing_len(payload_len: usize) -> usize {
-    1 + 32 + 32 + payload_len
 }
 
 fn fixed_signature(bytes: Vec<u8>) -> Result<[u8; ED25519_SIGNATURE_BYTES], String> {

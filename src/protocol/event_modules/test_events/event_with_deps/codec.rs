@@ -6,55 +6,72 @@
 //! local-only event that stores canonical shared event bytes for later replay.
 
 use crate::protocol::event_modules::types::{EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::{EventWithDeps, StagedEventWithDeps, MAX_DEPS, PAYLOAD_BYTES};
 
 pub const TYPE_EVENT_WITH_DEPS: u8 = 2;
 pub const TYPE_STAGED_EVENT_WITH_DEPS: u8 = 3;
-pub const ENCODED_BYTES: usize = 1 + 8 + 1 + (MAX_DEPS * 32) + PAYLOAD_BYTES;
-pub const STAGED_ENCODED_BYTES: usize = 1 + 8 + ENCODED_BYTES;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "event_with_deps",
+    TYPE_EVENT_WITH_DEPS,
+    &[
+        Field::u64("timestamp"),
+        Field::u8("dependency_count"),
+        Field::bytes("dependency_slots", MAX_DEPS * 32),
+        Field::bytes("payload", PAYLOAD_BYTES),
+    ],
+);
+
+pub const STAGED_SCHEMA: WireSchema = WireSchema::new(
+    "staged event_with_deps",
+    TYPE_STAGED_EVENT_WITH_DEPS,
+    &[
+        Field::u64("index"),
+        Field::bytes("inner_bytes", SCHEMA.wire_size()),
+    ],
+);
+
+pub const ENCODED_BYTES: usize = SCHEMA.wire_size();
+pub const STAGED_ENCODED_BYTES: usize = STAGED_SCHEMA.wire_size();
 
 pub fn encode(event: &EventWithDeps) -> Vec<u8> {
     assert!(
         event.dependencies.len() <= MAX_DEPS,
         "event_with_deps dependencies exceed fixed field count"
     );
-    let mut out = Writer::with_capacity(ENCODED_BYTES);
-    out.u8(TYPE_EVENT_WITH_DEPS);
-    out.u64(event.timestamp);
-    out.u8(event.dependencies.len() as u8);
+    let mut dependency_slots = vec![0u8; MAX_DEPS * 32];
     for idx in 0..MAX_DEPS {
         if let Some(dep) = event.dependencies.get(idx) {
-            out.id(dep);
-        } else {
-            out.id(&[0; 32]);
+            dependency_slots[idx * 32..(idx + 1) * 32].copy_from_slice(dep);
         }
     }
-    out.raw(&event.payload);
-    out.finish()
+    SCHEMA
+        .encoder()
+        .u64(event.timestamp)
+        .u8(event.dependencies.len() as u8)
+        .bytes(&dependency_slots)
+        .bytes(&event.payload)
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<EventWithDeps, String> {
     // Unused dependency slots must be zero. This prevents two encodings of the
     // same semantic dependency set from producing different event ids.
-    if bytes.len() != ENCODED_BYTES {
-        return Err("event_with_deps length mismatch".to_string());
-    }
-    let mut reader = Reader::new(bytes, "event_with_deps");
-    let tag = reader.u8()?;
-    if tag != TYPE_EVENT_WITH_DEPS {
-        return Err("unknown event type".to_string());
-    }
-    let timestamp = reader.u64()?;
-    let dep_count = reader.u8()? as usize;
+    let v = SCHEMA.parse(bytes)?;
+    let timestamp = v.u64("timestamp")?;
+    let dep_count = v.u8("dependency_count")? as usize;
     if dep_count > MAX_DEPS {
         return Err("event_with_deps dependency count exceeds fixed fields".to_string());
     }
 
     let mut dependencies = Vec::with_capacity(dep_count);
+    let dependency_slots = v.raw("dependency_slots")?;
     for idx in 0..MAX_DEPS {
-        let dep = reader.id()?;
+        let dep: [u8; 32] = dependency_slots[idx * 32..(idx + 1) * 32]
+            .try_into()
+            .map_err(|_| "event_with_deps dependency slot is malformed".to_string())?;
         if idx < dep_count {
             dependencies.push(dep);
         } else if dep != [0; 32] {
@@ -62,10 +79,8 @@ pub fn decode(bytes: &[u8]) -> Result<EventWithDeps, String> {
         }
     }
 
-    let payload = reader.bytes(PAYLOAD_BYTES)?;
-    reader.finish()?;
     let mut fixed_payload = [0; PAYLOAD_BYTES];
-    fixed_payload.copy_from_slice(&payload);
+    fixed_payload.copy_from_slice(v.raw("payload")?);
 
     Ok(EventWithDeps {
         timestamp,
@@ -80,25 +95,17 @@ pub fn encode_staged(event: &StagedEventWithDeps) -> Vec<u8> {
         ENCODED_BYTES,
         "staged event_with_deps bytes must be fixed width"
     );
-    let mut out = Writer::with_capacity(STAGED_ENCODED_BYTES);
-    out.u8(TYPE_STAGED_EVENT_WITH_DEPS);
-    out.u64(event.index);
-    out.raw(&event.inner_bytes);
-    out.finish()
+    STAGED_SCHEMA
+        .encoder()
+        .u64(event.index)
+        .bytes(&event.inner_bytes)
+        .finish()
 }
 
 pub fn decode_staged(bytes: &[u8]) -> Result<StagedEventWithDeps, String> {
-    if bytes.len() != STAGED_ENCODED_BYTES {
-        return Err("staged event_with_deps length mismatch".to_string());
-    }
-    let mut reader = Reader::new(bytes, "staged event_with_deps");
-    let tag = reader.u8()?;
-    if tag != TYPE_STAGED_EVENT_WITH_DEPS {
-        return Err("unknown staged event_with_deps type".to_string());
-    }
-    let index = reader.u64()?;
-    let inner_bytes = reader.bytes(ENCODED_BYTES)?;
-    reader.finish()?;
+    let v = STAGED_SCHEMA.parse(bytes)?;
+    let index = v.u64("index")?;
+    let inner_bytes = v.raw("inner_bytes")?.to_vec();
     record_from_bytes(inner_bytes.clone())?;
     Ok(StagedEventWithDeps { index, inner_bytes })
 }

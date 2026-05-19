@@ -9,7 +9,6 @@
 
 use crate::core::crypto::{self, Ed25519PrivateKey, ED25519_SIGNATURE_BYTES};
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
 use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::{
@@ -34,6 +33,17 @@ pub const SCHEMA: WireSchema = WireSchema::new(
 );
 
 pub const REMOVAL_FRONTIER_WIRE_SIZE: usize = SCHEMA.wire_size();
+
+pub const SIGNED_SCHEMA: WireSchema = WireSchema::new(
+    "signed removal_frontier",
+    TYPE_SIGNED_REMOVAL_FRONTIER,
+    &[
+        Field::id("signer_endpoint_shared_id"),
+        Field::id("signer_public_key"),
+        Field::bytes("payload", REMOVAL_FRONTIER_WIRE_SIZE),
+        Field::bytes("signature", ED25519_SIGNATURE_BYTES),
+    ],
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RemovalFrontierMetadata {
@@ -104,29 +114,22 @@ pub fn sign(
 }
 
 pub fn encode_signed(event: &SignedRemovalFrontierEnvelope) -> Vec<u8> {
-    let mut out = Writer::with_capacity(signing_len(event.payload.len()) + ED25519_SIGNATURE_BYTES);
-    write_signing_fields(&mut out, event);
-    out.raw(&event.signature);
-    out.finish()
+    SIGNED_SCHEMA
+        .encoder()
+        .id(&event.signer_endpoint_shared_id)
+        .id(&event.signer_public_key)
+        .bytes(&event.payload)
+        .bytes(&event.signature)
+        .finish()
 }
 
 pub fn decode_signed(bytes: &[u8]) -> Result<SignedRemovalFrontierEnvelope, String> {
-    let mut reader = Reader::new(bytes, "signed removal frontier envelope");
-    let tag = reader.u8()?;
-    if tag != TYPE_SIGNED_REMOVAL_FRONTIER {
-        return Err("expected signed removal frontier envelope".to_string());
-    }
-    let signer_endpoint_shared_id = reader.id()?;
-    let signer_public_key = reader.id()?;
-    let payload = reader.bytes(REMOVAL_FRONTIER_WIRE_SIZE)?;
-    let signature_bytes = reader.bytes(ED25519_SIGNATURE_BYTES)?;
-    reader.finish()?;
-
-    let signature = fixed_signature(signature_bytes)?;
+    let v = SIGNED_SCHEMA.parse(bytes)?;
+    let signature = fixed_signature(v.raw("signature")?.to_vec())?;
     let event = SignedRemovalFrontierEnvelope {
-        signer_endpoint_shared_id,
-        signer_public_key,
-        payload,
+        signer_endpoint_shared_id: v.id("signer_endpoint_shared_id")?,
+        signer_public_key: v.id("signer_public_key")?,
+        payload: v.raw("payload")?.to_vec(),
         signature,
     };
     validate_signed_payload(&event)?;
@@ -141,9 +144,12 @@ pub fn decode_signed(bytes: &[u8]) -> Result<SignedRemovalFrontierEnvelope, Stri
 }
 
 pub fn signing_bytes(event: &SignedRemovalFrontierEnvelope) -> Vec<u8> {
-    let mut out = Writer::with_capacity(signing_len(event.payload.len()));
-    write_signing_fields(&mut out, event);
-    out.finish()
+    SIGNED_SCHEMA
+        .encoder()
+        .id(&event.signer_endpoint_shared_id)
+        .id(&event.signer_public_key)
+        .bytes(&event.payload)
+        .finish_without_trailing_fields(1)
 }
 
 pub fn signed_record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
@@ -208,17 +214,6 @@ fn validate_event(event: &RemovalFrontierEvent) -> Result<(), String> {
         return Err("removal frontier refs must be sorted and unique".to_string());
     }
     Ok(())
-}
-
-fn write_signing_fields(out: &mut Writer, event: &SignedRemovalFrontierEnvelope) {
-    out.u8(TYPE_SIGNED_REMOVAL_FRONTIER);
-    out.id(&event.signer_endpoint_shared_id);
-    out.id(&event.signer_public_key);
-    out.raw(&event.payload);
-}
-
-fn signing_len(payload_len: usize) -> usize {
-    1 + 32 + 32 + payload_len
 }
 
 fn fixed_signature(bytes: Vec<u8>) -> Result<[u8; ED25519_SIGNATURE_BYTES], String> {

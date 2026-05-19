@@ -823,6 +823,78 @@ fn codec_files_use_shared_binary_helpers_and_finish_reads() {
 }
 
 #[test]
+fn fixed_width_codec_files_declare_wire_schemas() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let event_root = root.join("src/protocol/event_modules");
+    let variable_or_framed = [
+        "connection/transit/codec.rs",
+        "content/content_event/codec.rs",
+        "identity/signed/codec.rs",
+    ];
+    let mut offenders = Vec::new();
+    for path in rust_files(&event_root)
+        .into_iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == "codec.rs"))
+    {
+        let relative = path
+            .strip_prefix(&event_root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        if variable_or_framed.contains(&relative.as_str()) {
+            continue;
+        }
+        let text = source_text(&path);
+        if !text.contains("pub const SCHEMA: WireSchema") {
+            offenders.push(relative);
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "fixed-width event codecs must declare the canonical layout as WireSchema; only variable/framed codecs are explicit exceptions:\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn fixed_signed_event_codecs_do_not_use_sized_payload_fields() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let event_root = root.join("src/protocol/event_modules");
+    let variable_signed = ["content/content_event/codec.rs", "identity/signed/codec.rs"];
+    let mut offenders = Vec::new();
+    for path in rust_files(&event_root)
+        .into_iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == "codec.rs"))
+    {
+        let relative = path
+            .strip_prefix(&event_root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        if variable_signed.contains(&relative.as_str()) {
+            continue;
+        }
+        let text = source_text(&path);
+        if !text.contains("TYPE_SIGNED") {
+            continue;
+        }
+        if !text.contains("pub const SIGNED_SCHEMA: WireSchema")
+            || text.contains(".sized_bytes(&event.payload)")
+            || text.contains("reader.sized_bytes()?")
+        {
+            offenders.push(relative);
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "fixed signed event envelopes must declare SIGNED_SCHEMA and carry fixed payload bytes from the event WireSchema; sized payloads are only allowed for explicitly variable legacy envelopes:\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
 fn codec_modules_have_type_files() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/protocol/event_modules");
     let mut offenders = Vec::new();

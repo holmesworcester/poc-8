@@ -1587,12 +1587,18 @@ database transaction is held while writing to the socket.
 
 # Schema-Driven Wire Format
 
-Every event's `codec.rs` now drives `encode`/`decode` through a static
-`pub const SCHEMA: WireSchema` declared in the codec file. The schema knows
-the event's tag and an ordered list of fixed-size fields; the codec body is a
-thin chain of `SCHEMA.encoder().id(...).u64(...)...finish()` writes and a
+Every fixed-width event's `codec.rs` now drives `encode`/`decode` through a
+static `pub const SCHEMA: WireSchema` declared in the codec file. The schema
+knows the event's tag and an ordered list of fixed-size fields; the codec body
+is a thin chain of `SCHEMA.encoder().id(...).u64(...)...finish()` writes and a
 matching `SCHEMA.parse(bytes)?.id("name")?` reader. Per-event boilerplate
 shrinks; the wire format is what the schema declares.
+
+Fixed-width signed events also declare `pub const SIGNED_SCHEMA: WireSchema`.
+That schema covers `signer_endpoint_shared_id` (or the setting authority id),
+`signer_public_key`, the fixed payload bytes, and the trailing Ed25519
+signature. Signing uses the same schema prefix with the signature field
+omitted, so the signed byte prefix and accepted envelope layout cannot drift.
 
 The schema only models layout. Record metadata (scope, deps, timestamp,
 workspace), signing, AEAD seal/open, and dependency dedup stay as ordinary
@@ -1604,9 +1610,10 @@ The wire format ships these simplifications:
 
 - Connection events drop the 10-byte `EVENT_MAGIC` prefix; tags 132/133/138
   go through the ordinary tag-byte dispatch like every other event.
-- Per-event signed envelopes (content/*, encryption/*) drop their
-  `sized_bytes(payload)` indirection. The decoder reads exactly
-  `INNER_WIRE_SIZE` bytes for the inner.
+- Fixed per-event signed envelopes (content message/reaction/file slices and
+  encryption recipient/frontier/key-wrap facts) drop their
+  `sized_bytes(payload)` indirection. The decoder reads exactly the inner
+  schema's wire size.
 - The transit outer envelope drops `sized_bytes(ciphertext)` — ciphertext is
   rest-of-frame, and the TCP frame length prefix supplies the outer
   boundary.
@@ -1617,10 +1624,11 @@ The wire format ships these simplifications:
 The outermost `TOPOTRANS1` magic stays as the protocol-version probe in
 front of unverified TCP bytes. Per-element `sized_bytes` inside the
 inner-events batch stays for now (needs a unified tag→size table across
-sync, shared, and local event types). The `identity/signed` universal
-envelope keeps `sized_bytes(payload)` and an `inner_type` byte because it
-dispatches across six different inner sizes and existing tests use it as a
-public-key derivation hack with arbitrary payload bytes.
+sync, shared, and local event types). The remaining variable/framed codec
+exceptions are explicit: `connection/transit` is a framed transport envelope,
+`content/content_event` is the variable-size generated payload path used by
+throughput tests, and `identity/signed` is the legacy universal envelope that
+dispatches across six different inner sizes.
 
 ## Direction: flatten signatures and encryption into each event type
 

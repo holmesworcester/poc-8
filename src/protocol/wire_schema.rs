@@ -72,7 +72,11 @@ impl WireSchema {
     pub fn encoder(&'static self) -> WireEncoder {
         let mut out = Vec::with_capacity(self.wire_size());
         out.push(self.tag);
-        WireEncoder { schema: self, out, field_index: 0 }
+        WireEncoder {
+            schema: self,
+            out,
+            field_index: 0,
+        }
     }
 
     /// Verify the bytes look like an event of this schema and return a borrowed
@@ -94,7 +98,10 @@ impl WireSchema {
                 bytes.len()
             ));
         }
-        Ok(Parsed { schema: self, bytes })
+        Ok(Parsed {
+            schema: self,
+            bytes,
+        })
     }
 }
 
@@ -158,6 +165,25 @@ impl WireEncoder {
             "{}: encoder finished early ({} of {} fields)",
             self.schema.label,
             self.field_index,
+            self.schema.fields.len()
+        );
+        self.out
+    }
+
+    /// Finish an intentionally truncated prefix of the schema.
+    ///
+    /// Signed events use this for the bytes covered by the signature: the
+    /// signed prefix is the complete schema except the final signature field.
+    /// Keeping this operation on `WireEncoder` means the prefix still has to
+    /// write fields in the declared order and with the declared sizes.
+    pub fn finish_without_trailing_fields(self, trailing_fields: usize) -> Vec<u8> {
+        assert_eq!(
+            self.field_index + trailing_fields,
+            self.schema.fields.len(),
+            "{}: encoder finished at field {}, expected {} trailing fields out of {}",
+            self.schema.label,
+            self.field_index,
+            trailing_fields,
             self.schema.fields.len()
         );
         self.out

@@ -19,13 +19,39 @@
 
 use crate::core::crypto::{self, Ed25519PrivateKey, ED25519_SIGNATURE_BYTES};
 use crate::protocol::event_modules::types::{EventId, EventRecord, EventScope};
-use crate::protocol::wire::{Reader, Writer};
+use crate::protocol::wire_schema::{Field, WireSchema};
 
 use super::types::{DisappearingMessagesSettingEvent, SignedDisappearingMessagesSettingEnvelope};
 
 pub const TYPE_DISAPPEARING_MESSAGES_SETTING: u8 = 147;
 pub const TYPE_SIGNED_DISAPPEARING_MESSAGES_SETTING: u8 = 148;
-pub const DISAPPEARING_MESSAGES_SETTING_WIRE_SIZE: usize = 1 + 8 + 32 + 4 + 32 + 8 + 8 + 32;
+
+pub const SCHEMA: WireSchema = WireSchema::new(
+    "disappearing_messages_setting",
+    TYPE_DISAPPEARING_MESSAGES_SETTING,
+    &[
+        Field::u64("created_at_ms"),
+        Field::id("workspace_id"),
+        Field::u32("ttl_minutes"),
+        Field::id("authority_admin_event_id"),
+        Field::u64("effective_at_minute"),
+        Field::u64("expires_at_or_before_minute"),
+        Field::id("previous_setting_id"),
+    ],
+);
+
+pub const DISAPPEARING_MESSAGES_SETTING_WIRE_SIZE: usize = SCHEMA.wire_size();
+
+pub const SIGNED_SCHEMA: WireSchema = WireSchema::new(
+    "signed disappearing_messages_setting",
+    TYPE_SIGNED_DISAPPEARING_MESSAGES_SETTING,
+    &[
+        Field::id("authority_admin_event_id"),
+        Field::id("signer_public_key"),
+        Field::bytes("payload", DISAPPEARING_MESSAGES_SETTING_WIRE_SIZE),
+        Field::bytes("signature", ED25519_SIGNATURE_BYTES),
+    ],
+);
 
 /// Sentinel `previous_setting_id` meaning "no predecessor." Only legal
 /// when no setting has yet been admitted for the workspace; the projector
@@ -33,44 +59,33 @@ pub const DISAPPEARING_MESSAGES_SETTING_WIRE_SIZE: usize = 1 + 8 + 32 + 4 + 32 +
 pub const NO_PREVIOUS_SETTING_ID: [u8; 32] = [0; 32];
 
 pub fn encode(event: &DisappearingMessagesSettingEvent) -> Vec<u8> {
-    let mut out = Writer::with_capacity(DISAPPEARING_MESSAGES_SETTING_WIRE_SIZE);
-    out.u8(TYPE_DISAPPEARING_MESSAGES_SETTING);
-    out.u64(event.created_at_ms);
-    out.id(&event.workspace_id);
-    out.u32(event.ttl_minutes as usize);
-    out.id(&event.authority_admin_event_id);
-    out.u64(event.effective_at_minute);
-    out.u64(event.expires_at_or_before_minute);
-    out.id(&event.previous_setting_id.unwrap_or(NO_PREVIOUS_SETTING_ID));
-    out.finish()
+    SCHEMA
+        .encoder()
+        .u64(event.created_at_ms)
+        .id(&event.workspace_id)
+        .u32(event.ttl_minutes)
+        .id(&event.authority_admin_event_id)
+        .u64(event.effective_at_minute)
+        .u64(event.expires_at_or_before_minute)
+        .id(&event.previous_setting_id.unwrap_or(NO_PREVIOUS_SETTING_ID))
+        .finish()
 }
 
 pub fn decode(bytes: &[u8]) -> Result<DisappearingMessagesSettingEvent, String> {
-    let mut reader = Reader::new(bytes, "disappearing_messages_setting");
-    let tag = reader.u8()?;
-    if tag != TYPE_DISAPPEARING_MESSAGES_SETTING {
-        return Err("expected disappearing_messages_setting".to_string());
-    }
-    let created_at_ms = reader.u64()?;
-    let workspace_id = reader.id()?;
-    let ttl_minutes = reader.u32()?;
-    let authority_admin_event_id = reader.id()?;
-    let effective_at_minute = reader.u64()?;
-    let expires_at_or_before_minute = reader.u64()?;
-    let previous_raw = reader.id()?;
-    reader.finish()?;
+    let v = SCHEMA.parse(bytes)?;
+    let previous_raw = v.id("previous_setting_id")?;
     let previous_setting_id = if previous_raw == NO_PREVIOUS_SETTING_ID {
         None
     } else {
         Some(previous_raw)
     };
     let event = DisappearingMessagesSettingEvent {
-        created_at_ms,
-        workspace_id,
-        ttl_minutes,
-        authority_admin_event_id,
-        effective_at_minute,
-        expires_at_or_before_minute,
+        created_at_ms: v.u64("created_at_ms")?,
+        workspace_id: v.id("workspace_id")?,
+        ttl_minutes: v.u32("ttl_minutes")?,
+        authority_admin_event_id: v.id("authority_admin_event_id")?,
+        effective_at_minute: v.u64("effective_at_minute")?,
+        expires_at_or_before_minute: v.u64("expires_at_or_before_minute")?,
         previous_setting_id,
     };
     let expected = event.created_at_ms / 60_000;
@@ -99,30 +114,26 @@ pub fn sign(
 }
 
 pub fn encode_signed(event: &SignedDisappearingMessagesSettingEnvelope) -> Vec<u8> {
-    let mut out = Writer::with_capacity(signing_len(event.payload.len()) + ED25519_SIGNATURE_BYTES);
-    write_signing_fields(&mut out, event);
-    out.raw(&event.signature);
-    out.finish()
+    SIGNED_SCHEMA
+        .encoder()
+        .id(&event.authority_admin_event_id)
+        .id(&event.signer_public_key)
+        .bytes(&event.payload)
+        .bytes(&event.signature)
+        .finish()
 }
 
 pub fn decode_signed(bytes: &[u8]) -> Result<SignedDisappearingMessagesSettingEnvelope, String> {
-    let mut reader = Reader::new(bytes, "signed disappearing_messages_setting envelope");
-    let tag = reader.u8()?;
-    if tag != TYPE_SIGNED_DISAPPEARING_MESSAGES_SETTING {
-        return Err("expected signed disappearing_messages_setting envelope".to_string());
-    }
-    let authority_admin_event_id = reader.id()?;
-    let signer_public_key = reader.id()?;
-    let payload = reader.sized_bytes()?;
-    let signature_bytes = reader.bytes(ED25519_SIGNATURE_BYTES)?;
-    reader.finish()?;
-    let signature = signature_bytes
+    let v = SIGNED_SCHEMA.parse(bytes)?;
+    let signature = v
+        .raw("signature")?
+        .to_vec()
         .try_into()
         .map_err(|_| "signature length mismatch".to_string())?;
     let event = SignedDisappearingMessagesSettingEnvelope {
-        authority_admin_event_id,
-        signer_public_key,
-        payload,
+        authority_admin_event_id: v.id("authority_admin_event_id")?,
+        signer_public_key: v.id("signer_public_key")?,
+        payload: v.raw("payload")?.to_vec(),
         signature,
     };
     validate_signed_payload(&event)?;
@@ -131,15 +142,20 @@ pub fn decode_signed(bytes: &[u8]) -> Result<SignedDisappearingMessagesSettingEn
         &signing_bytes(&event),
         &event.signature,
     ) {
-        return Err("signed disappearing_messages_setting signature verification failed".to_string());
+        return Err(
+            "signed disappearing_messages_setting signature verification failed".to_string(),
+        );
     }
     Ok(event)
 }
 
 pub fn signing_bytes(event: &SignedDisappearingMessagesSettingEnvelope) -> Vec<u8> {
-    let mut out = Writer::with_capacity(signing_len(event.payload.len()));
-    write_signing_fields(&mut out, event);
-    out.finish()
+    SIGNED_SCHEMA
+        .encoder()
+        .id(&event.authority_admin_event_id)
+        .id(&event.signer_public_key)
+        .bytes(&event.payload)
+        .finish_without_trailing_fields(1)
 }
 
 pub fn signed_record_from_bytes(bytes: Vec<u8>) -> Result<EventRecord, String> {
@@ -179,17 +195,6 @@ fn validate_signed_payload(
         );
     }
     decode(&event.payload).map(|_| ())
-}
-
-fn write_signing_fields(out: &mut Writer, event: &SignedDisappearingMessagesSettingEnvelope) {
-    out.u8(TYPE_SIGNED_DISAPPEARING_MESSAGES_SETTING);
-    out.id(&event.authority_admin_event_id);
-    out.id(&event.signer_public_key);
-    out.sized_bytes(&event.payload);
-}
-
-fn signing_len(payload_len: usize) -> usize {
-    1 + 32 + 32 + 4 + payload_len
 }
 
 fn push_unique(out: &mut Vec<EventId>, id: EventId) {

@@ -133,7 +133,7 @@ mod tests {
     }
 
     fn signing_public_key_for(private_key: &[u8; 32]) -> [u8; 32] {
-        codec::sign([0; 32], private_key, vec![codec::TYPE_REACTION]).signer_public_key
+        crate::core::crypto::ed25519_public_key(private_key)
     }
 
     fn endpoint_shared_record(
